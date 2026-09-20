@@ -592,4 +592,14 @@ main()
   .then((code) => {
     if (typeof code === 'number' && code !== 0) process.exitCode = code;
   })
-  .catch((err) => fail((err as Error).message ?? String(err), 2));
+  .catch((err) => {
+    // Exit 3, not 2. A CI job needs to tell "you passed a bad flag" (fix the
+    // pipeline) apart from "the scanner itself fell over" (report it, or retry
+    // on a transient fetch) — collapsing both into 2 makes that undecidable,
+    // and every usage error above already exits 2 by way of fail().
+    const e = err as Error;
+    process.stderr.write(`${c.red('mcptrustchecker: internal error')} ${e?.message ?? String(err)}\n`);
+    if (process.env.MCPTC_DEBUG && e?.stack) process.stderr.write(`${e.stack}\n`);
+    process.stderr.write('This is a bug. Please report it: https://github.com/illia-haidar/mcptrustchecker/issues\n');
+    process.exit(3);
+  });

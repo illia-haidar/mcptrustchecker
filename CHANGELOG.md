@@ -5,6 +5,38 @@ deterministic: the **methodology version** is bumped whenever a change could
 move a score, so a grade is always reproducible against the version that
 produced it.
 
+## 1.13.1 — methodology `mcptrustchecker-1.13` (unchanged)
+
+Distribution and metadata only. No rule, weight, gate or detector changed, so a
+`1.13.0` score and a `1.13.1` score are directly comparable.
+
+- The package points at its repository again. `repository` and `bugs` were
+  dropped while the previous account was unavailable; npm shows the repository
+  link once more, and `npm publish` can carry build provenance because the
+  registry has a repository to bind the attestation to.
+
+- Every generated report links to the repository rather than to the registry
+  page. The Markdown footer and the SARIF `informationUri` both moved.
+
+- Four transitive dependencies were advanced to patched releases after advisories
+  were published against them — `fast-uri`, `hono`, `ip-address` and `qs`, all
+  reached through the MCP SDK's server-side transports, which this scanner does
+  not execute. `npm audit` is clean at the `high` level again.
+
+- The bundled action is documented with a usable address, and the docs no longer
+  promise a GitHub Action while showing a CLI-only example.
+
+- A crash and a usage error are no longer the same exit code. Both used to exit
+  2, so a pipeline could not tell "fix the flag you passed" from "the scanner
+  itself fell over" — the first is the caller's bug, the second is ours. An
+  unexpected failure now exits **3**, says so, and points at the issue tracker;
+  `MCPTC_DEBUG=1` adds the stack. Usage errors keep exiting 2, and a test pins
+  the documented table to the code so the two cannot drift.
+
+- Published from CI through OIDC trusted publishing: no long-lived npm token
+  exists for this package any more, and the right to publish is pinned to this
+  repository and this workflow file.
+
 ## 1.13.0 — methodology `mcptrustchecker-1.13`
 
 Verification told the truth about the wrong thing. Two fixes to the strongest

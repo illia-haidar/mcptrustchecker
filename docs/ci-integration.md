@@ -8,7 +8,8 @@ MCP Trust Checker is CI-native: SARIF 2.1.0 for GitHub's Security tab, exit code
 | --- | --- |
 | `0` | scan completed; gates passed |
 | `1` | a gate failed (`--fail-under`, `--min-grade`, or `diff` drift) |
-| `2` | usage / runtime error |
+| `2` | usage error — a bad flag, an unreadable target, a refused host |
+| `3` | internal error — the scanner itself failed. Set `MCPTC_DEBUG=1` for the stack, and please report it |
 
 ```bash
 mcptrustchecker scan ./tools.json --min-grade B        # exit 1 if worse than B
