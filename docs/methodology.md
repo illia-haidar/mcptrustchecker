@@ -1,4 +1,4 @@
-# Methodology — the Capability-Flow Trust Model (`mcptrustchecker-1.12`)
+# Methodology — the Capability-Flow Trust Model (`mcptrustchecker-1.14`)
 
 This document specifies exactly what MCP Trust Checker does, stage by stage. It is the spec behind every finding. The design goal is **auditability**: nothing here depends on a model's opinion, so a result can be reproduced and defended.
 

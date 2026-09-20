@@ -114,6 +114,18 @@ Maximum points any one category may subtract:
 
 Four of the five coverage tiers inspected *something* — a running server, the shipped source, the advertised tool list, the registry record — so a clean result is evidence there, just of varying reach. `empty` inspected nothing at all: no tools, no prompts, no resources, no source, no package metadata. `E_cov = 25` is sized to keep a threat-clean empty scan out of the A and B bands entirely (a clean `empty` scan lands at **C 75**), because `MTC-META-001` and the coverage caveat both state in prose that an empty surface is not a clean bill of health — and at the previous −10 the score said the opposite, awarding **A (90)** to a target the scanner never looked at.
 
+**What counts as "the registry record" (tightened in `mcptrustchecker-1.14`).** The
+package name on the surface is not evidence of it. It is the target string the
+caller typed, copied onto the surface before any lookup, and it survives both an
+offline run and a registry `404` unchanged. Counting it as metadata put every
+target that does not exist — every typo, every hallucinated package name, every
+deleted one — into the `metadata` tier at `E_cov = 8` rather than `empty` at 25,
+so a name nobody has ever published scored **92, grade A**. The tier now requires
+a fact the registry actually returned: a resolved version, at least one declared
+dependency, or the artifact's tarball digest. A declared-empty dependency list
+does not qualify, because it is indistinguishable from the default carried by a
+surface that was never fetched.
+
 ## Hard gates (weakest-link, confirmed-only)
 
 Applied *after* the number:

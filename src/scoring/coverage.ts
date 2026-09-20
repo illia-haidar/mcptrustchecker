@@ -25,8 +25,15 @@ export function computeCoverage(surface: ServerSurface, verification?: Verificat
     (Array.isArray(surface.resources) && surface.resources.length > 0);
   const implementationSource = Array.isArray(surface.sourceFiles) && surface.sourceFiles.length > 0;
   const m = surface.packageMeta;
+  // `m.name` is NOT evidence. It is the target string the caller typed, echoed
+  // back — present even when the registry was never reached, or reached and
+  // answered 404. Counting it as metadata meant an offline scan of a package
+  // that does not exist reported coverage `metadata` (−8) instead of `empty`
+  // (−25), and so scored 92/A: a clean bill of health for something the scanner
+  // never looked at, which is exactly what COVERAGE_HONESTY.empty exists to
+  // prevent. The other three are facts the registry supplied.
   const packageMetadata = Boolean(
-    m && (m.name || m.version || (Array.isArray(m.dependencies) && m.dependencies.length > 0) || m.tarballSha256),
+    m && (m.version || (Array.isArray(m.dependencies) && m.dependencies.length > 0) || m.tarballSha256),
   );
   const liveTransport = surface.source?.kind === 'stdio' || surface.source?.kind === 'http';
 
@@ -41,6 +48,18 @@ export function computeCoverage(surface: ServerSurface, verification?: Verificat
   const caveats: string[] = [];
   if (level === 'empty') {
     caveats.push('Nothing scannable was found on this target — an empty surface is not a clean bill of health.');
+    // A package name on its own is the commonest way to land here, and it is
+    // the one case with an obvious remedy: nothing was fetched, so say that
+    // plainly and name the flag that fixes it. Without this the most
+    // actionable advice the report has would be missing from precisely the
+    // scan that inspected the least.
+    if (surface.source?.kind === 'package') {
+      caveats.push(
+        'The registry was not contacted, so not even the package record was read — the name alone is not a scan. ' +
+          'Add --online to fetch the published package and analyze its source, or scan the running server: ' +
+          '--command "npx -y <package>".',
+      );
+    }
   } else {
     if (!toolSurface) {
       caveats.push(

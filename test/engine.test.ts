@@ -55,7 +55,7 @@ test('every emitted rule id exists in the rule catalog', async () => {
 
 test('the report exposes an auditable score vector and digest', async () => {
   const report = await scanFixture('poisoned-server.json'); // has real threat findings
-  assert.equal(report.score.methodologyVersion, 'mcptrustchecker-1.13');
+  assert.equal(report.score.methodologyVersion, 'mcptrustchecker-1.14');
   assert.equal(report.surfaceDigest.length, 64);
   const sum = report.score.vector.reduce((s, v) => s + v.appliedPenalty, 0);
   assert.ok(sum > 0);

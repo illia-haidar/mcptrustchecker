@@ -1,6 +1,6 @@
 {
   "name": "mcptrustchecker",
-  "version": "1.13.1",
+  "version": "1.14.0",
   "description": "Local-first, deterministic security scanner for Model Context Protocol (MCP) servers. Cross-tool toxic-flow analysis, Unicode-smuggling decode, prompt-injection & supply-chain detection, with an auditable 0–100 Trust Score.",
   "type": "module",
   "license": "MIT",

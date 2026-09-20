@@ -8,8 +8,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-3c873a.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/package.json)
-[![Methodology](https://img.shields.io/badge/methodology-mcptrustchecker--1.13-6f42c1.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/docs/methodology.md)
-[![Tests](https://img.shields.io/badge/tests-460%20passing-brightgreen.svg)](https://github.com/illia-haidar/mcptrustchecker/tree/main/test)
+[![Methodology](https://img.shields.io/badge/methodology-mcptrustchecker--1.14-6f42c1.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/docs/methodology.md)
+[![Tests](https://img.shields.io/badge/tests-466%20passing-brightgreen.svg)](https://github.com/illia-haidar/mcptrustchecker/tree/main/test)
 [![Rules](https://img.shields.io/badge/rules-84-orange.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/docs/rules.md)
 [![No account](https://img.shields.io/badge/account-not%20required-brightgreen.svg)](#why-this-is-different)
 [![Offline](https://img.shields.io/badge/runs-100%25%20offline-brightgreen.svg)](#why-this-is-different)
@@ -37,7 +37,7 @@ npx mcptrustchecker                # 🔍 scan every MCP server you already have
 
 ## What makes the algorithm unique
 
-The **Capability-Flow Trust Model** (methodology `mcptrustchecker-1.13`) is an **original algorithm designed from scratch for this project** by [Illia Haidar](https://mcptrustchecker.com) — it is not a wrapper around, or derivative of, any existing scanner or methodology. It is named, versioned, fully specified in docs/methodology.md, and citable via [CITATION.cff](CITATION.cff).
+The **Capability-Flow Trust Model** (methodology `mcptrustchecker-1.14`) is an **original algorithm designed from scratch for this project** by [Illia Haidar](https://mcptrustchecker.com) — it is not a wrapper around, or derivative of, any existing scanner or methodology. It is named, versioned, fully specified in docs/methodology.md, and citable via [CITATION.cff](CITATION.cff).
 
 **It is refined against 30,000+ real MCP servers — and still improving.** The model is not theoretical: it is calibrated on a continuously-scanned corpus of **30,000+ MCP servers** published on npm and PyPI. Each revision comes from a **full-population audit** of that corpus — every server in a grade band re-examined for *both* false positives (benign code graded down) and false negatives (real threats graded up), each change measured against the threats it must keep catching, and the whole corpus re-scanned before the version ships. That loop produced `mcptrustchecker-1.9`, which moved "evaluating a runtime value" off the threat axis after the data showed it was charging capability as malice. The corpus keeps growing and the audits keep running, so the methodology is expected to keep tightening — which is why every score carries the version that produced it.
 
@@ -68,7 +68,7 @@ Real output, `mcptrustchecker scan test/fixtures/poisoned-server.json`:
    │  GRADE  F  │   Trust Score 46/100   (client adoption risk · threat 50)
    ╰────────────╯   Capability MINIMAL   (blast radius)
                     Coverage MANIFEST   (static tool list only — no source)
-   methodology mcptrustchecker-1.13
+   methodology mcptrustchecker-1.14
 
 Threats    2 critical · 4 high · 2 medium
 
@@ -121,7 +121,7 @@ Most scanners *assert* they have a low false-positive rate. This one **measures*
 
 *(81 labeled servers, held-out cases flagged; "concerning" := Trust grade C or worse. Reproduce with `npm run benchmark`.)* The corpus is honest and versioned — it grows with every calibration case, and the CI gate holds precision/recall ≥ 90%.
 
-It also grows with every **evasion** the model has to survive. The corpus is a **matrix**, not a list: the same tool-poisoning payload in six forms — English, Russian, German, Spanish, Chinese and an English paraphrase that shares no wording with any pattern — crossed with ten hiding transforms (base64, hex, percent-escapes, HTML entities, `\u` and `\u{}` escapes, zero-width splitting, C0-control splitting, the Unicode Tags block, and a blob introduced by `=`). Run against `mcptrustchecker-1.9`, those cases score **74.4% recall**: ten of them grade **A or B**. Under `mcptrustchecker-1.13` every cell grades F, with precision unchanged at 100%. Each cell also asserts the **monotonicity invariant** — the hidden form may never score better than the plain one. Testing a single English payload is what let a violation ship in an earlier release: English is caught by the phrase lexicon too, so it passed while the paraphrase did not.
+It also grows with every **evasion** the model has to survive. The corpus is a **matrix**, not a list: the same tool-poisoning payload in six forms — English, Russian, German, Spanish, Chinese and an English paraphrase that shares no wording with any pattern — crossed with ten hiding transforms (base64, hex, percent-escapes, HTML entities, `\u` and `\u{}` escapes, zero-width splitting, C0-control splitting, the Unicode Tags block, and a blob introduced by `=`). Run against `mcptrustchecker-1.9`, those cases score **74.4% recall**: ten of them grade **A or B**. Under `mcptrustchecker-1.14` every cell grades F, with precision unchanged at 100%. Each cell also asserts the **monotonicity invariant** — the hidden form may never score better than the plain one. Testing a single English payload is what let a violation ship in an earlier release: English is caught by the phrase lexicon too, so it passed while the paraphrase did not.
 
 ---
 
@@ -290,7 +290,7 @@ A single number can't answer "should I use this server?" — because **"powerful
 firecrawl   Trust B (81/100)   Capability CRITICAL   Coverage LIVE     → trustworthy, but huge blast radius — grant carefully
 poisoned    Trust F            Capability HIGH        Coverage LIVE     → actual malice signals — avoid
 memory      Trust A (100)      Capability MINIMAL     Coverage LIVE     → safe and low-power
-some-pkg    Trust A (98)       Capability MINIMAL     Coverage METADATA → clean *so far* — 0 tools seen; scan the live server
+some-pkg    Trust C (75/100)   Capability MINIMAL     Coverage EMPTY    → a bare name, nothing fetched — not a verdict; add --online
 ```
 
 This is why MCP Trust Checker doesn't collapse every capable server into "F" (which would make the grade useless). Popularity is never an input — popular packages get compromised — but a legitimate powerful server keeps a high Trust grade while its Capability and the scan's Coverage are surfaced honestly.
@@ -330,10 +330,10 @@ Three subtract-only terms, each **one itemized line** in `vector` — no black b
 | --- | --- | --- |
 | **E_cap** — capability exposure | blast radius if the model driving the server is manipulated | minimal 0 · moderate 3 · high 6 · critical 10 |
 | **E_ver** — verification discount | how verifiable the *source* is (build provenance / vendor scope / public repo) | vendor 0 · provenance 0 · public repo 1 · none 5 (**2** when the shipped source was fully read — the gap is a missing repo *link*, not the code) · **unknown → term skipped** |
-| **E_cov** — coverage honesty | how much of the target the scan could actually inspect | live 0 · source 0 · manifest 4 · metadata 8 · empty 10 |
+| **E_cov** — coverage honesty | how much of the target the scan could actually inspect | live 0 · source 0 · manifest 4 · metadata 8 · **empty 25** |
 
 - **Verification is an engine signal**, computed from the fetched npm/PyPI document (Sigstore/SLSA provenance + vendor-owned scope) on an `--online` scan — identical logic in the CLI, the registry and the hosted API, so every mode agrees. An **offline** scan cannot check provenance, so verification is `unknown`, the term is **skipped**, and a coverage caveat records the omission — an unchecked signal never reads as clean.
-- The terms are **subtract-only**: a threat-clean server is never dragged below **B** by exposure alone (validated on 31,300 real packages; clean floor = 87), and the confirmed-critical **F-gate holds** regardless.
+- The terms are **subtract-only**, and their total reach is enumerated rather than asserted: across all 70 reachable clean states (every combination of capability, verification and coverage that a threat-clean target can actually occupy) the grade lands **52 A · 13 B · 5 C**, floor **70**. Exposure alone never costs a threat-clean server more than one band — except where the scan inspected nothing, which is the one case that must not read as clean. A test walks the whole lattice, so the claim cannot drift from the constants. The confirmed-critical **F-gate holds** regardless.
 - **Bands:** A 90–100 · B 80–89 · C 70–79 · D 60–69 · F 0–59.
 
 Every report ships the full itemized `vector` (threat penalties **and** the three client terms), the preserved `threatScore`, and the `methodologyVersion`. **Same methodology version + same target ⇒ byte-identical score.** Details: **[docs/scoring.md](https://github.com/illia-haidar/mcptrustchecker/blob/main/docs/scoring.md)**.
@@ -352,7 +352,7 @@ const report  = await scanSurface(surface);
 
 report.score.grade;              // 'A' … 'F'
 report.score.score;              // 0 … 100
-report.score.methodologyVersion; // 'mcptrustchecker-1.13'  ← pin & display this
+report.score.methodologyVersion; // 'mcptrustchecker-1.14'  ← pin & display this
 report.toxicFlows;               // enumerated exfiltration primitives
 renderBadge(report);             // shields.io endpoint JSON for a live trust badge
 ```

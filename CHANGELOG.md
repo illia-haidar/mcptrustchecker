@@ -5,6 +5,60 @@ deterministic: the **methodology version** is bumped whenever a change could
 move a score, so a grade is always reproducible against the version that
 produced it.
 
+## 1.14.0 — methodology `mcptrustchecker-1.14`
+
+**Scores move.** One coverage input was wrong, and it was wrong in the most
+expensive direction: it let targets the scanner had never successfully looked at
+report a grade as if it had. Re-scan anything you have stored from an earlier
+version before comparing; reports carry `score.methodologyVersion` precisely so
+the two are never silently mixed.
+
+- **A package name is no longer mistaken for a registry record.** The coverage
+  axis asked whether the surface carried package metadata, and answered yes when
+  `packageMeta.name` was set. That name is not something the registry returned —
+  it is the string the caller typed, copied onto the surface before any lookup
+  happens, and it is still there after an offline run or a `404`. So a package
+  that does not exist landed in the `metadata` tier (`E_cov = 8`) instead of
+  `empty` (25), and a threat-clean scan of a name nobody has ever published came
+  back **92, grade A**: a clean bill of health for something that was never
+  inspected, which is the exact failure the `empty` tier was introduced to stop.
+  The tier now requires a fact the registry supplied — a resolved version, a
+  declared dependency, or the artifact's tarball digest. The same target now
+  reports **75, grade C**, with `Coverage EMPTY` and the caveat that says why.
+
+  A declared-empty dependency array deliberately does not qualify: it is
+  indistinguishable from the default an unfetched surface already carries.
+
+  This is scored, so it changes grades, and it changes them wherever the registry
+  was never successfully read. That includes the plain `mcptrustchecker <package>`
+  with no `--online`: that run contacts nothing at all, so it now reports
+  `Coverage EMPTY` and a **C**, where it used to claim "registry metadata only"
+  and an **A** without having read a single byte from the registry. Add
+  `--online` (or scan the running server) and the scan has real material to work
+  with, and the grade reflects it. Stored scans that did reach the registry keep
+  their version and dependencies and are unaffected: in the catalog behind
+  mcptrustchecker.com this moves roughly 487 of 30,436 entries (1.6%), nearly all
+  of them from B to C.
+
+- **The remedy no longer disappears with the coverage.** "Add `--online`" was
+  only ever attached to tiers that had already inspected something, so the change
+  above would have removed the report's most actionable line from exactly the
+  scan that inspected the least. An empty *package* surface now says that the
+  registry was not contacted, that a name on its own is not a scan, and which
+  flag fixes it. Empty surfaces with no registry behind them are not told to go
+  fetch one.
+
+- The other three coverage tiers were audited for the same class of mistake and
+  are sound. `live` cannot be claimed without a completed handshake — a failed
+  connect throws rather than producing a surface — and a server declared in a
+  client config is recorded as `client-config`, not as a transport that was
+  actually opened.
+
+- Six tests pin the new boundary, including that each registry fact
+  independently reaches `metadata`, that an empty dependency list does not, and
+  that a nonexistent package cannot reach the A band offline. 466 tests pass;
+  the 81-server benchmark holds at 100% precision and 100% recall.
+
 ## 1.13.1 — methodology `mcptrustchecker-1.13` (unchanged)
 
 Distribution and metadata only. No rule, weight, gate or detector changed, so a

@@ -114,7 +114,7 @@ test('OFFLINE scan: verification is unknown, the term is skipped, a caveat is re
   // A metadata-only package surface with NO verification set (offline).
   const surface: ServerSurface = makeSurface({
     source: { kind: 'package', origin: 'left-pad' },
-    packageMeta: { registry: 'npm', name: 'left-pad' },
+    packageMeta: { registry: 'npm', name: 'left-pad', version: '1.3.0' },
   });
   const report = await scanSurface(surface);
   // No verification line in the vector...
@@ -138,7 +138,7 @@ test('ONLINE-style scan: a verification set on packageMeta IS applied to the sco
 });
 
 test('computeCoverage adds the caveat only for an unchecked package target', () => {
-  const pkg = makeSurface({ source: { kind: 'package', origin: 'p' }, packageMeta: { registry: 'npm', name: 'p' } });
+  const pkg = makeSurface({ source: { kind: 'package', origin: 'p' }, packageMeta: { registry: 'npm', name: 'p', version: '1.0.0' } });
   assert.ok(computeCoverage(pkg, 'unknown').caveats.some((c) => /Publisher verification was not checked/.test(c)));
   assert.ok(!computeCoverage(pkg, 'none').caveats.some((c) => /Publisher verification was not checked/.test(c)));
   // A live server with no package identity should not nag about provenance.
