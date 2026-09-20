@@ -1,0 +1,35 @@
+# MCP Trust Checker · https://mcptrustchecker.com · support@mcptrustchecker.com · © 2026 Illia Haidar · MIT
+cff-version: 1.2.0
+message: "If you use MCP Trust Checker or the Capability-Flow Trust Model, please cite it as below."
+type: software
+title: "MCP Trust Checker"
+abstract: >-
+  Local-first, deterministic security scanner for Model Context Protocol (MCP)
+  servers, built on the Capability-Flow Trust Model — an original methodology
+  by Illia Haidar that reduces every tool to behavioral roles (untrusted-input,
+  sensitive-source, external-sink, code-exec, file-write), wires them into a
+  cross-tool toxic-flow graph to statically prove data-exfiltration primitives
+  (the lethal trifecta), and produces an auditable, reproducible 0-100 Trust
+  Score with a fully itemized penalty vector. No LLM, no account, fully offline.
+authors:
+  - family-names: "Haidar"
+    given-names: "Illia"
+    email: "support@mcptrustchecker.com"
+contact:
+  - family-names: "Haidar"
+    given-names: "Illia"
+    email: "support@mcptrustchecker.com"
+version: "1.12.1"
+date-released: "2026-07-26"
+url: "https://mcptrustchecker.com"
+repository-code: "https://github.com/illia-haidar/mcptrustchecker"
+license: MIT
+keywords:
+  - "MCP security scanner"
+  - "Model Context Protocol"
+  - "Capability-Flow Trust Model"
+  - "toxic flow analysis"
+  - "tool poisoning"
+  - "prompt injection detection"
+  - "supply chain security"
+  - "static analysis"

@@ -1,0 +1,29 @@
+{
+  "server": {
+    "name": "time-server",
+    "version": "1.2.0",
+    "instructions": "Provides the current time and timezone conversions. Read-only; performs no network or filesystem access."
+  },
+  "tools": [
+    {
+      "name": "get_current_time",
+      "description": "Return the current time for a given IANA timezone.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "timezone": { "type": "string", "description": "IANA timezone name, for example America/New_York." }
+        },
+        "required": ["timezone"]
+      },
+      "annotations": { "readOnlyHint": true }
+    },
+    {
+      "name": "list_timezones",
+      "description": "List the supported IANA timezone identifiers.",
+      "inputSchema": { "type": "object", "properties": {} },
+      "annotations": { "readOnlyHint": true }
+    }
+  ],
+  "prompts": [],
+  "resources": []
+}

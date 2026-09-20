@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Build + full test suite across every supported Node on all three OSes —
+  # path handling, the command allowlist and client-config discovery differ on
+  # Windows, so it must be exercised there too.
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [20, 22, 24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+
+  # The scanner grades its own clean fixture and must keep an A.
+  dogfood:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npm run build
+      - run: node dist/cli/index.js scan test/fixtures/clean-server.json --min-grade A
+
+  # Real end-to-end install: pack the tarball, install it into a throwaway
+  # project, run the published bin + the library import. Catches packaging /
+  # exports / shebang regressions that unit tests can't see.
+  package-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npm run build
+      - name: Pack + install into a clean project
+        run: |
+          set -e
+          TARBALL="$(npm pack --silent)"
+          mkdir -p /tmp/consumer && cd /tmp/consumer
+          npm init -y >/dev/null
+          npm install "$GITHUB_WORKSPACE/$TARBALL" >/dev/null
+          echo "→ bin resolves:"; npx mcptrustchecker --version
+          echo "→ ESM import resolves:"
+          node --input-type=module -e "import { scanSurface, METHODOLOGY_VERSION } from 'mcptrustchecker'; if (typeof scanSurface !== 'function') process.exit(1); console.log('scanSurface ok ·', METHODOLOGY_VERSION)"
+
+  # Measured precision/recall on the labeled corpus — calibration regressions
+  # fail here, not just in review.
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npm run benchmark
+
+  # Dependency vulnerabilities in the tool's own supply chain.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npm audit --audit-level=high

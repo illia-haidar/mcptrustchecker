@@ -1,0 +1,52 @@
+name: Release
+
+# Publish to npm with build provenance (SLSA) when a v* tag is pushed.
+#
+# Authentication is OIDC, not a secret: npm is configured to trust this
+# repository and this workflow FILE as a publisher, so the job exchanges the
+# run's short-lived identity token for publish rights. Nothing long-lived is
+# stored here, there is no token to leak or rotate, and a fork cannot publish
+# because the trust is pinned to `illia-haidar/mcptrustchecker` + `release.yml`.
+#
+#   git tag v1.0.0 && git push origin v1.0.0
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write # required for npm provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+      # Node 20 ships npm 10, which cannot request the OIDC token that trusted
+      # publishing needs — it would fall back to asking for a credential and
+      # fail. Pin a client new enough to speak it.
+      - run: npm install -g npm@latest
+      - run: npm ci
+      # A tag that disagrees with package.json publishes a version nobody
+      # intended, under a tag that then points at the wrong commit forever.
+      # npm rejects a re-publish of the same version, so this is unrecoverable
+      # without burning a version number — check it before anything else runs.
+      - name: Tag must match the package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag $GITHUB_REF_NAME implies version $tag, but package.json says $pkg"
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches package.json $pkg"
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run benchmark
+      - run: npm publish --provenance --access public

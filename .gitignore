@@ -1,0 +1,24 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+coverage/
+.env
+.env.*
+*.tsbuildinfo
+# MCP Trust Checker writes an integrity lockfile; users decide whether to commit it.
+# We ignore it in this repo's own runs, but recommend users COMMIT theirs.
+# Anchored to the root so a fixture lockfile under test/ is still tracked.
+/mcptrustchecker.lock
+/scratch/
+
+# ephemeris/data artifacts written by scanned servers during live testing
+*.bsp
+*.sqlite
+test.db
+
+# Stray logs / scratch / scan artifacts (never commit)
+err.txt
+warn.txt
+/temp/
+*.tgz

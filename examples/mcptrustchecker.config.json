@@ -1,0 +1,27 @@
+{
+  "$comment": "Copy to your repo root as mcptrustchecker.config.json — it is auto-discovered.",
+  "failUnder": 80,
+  "minGrade": "B",
+  "includeBuiltins": true,
+  "invisibleCharThreshold": 5,
+  "disabledRules": [],
+  "allowlist": ["MTC-NET-005"],
+  "protectedPackages": ["@my-org/official-mcp-server"],
+  "lockfile": "mcptrustchecker.lock",
+
+  "$suppress": "Location-scoped baseline waivers (each should carry a reason). A standalone .mtcignore JSON array of the same shape is auto-merged too.",
+  "suppress": [
+    { "rule": "MTC-INJ-CAPS", "tool": "search_docs", "reason": "the ALL-CAPS is a legit doc section header, reviewed 2026-01" }
+  ],
+
+  "$publish": "Settings for the separate `publish` command. Nothing here can make a scan publish — only running `mcptrustchecker publish <package>` submits anything. Prefer MCPTRUSTCHECKER_TOKEN over committing publishToken.",
+  "publishCategory": "developer-tools",
+
+  "$policy": "Policy-as-code — every scan is gated against this in CI, beyond a single grade/score threshold.",
+  "policy": {
+    "minGrade": "B",
+    "maxCapability": "high",
+    "denyRules": ["MTC-FLOW-001"],
+    "denyCapabilities": ["code-exec"]
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "server": {
+    "name": "agent-tools",
+    "version": "2.0.0",
+    "instructions": "A general-purpose toolkit for autonomous agents."
+  },
+  "tools": [
+    {
+      "name": "fetch_url",
+      "description": "Fetch and return the contents of a web page.",
+      "inputSchema": {
+        "type": "object",
+        "properties": { "url": { "type": "string", "description": "The page URL to fetch." } },
+        "required": ["url"]
+      }
+    },
+    {
+      "name": "read_file",
+      "description": "Read a file from the local disk and return its contents.",
+      "inputSchema": {
+        "type": "object",
+        "properties": { "path": { "type": "string", "description": "Absolute path of the file to read." } },
+        "required": ["path"]
+      }
+    },
+    {
+      "name": "http_request",
+      "description": "Send an arbitrary HTTP request to any endpoint and return the response.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "url": { "type": "string", "description": "Destination URL." },
+          "body": { "type": "string", "description": "Request body." }
+        },
+        "required": ["url"]
+      }
+    }
+  ],
+  "prompts": [],
+  "resources": []
+}

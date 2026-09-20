@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 452" width="860" height="452" font-family="SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace" font-size="14">
+  <style>
+    .t { fill:#adbac7; } .g { fill:#768390; } .grn { fill:#3fb950; } .red { fill:#f85149; }
+    .amb { fill:#e3b341; } .wht { fill:#f0f6fc; } .b { font-weight:700; }
+  </style>
+  <rect x="1" y="1" width="858" height="450" rx="12" fill="#0d1117" stroke="#30363d"/>
+  <rect x="1" y="1" width="858" height="42" rx="12" fill="#161b22"/>
+  <rect x="1" y="30" width="858" height="13" fill="#161b22"/>
+  <circle cx="26" cy="22" r="6" fill="#f85149"/>
+  <circle cx="48" cy="22" r="6" fill="#e3b341"/>
+  <circle cx="70" cy="22" r="6" fill="#3fb950"/>
+  <text x="430" y="27" text-anchor="middle" class="g">mcptrustchecker · MCP security scan</text>
+
+  <text x="24" y="78"><tspan class="grn">$</tspan> <tspan class="t">npx mcptrustchecker scan ./tools.json</tspan></text>
+
+  <text x="24" y="114"><tspan class="wht b">MCP Trust Checker</tspan> <tspan class="g">· MCP security scan</tspan></text>
+  <text x="24" y="132" class="g">────────────────────────────────────────────────</text>
+  <text x="24" y="156"><tspan class="g">Target </tspan> <tspan class="t">notes-sync</tspan>  <tspan class="g">(manifest)</tspan></text>
+  <text x="24" y="176"><tspan class="g">Surface</tspan> <tspan class="t">3 tools · 0 prompts · 0 resources</tspan></text>
+
+  <rect x="46" y="198" width="150" height="44" rx="8" fill="none" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="121" y="225" text-anchor="middle" class="grn b" font-size="16">GRADE  A</text>
+  <text x="214" y="212" class="wht b" font-size="15">Trust Score 90/100</text>
+  <text x="214" y="230"><tspan class="g">Capability</tspan> <tspan class="amb b">HIGH</tspan>  <tspan class="g">(blast radius)</tspan></text>
+  <text x="214" y="248" class="g">methodology mcptrustchecker-1.12</text>
+
+  <text x="24" y="286"><tspan class="g">Threats</tspan>    <tspan class="grn">none</tspan>   <tspan class="g">·</tspan>  <tspan class="g">Capability</tspan> <tspan class="amb">high (1 observation)</tspan></text>
+
+  <text x="24" y="318"><tspan class="wht b">Toxic flows</tspan> <tspan class="g">(untrusted-input → sensitive-source → external-sink)</tspan></text>
+  <text x="24" y="340"><tspan class="amb b">[CAP]</tspan> <tspan class="g">MTC-FLOW-002</tspan>  <tspan class="wht">Completed toxic-flow trifecta across tools</tspan></text>
+  <text x="24" y="360" class="g">      untrusted [fetch_url] · reads [read_file] · sends [http_request]</text>
+  <text x="24" y="380"><tspan class="grn">      →</tspan> <tspan class="t">split the trifecta across separate, individually-approved tools</tspan></text>
+
+  <text x="24" y="416" class="g">Three honest tools that compose into an exfiltration path: priced into</text>
+  <text x="24" y="434" class="g">Capability, not into Trust. Only a single tool holding all three is an F.</text>
+</svg>

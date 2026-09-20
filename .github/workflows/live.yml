@@ -1,0 +1,22 @@
+name: Live sweep (opt-in)
+
+# Boots a set of REAL MCP servers and scans each — proves 0 scanner crashes on
+# live surfaces. Not on every push (network + registry installs are slow/flaky):
+# run it manually from the Actions tab, or on a weekly schedule.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1' # Mondays 06:00 UTC
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npm run build
+      - name: Scan real MCP servers (fails only on a scanner crash)
+        run: node scripts/live-sweep.mjs

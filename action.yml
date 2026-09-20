@@ -1,0 +1,79 @@
+name: 'MCP Trust Checker — MCP Security Scan'
+description: 'Scan a Model Context Protocol server for security issues and gate CI on its Trust Score.'
+author: 'MCP Trust Checker (https://mcptrustchecker.com · support@mcptrustchecker.com)'
+branding:
+  icon: 'shield'
+  color: 'purple'
+
+inputs:
+  target:
+    description: 'What to scan: a tools.json manifest, an http(s) URL, a client config, or a package name.'
+    required: true
+  min-grade:
+    description: 'Fail if the grade is worse than this (A–F).'
+    required: false
+  fail-under:
+    description: 'Fail if the Trust Score is below this (0–100).'
+    required: false
+  sarif:
+    description: 'Produce a SARIF file and upload it to the Security tab.'
+    required: false
+    default: 'false'
+  config:
+    description: 'Path to a mcptrustchecker.config.json.'
+    required: false
+  extra-args:
+    description: 'Additional raw CLI arguments (e.g. "--online --include-builtins").'
+    required: false
+    default: ''
+  version:
+    description: 'MCP Trust Checker version to run (npm dist-tag or version).'
+    required: false
+    default: 'latest'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Run MCP Trust Checker
+      shell: bash
+      # Every input is passed through `env:` and read as a shell VARIABLE. It must
+      # never be interpolated with ${{ }} inside `run:`: the Actions expression
+      # evaluator substitutes the text before bash parses the line, so quotes
+      # around it are decoration and a value like `"; curl … | sh; #` executes in
+      # the caller's runner with their GITHUB_TOKEN. An action input is a contract
+      # whose bindings the author does not control — a PR title or a dispatch
+      # payload can reach it — so the boundary is enforced here, not documented.
+      env:
+        TARGET: ${{ inputs.target }}
+        MIN_GRADE: ${{ inputs.min-grade }}
+        FAIL_UNDER: ${{ inputs.fail-under }}
+        SARIF: ${{ inputs.sarif }}
+        CONFIG: ${{ inputs.config }}
+        EXTRA_ARGS: ${{ inputs.extra-args }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        # An array, not a string: each element stays one argument no matter what
+        # characters it contains.
+        args=()
+        [ -n "$MIN_GRADE" ] && args+=(--min-grade "$MIN_GRADE")
+        [ -n "$FAIL_UNDER" ] && args+=(--fail-under "$FAIL_UNDER")
+        [ -n "$CONFIG" ] && args+=(--config "$CONFIG")
+        [ "$SARIF" = "true" ] && args+=(--sarif -o mcptrustchecker.sarif)
+        echo "mcptrustchecker $VERSION scanning: $TARGET"
+        # $EXTRA_ARGS is deliberately unquoted: it is documented as raw CLI
+        # arguments and has to word-split into several. Unquoted expansion splits
+        # and globs — it does NOT perform command substitution — so this passes
+        # words to the CLI rather than to the shell.
+        npx --yes "mcptrustchecker@$VERSION" scan "$TARGET" $EXTRA_ARGS "${args[@]}"
+
+    - name: Upload SARIF
+      if: ${{ inputs.sarif == 'true' && always() }}
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: mcptrustchecker.sarif

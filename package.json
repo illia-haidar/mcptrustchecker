@@ -1,0 +1,77 @@
+{
+  "name": "mcptrustchecker",
+  "version": "1.13.0",
+  "description": "Local-first, deterministic security scanner for Model Context Protocol (MCP) servers. Cross-tool toxic-flow analysis, Unicode-smuggling decode, prompt-injection & supply-chain detection, with an auditable 0–100 Trust Score.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Illia Haidar <support@mcptrustchecker.com> (https://mcptrustchecker.com)",
+  "homepage": "https://mcptrustchecker.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/illia-haidar/mcptrustchecker.git"
+  },
+  "bugs": {
+    "url": "https://github.com/illia-haidar/mcptrustchecker/issues",
+    "email": "support@mcptrustchecker.com"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "security",
+    "scanner",
+    "prompt-injection",
+    "tool-poisoning",
+    "toxic-flow",
+    "supply-chain",
+    "llm-security",
+    "ai-security",
+    "sarif",
+    "sast"
+  ],
+  "bin": {
+    "mcptrustchecker": "dist/cli/index.js"
+  },
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node scripts/run-tests.mjs",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build",
+    "scan:self": "tsx src/cli/index.ts scan test/fixtures/clean-server.json",
+    "scan:popular": "bash examples/scan-popular.sh",
+    "scan:live": "npm run build && node scripts/live-sweep.mjs",
+    "benchmark": "npm run build && node benchmark/run.mjs",
+    "docs:rules": "npm run build && node scripts/gen-rules.mjs",
+    "demo": "tsx src/cli/index.ts scan test/fixtures/poisoned-server.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "overrides": {
+    "fast-uri": "^3.1.4",
+    "@hono/node-server": "^2.0.5"
+  }
+}
