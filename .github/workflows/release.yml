@@ -30,8 +30,11 @@ jobs:
           cache: npm
       # Node 20 ships npm 10, which cannot request the OIDC token that trusted
       # publishing needs — it would fall back to asking for a credential and
-      # fail. Pin a client new enough to speak it.
-      - run: npm install -g npm@latest
+      # fail. npm 11 is the newest line that still runs on Node 20 (it wants
+      # ^20.17.0 || >=22.9.0) and it is past the 11.5.1 that added OIDC, so pin
+      # the MAJOR: `npm@latest` is npm 12, which requires Node >=22.22 and dies
+      # here with EBADENGINE. Raise both together or neither.
+      - run: npm install -g npm@11
       - run: npm ci
       # A tag that disagrees with package.json publishes a version nobody
       # intended, under a tag that then points at the wrong commit forever.
