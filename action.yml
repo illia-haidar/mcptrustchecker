@@ -1,4 +1,4 @@
-name: 'MCP Trust Checker — MCP Security Scan'
+name: 'MCP Trust Checker'
 description: 'Scan a Model Context Protocol server for security issues and gate CI on its Trust Score.'
 author: 'MCP Trust Checker (https://mcptrustchecker.com · support@mcptrustchecker.com)'
 branding:
