@@ -9,6 +9,9 @@
  */
 
 import type { Coverage, CoverageLevel, ServerSurface, Verification } from '../types.js';
+import { SOURCE_LIMITS } from '../acquire/source.js';
+
+const SOURCE_FILE_LIMIT_MB = SOURCE_LIMITS.maxFileBytes / (1024 * 1024);
 
 /**
  * Derive the coverage descriptor from an acquired surface.
@@ -36,6 +39,10 @@ export function computeCoverage(surface: ServerSurface, verification?: Verificat
     m && (m.version || (Array.isArray(m.dependencies) && m.dependencies.length > 0) || m.tarballSha256),
   );
   const liveTransport = surface.source?.kind === 'stdio' || surface.source?.kind === 'http';
+  // Source files that exist but were not read (a size limit). Reported by name:
+  // "add --online" is the wrong advice for a package whose artifact WAS fetched.
+  const skipped = Array.isArray(surface.packageLayout?.skipped) ? surface.packageLayout!.skipped : [];
+  const artifactRead = Boolean(m?.tarballSha256) || Boolean(surface.packageLayout);
 
   // Richest signal wins for the headline label; `inputs` keeps the full detail.
   let level: CoverageLevel;
@@ -53,7 +60,7 @@ export function computeCoverage(surface: ServerSurface, verification?: Verificat
     // plainly and name the flag that fixes it. Without this the most
     // actionable advice the report has would be missing from precisely the
     // scan that inspected the least.
-    if (surface.source?.kind === 'package') {
+    if (surface.source?.kind === 'package' && !artifactRead) {
       caveats.push(
         'The registry was not contacted, so not even the package record was read — the name alone is not a scan. ' +
           'Add --online to fetch the published package and analyze its source, or scan the running server: ' +
@@ -76,9 +83,13 @@ export function computeCoverage(surface: ServerSurface, verification?: Verificat
     }
     if (!implementationSource && !liveTransport) {
       caveats.push(
-        packageMetadata
-          ? 'The implementation source was not read — this reflects registry metadata only. Add --online to fetch and analyze the published package source.'
-          : 'The implementation source was not read — this reflects the declared tool metadata only.',
+        artifactRead && skipped.length
+          ? 'The implementation source was not read — the package was fetched, but its code is in files over the per-file size limit (listed below).'
+          : packageMetadata && !artifactRead
+            ? 'The implementation source was not read — this reflects registry metadata only. Add --online to fetch and analyze the published package source.'
+            : packageMetadata
+              ? 'The implementation source was not read — the published package was fetched but contains no source files the scanner reads.'
+              : 'The implementation source was not read — this reflects the declared tool metadata only.',
       );
     }
     // Provenance (npm/PyPI attestations) can only be checked with network
@@ -91,7 +102,25 @@ export function computeCoverage(surface: ServerSurface, verification?: Verificat
     }
   }
 
-  return { level, inputs: { toolSurface, implementationSource, packageMetadata, liveTransport }, caveats };
+  for (const k of skipped.slice(0, 5)) {
+    const mb = k.bytes / (1024 * 1024);
+    const size = mb >= 1 ? `${mb.toFixed(1)} MB` : `${Math.max(1, Math.round(k.bytes / 1024))} KB`;
+    const why =
+      k.reason === 'over-per-file-limit'
+        ? `over the ${Math.round(SOURCE_FILE_LIMIT_MB)} MB per-file limit`
+        : k.reason === 'over-total-limit'
+          ? 'over the total source-size budget'
+          : 'over the file-count budget';
+    caveats.push(`\`${k.path}\` (${size}) was not read: ${why}.`);
+  }
+  if (skipped.length > 5) caveats.push(`…and ${skipped.length - 5} more file(s) were not read for the same reasons.`);
+
+  return {
+    level,
+    inputs: { toolSurface, implementationSource, packageMetadata, liveTransport },
+    caveats,
+    ...(skipped.length ? { skipped: skipped.map((k) => ({ ...k })) } : {}),
+  };
 }
 
 /** A short human label for a coverage level (terminal/markdown headline). */

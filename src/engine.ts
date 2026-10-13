@@ -22,6 +22,8 @@ import { analyzeToxicFlows } from './detectors/toxicFlow.js';
 import { checkIntegrity, type Lockfile } from './lockfile.js';
 import { surfaceDigest } from './util/hash.js';
 import { computeScore } from './scoring/index.js';
+import { CAPABILITY_NOTE, isCapabilityRule } from './scoring/model.js';
+import { createHash } from 'node:crypto';
 import { computeCapabilityProfile } from './scoring/capability.js';
 import { computeCoverage } from './scoring/coverage.js';
 import { METHODOLOGY_VERSION, TOOL_NAME, TOOL_VERSION } from './version.js';
@@ -217,6 +219,17 @@ export async function scanSurface(rawSurface: ServerSurface, options: ScanOption
     }
   }
 
+  // Capability observations say so in their own words, and every finding carries
+  // a stable fingerprint — rule + where + the normalized evidence, never a line
+  // number — so a marketplace can suppress ONE location instead of a whole rule,
+  // and the suppression survives the code moving down a few lines.
+  for (const f of findings) {
+    if (isCapabilityRule(f.ruleId) && !f.description.includes('does not lower the trust grade')) {
+      f.description = `${f.description.trimEnd()} ${CAPABILITY_NOTE}`;
+    }
+    if (typeof f.data?.fingerprint !== 'string') f.data = { ...(f.data ?? {}), fingerprint: defaultFingerprint(f) };
+  }
+
   findings.sort((a, b) => {
     if (SEVERITY_ORDER[a.severity] !== SEVERITY_ORDER[b.severity])
       return SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity];
@@ -262,4 +275,11 @@ export async function scanSurface(rawSurface: ServerSurface, options: ScanOption
       findingsBySeverity,
     },
   };
+}
+
+/** Fingerprint for a finding that did not compute its own: rule + location + normalized evidence. */
+function defaultFingerprint(f: Finding): string {
+  const loc = f.location ? `${f.location.kind}:${f.location.name ?? ''}:${f.location.field ?? ''}` : '';
+  const ev = (f.evidence ?? '').replace(/\s+/g, ' ').replace(/:\d+\b/g, ':#').trim();
+  return createHash('sha256').update(`${f.ruleId}|${loc}|${ev}`).digest('hex');
 }

@@ -37,12 +37,16 @@ export function computeCapabilityProfile(
     'MTC-SRC-006': 'sensitive-source',
   };
   for (const f of findings) {
-    // A source finding downgraded to packaging/dev tooling (non-runtime) ships,
-    // but it is not the server's request-handling surface — it must NOT inflate
-    // the client's blast radius. Without this the tooling downgrade is cosmetic:
-    // the finding still buys the full -6/-10 capability penalty.
+    // A source finding downgraded to packaging/dev tooling (non-runtime), or in a
+    // file the MCP server does not import, ships — but it is not the server's
+    // request-handling surface, so it must NOT inflate the client's blast radius.
+    // Without this the downgrade is cosmetic: the finding still buys the -6/-10.
     if (f.data?.nonRuntime) continue;
-    const tag = ruleTag[f.ruleId];
+    // A finding can carry its own tag: MTC-SRC-002 tags a runtime-chosen command
+    // `code-exec`, a fixed program `process-spawn`, and a fixed program with fixed
+    // arguments nothing at all (`null`). Absent, the rule's default applies.
+    const explicit = f.data && 'capabilityTag' in f.data ? (f.data.capabilityTag as CapabilityTag | null) : undefined;
+    const tag = explicit !== undefined ? explicit : ruleTag[f.ruleId];
     if (tag) tagSet.add(tag);
   }
   const has = (t: CapabilityTag): boolean => tagSet.has(t);
@@ -58,6 +62,9 @@ export function computeCapabilityProfile(
   if (has('external-sink')) bump('moderate', 'can send data / act on an external service');
   if (has('file-write')) bump('moderate', 'can create, modify or delete files');
   if (has('sensitive-source')) bump('moderate', 'reads sensitive or local data');
+  // A fixed program (`execFile("git", […])`) is a real capability but not code
+  // execution: the model cannot choose what runs. Never more than moderate.
+  if (has('process-spawn')) bump('moderate', 'can start a fixed program (a process-spawning capability, not arbitrary code execution)');
 
   if (has('sensitive-source') && (has('external-sink') || has('code-exec'))) {
     bump('high', 'has a read → egress path (a data-exfiltration surface)');

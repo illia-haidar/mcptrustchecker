@@ -77,7 +77,12 @@ test('mere presence of exec/child_process (no concatenation) does not tank the g
   ]);
   assert.ok(!fired(r, 'MTC-SRC-009') && !fired(r, 'MTC-SRC-010'), 'no injection-flow finding on literal/validated calls');
   assert.ok(['A', 'B'].includes(r.score.grade), `expected A/B, got ${r.score.grade}`);
-  assert.ok(['high', 'critical'].includes(r.capabilityProfile.level), 'code-exec presence raises capability');
+  // Since 1.15 the call's SHAPE decides the capability: `exec("git status")` is a
+  // shell running an entirely literal command (shell-fixed) — a process-spawning
+  // capability (moderate), not code execution (high). A runtime-built command
+  // still raises it to high; see the call-shape tests.
+  assert.equal(r.capabilityProfile.level, 'moderate', 'a fixed shell command is process-spawn, not code-exec');
+  assert.equal(r.findings.find((f: any) => f.ruleId === 'MTC-SRC-002')?.data?.callShape, 'shell-fixed');
 });
 
 test('readSourceFiles collects code and skips vendored/hidden dirs', () => {
@@ -133,9 +138,16 @@ test('a capability sink in a packaging/install script is downgraded, not "in ser
   const r = await scanSource([{ path: 'scripts/adm-zip-security-lib.mjs', content: 'import { spawnSync } from "node:child_process";\nspawnSync("npm", ["ls"]);' }]);
   const src2 = findBy(r, 'MTC-SRC-002');
   assert.equal(src2.length, 1);
-  assert.equal(src2[0].severity, 'low', 'downgraded in packaging/dev tooling');
-  assert.equal(src2[0].confidence, 'heuristic');
+  // A fixed program with fixed arguments is `info` wherever it sits (1.15); the
+  // tooling location still caps anything stronger at low/heuristic.
+  assert.equal(src2[0].severity, 'info', 'a fixed call in tooling is a note');
+  assert.equal(src2[0].data.nonRuntime, true);
   assert.match(src2[0].title, /packaging\/dev tooling/);
+  // The same file with a runtime-chosen program is downgraded, not dropped.
+  const r2 = await scanSource([{ path: 'scripts/x.mjs', content: 'import { spawnSync } from "node:child_process";\nexport function go(c){ spawnSync(c, []); }' }]);
+  const t2 = findBy(r2, 'MTC-SRC-002')[0];
+  assert.equal(t2.severity, 'low');
+  assert.equal(t2.confidence, 'heuristic');
 });
 
 test('the SAME shell exec in the server runtime stays high "in server code"', async () => {

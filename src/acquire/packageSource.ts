@@ -18,10 +18,11 @@
 
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import type { PackageMeta, ServerSurface, SourceFile } from '../types.js';
+import type { PackageLayout, PackageMeta, ServerSurface, SkippedFile, SourceFile } from '../types.js';
 import { SOURCE_EXTENSIONS } from '../data/sourcePatterns.js';
 import { extractArchive, stripCommonRoot, type ArchiveEntry } from './archive.js';
-import { packageMetaFromJson, SIDECAR_MANIFESTS, SOURCE_LIMITS } from './source.js';
+import { LAYOUT_FILES, packageMetaFromJson, SIDECAR_MANIFESTS, SOURCE_LIMITS } from './source.js';
+import { LICENSE_FILE } from '../util/license.js';
 import { surfaceFromManifest } from './manifest.js';
 import { isBlockedHost } from './live.js';
 
@@ -48,6 +49,8 @@ export interface PackageSourceResult {
   sourceFiles: SourceFile[];
   /** Root-level sidecar files (package.json, tools.json, …) by base name. */
   sidecars: Record<string, string>;
+  /** Entry-point / license metadata and the files skipped by a size limit. */
+  layout: PackageLayout;
   /** SHA-256 (hex) of the verified compressed artifact. */
   tarballSha256: string;
 }
@@ -190,7 +193,7 @@ export async function downloadCapped(
   }
 }
 
-const SIDECAR_NAMES = new Set<string>(['package.json', ...SIDECAR_MANIFESTS]);
+const SIDECAR_NAMES = new Set<string>([...LAYOUT_FILES, ...SIDECAR_MANIFESTS]);
 
 /**
  * Directories skipped inside a published artifact. Deliberately NARROWER than
@@ -223,23 +226,41 @@ function isSourcePath(path: string): boolean {
  * root-level `package.json`/`tools.json` is found in every real layout. Output
  * is sorted by path so the scan is byte-identical regardless of archive order.
  */
-export function classifyArchiveEntries(entries: ArchiveEntry[]): { sourceFiles: SourceFile[]; sidecars: Record<string, string> } {
+export function classifyArchiveEntries(
+  entries: ArchiveEntry[],
+  skipped: SkippedFile[] = [],
+): { sourceFiles: SourceFile[]; sidecars: Record<string, string>; layout: PackageLayout } {
   const sourceFiles: SourceFile[] = [];
   const sidecars: Record<string, string> = {};
-  for (const e of stripCommonRoot(entries)) {
+  const licenseFiles: string[] = [];
+  const stripped = stripCommonRoot(entries);
+  // The shared top directory that stripCommonRoot removed, so skipped paths read the same way.
+  const root = stripped !== entries && entries[0] ? entries[0].path.slice(0, entries[0].path.indexOf('/') + 1) : '';
+  for (const e of stripped) {
     if (!e.path.includes('/') && SIDECAR_NAMES.has(e.path)) sidecars[e.path] = e.data.toString('utf8');
+    if (!e.path.includes('/') && LICENSE_FILE.test(e.path)) licenseFiles.push(e.path);
     if (isSourcePath(e.path)) sourceFiles.push({ path: e.path, content: e.data.toString('utf8') });
   }
   // Code-unit sort (never localeCompare) so order is reproducible on every machine.
   sourceFiles.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  return { sourceFiles, sidecars };
+  const files: Record<string, string> = {};
+  for (const n of LAYOUT_FILES) if (sidecars[n] !== undefined) files[n] = sidecars[n]!;
+  const layout: PackageLayout = {
+    files,
+    licenseFiles: licenseFiles.sort(),
+    skipped: skipped
+      .map((k) => ({ ...k, path: root && k.path.startsWith(root) ? k.path.slice(root.length) : k.path }))
+      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)),
+  };
+  return { sourceFiles, sidecars, layout };
 }
 
 /** The extraction predicate: implementation source + shallow sidecar files. */
 export function wantedSourceEntry(path: string): boolean {
   const parts = path.split('/');
-  // Sidecars only at the archive root or one level down (the pre-strip root dir).
-  if (parts.length <= 2 && SIDECAR_NAMES.has(parts[parts.length - 1]!)) return true;
+  // Sidecars and license files only at the archive root or one level down (the pre-strip root dir).
+  const base = parts[parts.length - 1]!;
+  if (parts.length <= 2 && (SIDECAR_NAMES.has(base) || LICENSE_FILE.test(base))) return true;
   return isSourcePath(path);
 }
 
@@ -258,8 +279,9 @@ export async function fetchPackageSource(
   const buf = await downloadCapped(url, registry, fetchImpl);
   verifyTarballIntegrity(buf, meta.tarballIntegrity);
   const tarballSha256 = createHash('sha256').update(buf).digest('hex');
-  const entries = extractArchive(buf, url.pathname, wantedSourceEntry, SOURCE_LIMITS);
-  return { ...classifyArchiveEntries(entries), tarballSha256 };
+  const skipped: SkippedFile[] = [];
+  const entries = extractArchive(buf, url.pathname, wantedSourceEntry, SOURCE_LIMITS, skipped);
+  return { ...classifyArchiveEntries(entries, skipped), tarballSha256 };
 }
 
 /**
@@ -270,8 +292,9 @@ export async function fetchPackageSource(
  */
 export function surfaceFromArchiveFile(path: string): ServerSurface {
   const buf = readFileSync(path);
-  const entries = extractArchive(buf, path, wantedSourceEntry, SOURCE_LIMITS);
-  const { sourceFiles, sidecars } = classifyArchiveEntries(entries);
+  const skipped: SkippedFile[] = [];
+  const entries = extractArchive(buf, path, wantedSourceEntry, SOURCE_LIMITS, skipped);
+  const { sourceFiles, sidecars, layout } = classifyArchiveEntries(entries, skipped);
 
   let manifest: unknown = {};
   for (const name of SIDECAR_MANIFESTS) {
@@ -294,5 +317,6 @@ export function surfaceFromArchiveFile(path: string): ServerSurface {
     tarballSha256: createHash('sha256').update(buf).digest('hex'),
   };
   surface.sourceFiles = sourceFiles;
+  surface.packageLayout = layout;
   return surface;
 }

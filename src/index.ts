@@ -69,6 +69,14 @@ export {
 
 // Hashing (rug-pull fingerprint)
 export { surfaceDigest, canonicalSurface } from './util/hash.js';
+// The license rule MTC-SUP-012 uses — exported so a marketplace that prints a
+// license beside the report gives the same answer as the report.
+export { licenseFromNpmManifest, licenseFromPypiInfo, licenseFromPyproject, licenseFromSetupCfg } from './util/license.js';
+// Per-location identity of a source finding (rule + file + normalized code, no line).
+export { findingFingerprint } from './detectors/source.js';
+// Which files of a package the MCP server can actually reach.
+export { buildReachability, type Reach, type ReachInfo } from './analysis/reachability.js';
+export { scanProcessCalls, type CallShape, type ProcessCall } from './analysis/callSites.js';
 
 // Reporters
 export { renderTerminal } from './report/terminal.js';

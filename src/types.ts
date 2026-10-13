@@ -184,6 +184,14 @@ export interface ServerSurface {
    */
   sourceFiles?: SourceFile[];
   /**
+   * The package's own layout, when its files were read: root-level metadata
+   * (package.json, pyproject.toml, setup.cfg, server.json) for entry points and
+   * license, the license files that ship, and the source files that were NOT
+   * read because of a size limit. Drives MCP-server reachability (which files
+   * the server can actually run) and honest coverage notes.
+   */
+  packageLayout?: PackageLayout;
+  /**
    * Where {@link tools} came from, when it matters for how far to trust them:
    *   - `live`   — enumerated from a running server (the real runtime surface).
    *   - `manifest`— a declared static tool list (a client-config/manifest).
@@ -201,6 +209,22 @@ export interface SourceFile {
   /** Path relative to the package root. */
   path: string;
   content: string;
+}
+
+/** A source file the scan did not read, and why. */
+export interface SkippedFile {
+  path: string;
+  bytes: number;
+  reason: 'over-per-file-limit' | 'over-total-limit' | 'over-file-count';
+}
+
+export interface PackageLayout {
+  /** Root-level metadata files by base name: package.json, pyproject.toml, setup.cfg, server.json. */
+  files: Record<string, string>;
+  /** Root-level license files that ship in the package (LICENSE, LICENCE.md, COPYING…). */
+  licenseFiles: string[];
+  /** Source files that exist but were not read, with the reason. */
+  skipped: SkippedFile[];
 }
 
 // ---------------------------------------------------------------------------
@@ -263,7 +287,13 @@ export type CapabilityTag =
   | 'sensitive-source' // reads private/local data (files, env, secrets, db…)
   | 'external-sink' // can send data out / act externally (http, email, publish…)
   | 'code-exec' // runs shell commands or evaluates code (a severe sink)
-  | 'file-write'; // writes or deletes files
+  | 'file-write' // writes or deletes files
+  /**
+   * Spawns a process whose PROGRAM is fixed in the code (`execFile("git", […])`,
+   * `execSync("npm --version")`). A real capability, but not arbitrary code
+   * execution: it raises the blast radius to `moderate` at most.
+   */
+  | 'process-spawn';
 
 export interface ToolCapability {
   tool: string;
@@ -336,6 +366,8 @@ export interface Coverage {
   };
   /** Honest notes on what the scan could NOT see; empty when coverage is complete. */
   caveats: string[];
+  /** Source files that exist but were not read (size limits), when any. */
+  skipped?: SkippedFile[];
 }
 
 export interface ToxicFlow {

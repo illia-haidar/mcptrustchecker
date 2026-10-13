@@ -1,4 +1,4 @@
-# Methodology — the Capability-Flow Trust Model (`mcptrustchecker-1.14`)
+# Methodology — the Capability-Flow Trust Model (`mcptrustchecker-1.15`)
 
 This document specifies exactly what MCP Trust Checker does, stage by stage. It is the spec behind every finding. The design goal is **auditability**: nothing here depends on a model's opinion, so a result can be reproduced and defended.
 
@@ -150,7 +150,7 @@ The rules split across the two axes exactly as the model requires:
 | Rule | What it finds | Axis |
 | --- | --- | --- |
 | `MTC-SRC-001` | dynamic code execution present (`eval`, `new Function`, `vm`) | capability |
-| `MTC-SRC-002` | shell/process execution present (`child_process`, `subprocess`) | capability |
+| `MTC-SRC-002` | process execution, graded per **call** by shape and reach (see below) | capability |
 | `MTC-SRC-003` | hardcoded egress to a fixed external host | capability |
 | `MTC-SRC-005` | dynamic module load from a non-literal | capability |
 | `MTC-SRC-006` | credential-path read / environment serialization | capability |
@@ -169,6 +169,40 @@ What still scores is the shape that actually indicates malice: a **decode-then-e
 dropper** (`MTC-SRC-004`), an **assembled command** (`MTC-SRC-009`), the **co-presence
 of both execution primitives** (`MTC-SRC-011`), and untrusted input *reaching* the
 sink, which is stage [4]'s job.
+
+**Process execution is graded per call (changed in `mcptrustchecker-1.15`).** The
+rule used to fire on the first `child_process` token in a file — usually the import
+line — and say "high, command injection / RCE" for every file alike. Now each call
+site is found (`execFile`, `spawn`, `exec`, `fork`, `promisify` aliases, compiled
+`(0, ns.execFile)(…)`, `cross-spawn`, `execa`; Python `subprocess`, `os.system`) and
+classified by what an attacker would have to control:
+
+| Shape | Condition | Severity | Capability tag |
+| --- | --- | --- | --- |
+| `shell-dynamic` | a shell runs a command line built at runtime | high | `code-exec` |
+| `dynamic-program` | no shell, but the program is chosen at runtime | high | `code-exec` |
+| `fixed-program-dynamic-args` | a fixed program, an argv with runtime elements | low (medium when tool input visibly reaches the argv) | `process-spawn` |
+| `shell-fixed` | a shell runs an entirely literal command line | low | `process-spawn` |
+| `fixed-program-fixed-args` | a fixed program with fixed arguments | info | — |
+
+A file takes its worst call. "Fixed" is decided by one constant folder shared by
+every rule (`src/util/constFold.ts`): literals, template strings without
+interpolation, concatenation, `const` aliases (scope-aware — a same-named constant
+in another function is never borrowed), ternaries of literals, `process.execPath`,
+`path.join`/`resolve` from the module's own directory, and the parameter of a
+**local** wrapper whose every call site passes a constant. An exported wrapper is
+never folded from its in-file callers: an outside caller could pass anything.
+`process-spawn` raises the blast radius to `moderate` at most.
+
+**Reach from the MCP server (added in `mcptrustchecker-1.15`).** A package is
+rarely only a server; it ships a CLI, a daemon, a client for its own server. The
+engine builds the import graph from the declared entry points (`bin`/`main`/
+`exports`, Python console scripts), finds the files that build or **handle** an MCP
+server (a client that *sends* `tools/call` is not one), and computes what the
+server can actually run — following a CLI's lazily-loaded `mcp serve` branch when
+the server is a subcommand. A capability sink in a file outside that closure is
+downgraded like tooling and does not raise the capability level. When no entry
+reaches a server, every file is `unknown` and nothing changes.
 
 **Presence vs. flow.** The capability rules fire on the mere presence of a sink;
 `MTC-SRC-009`/`-011` fire only when the code visibly builds the sink's argument from

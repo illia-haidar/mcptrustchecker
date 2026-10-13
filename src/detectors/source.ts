@@ -9,9 +9,17 @@
  * deterministic; no LLM, no execution of the code.
  */
 
-import type { Detector, DetectorContext, Finding, SourceFile } from '../types.js';
-import { SOURCE_PATTERNS, isNonRuntimePath } from '../data/sourcePatterns.js';
+import { createHash } from 'node:crypto';
+import type { CapabilityTag, Confidence, Detector, DetectorContext, Finding, Severity, SourceFile } from '../types.js';
+import { SOURCE_PATTERNS, isNonRuntimePath, type SourcePattern } from '../data/sourcePatterns.js';
 import { SECRET_PATTERNS } from '../data/injectionPatterns.js';
+import { buildReachability, type Reach } from '../analysis/reachability.js';
+import { scanProcessCalls, SHAPE_RANK, type CallShape, type ProcessCall } from '../analysis/callSites.js';
+import { toolFlowOf } from '../analysis/toolFlow.js';
+import { fileCtxOf, type FileCtx } from '../util/fileCtx.js';
+import { fold, isConst } from '../util/constFold.js';
+import { CAPABILITY_NOTE } from '../scoring/model.js';
+import { CODE, identOffsets, splitArgs } from '../util/jsLex.js';
 
 const MAX_FINDINGS_PER_RULE = 10; // don't drown the report on a big codebase
 
@@ -74,37 +82,55 @@ function isOptionalImportLoader(content: string, index: number): boolean {
  *  an `eval(`/`exec(` that is string DATA (a security scanner's detection pattern,
  *  a remediation example, a red-team payload fixture), not executed code. Uses a
  *  detection-rule key hint plus the standard odd-unescaped-quotes test. */
-function isInsideStringLiteral(content: string, index: number): boolean {
+function isInsideStringLiteral(content: string, index: number, file?: SourceFile): boolean {
   // Fast, high-precision hint: a `pattern:`/`example:`/`payload:` … key immediately
   // before a quote on the match's OWN line marks the value as detection/example DATA.
   let ls = index;
   while (ls > 0 && content[ls - 1] !== '\n') ls--;
   if (/\b(?:pattern|patterns|before|after|fix|example|examples|payload|sample|description|desc|label|rule|rules|title|message|msg|test|input|snippet|code|regex|match)s?\s*[:=]\s*['"`]/i.test(content.slice(ls, index)))
     return true;
-  // Multi-line string-state scan: a small lexer that tracks '/"/backtick strings
-  // (with escapes), Python triple-quotes and JS template literals ACROSS lines, so
-  // an `exec(`/`eval(` sitting inside a quoted rule/example — even a multi-line one —
-  // is recognised as data, not code. `//` and `/* */` comments are skipped so a
-  // quote inside a comment cannot throw off the string parity.
+  return stringStateAt(content, file)[index] === 1;
+}
+
+/**
+ * The multi-line string-state lexer, run ONCE per file: a small lexer that tracks
+ * '/"/backtick strings (with escapes), Python triple-quotes and JS template literals
+ * ACROSS lines, skipping `//` and `/* *\/` comments so a quote inside a comment
+ * cannot throw off the parity. `state[i] === 1` when offset i is inside a string.
+ * (It used to re-scan from offset 0 for every candidate match — quadratic on a
+ * large bundle, and the reason a 6 MB file could not be read at all.)
+ */
+const STRING_STATE = new WeakMap<object, Uint8Array>();
+function stringStateAt(content: string, file?: SourceFile): Uint8Array {
+  const key = file ?? null;
+  if (key) {
+    const hit = STRING_STATE.get(key);
+    if (hit) return hit;
+  }
+  const n = content.length;
+  const state = new Uint8Array(n + 1);
   let st: string | null = null; // '"' | "'" | '`' | '"""' | "'''"
-  for (let i = 0; i < index; ) {
+  for (let i = 0; i < n; ) {
+    state[i] = st === null ? 0 : 1;
     const c = content[i]!;
     if (st === null) {
-      if ((c === '"' || c === "'") && content[i + 1] === c && content[i + 2] === c) { st = c + c + c; i += 3; continue; }
+      if ((c === '"' || c === "'") && content[i + 1] === c && content[i + 2] === c) { st = c + c + c; state[i + 1] = 1; state[i + 2] = 1; i += 3; continue; }
       if (c === '"' || c === "'" || c === '`') { st = c; i += 1; continue; }
-      if (c === '/' && content[i + 1] === '/') { while (i < index && content[i] !== '\n') i++; continue; }
-      if (c === '/' && content[i + 1] === '*') { i += 2; while (i < index && !(content[i] === '*' && content[i + 1] === '/')) i++; i += 2; continue; }
+      if (c === '/' && content[i + 1] === '/') { while (i < n && content[i] !== '\n') { state[i] = 0; i++; } continue; }
+      if (c === '/' && content[i + 1] === '*') { state[i + 1] = 0; i += 2; while (i < n && !(content[i] === '*' && content[i + 1] === '/')) { state[i] = 0; i++; } if (i < n) state[i] = 0; if (i + 1 < n) state[i + 1] = 0; i += 2; continue; }
       i += 1;
     } else if (st.length === 3) {
-      if (c === st[0] && content[i + 1] === st[0] && content[i + 2] === st[0]) { st = null; i += 3; continue; }
+      if (c === st[0] && content[i + 1] === st[0] && content[i + 2] === st[0]) { st = null; state[i + 1] = 1; state[i + 2] = 1; i += 3; continue; }
       i += 1;
     } else {
-      if (c === '\\') { i += 2; continue; }
+      if (c === '\\') { if (i + 1 < n) state[i + 1] = 1; i += 2; continue; }
       if (c === st) { st = null; i += 1; continue; }
       i += 1;
     }
   }
-  return st !== null;
+  state[n] = st === null ? 0 : 1;
+  if (key) STRING_STATE.set(key, state);
+  return state;
 }
 
 /** True when the match sits on a comment line (`//`, `*`, `/*`, `#`) — a lexical
@@ -268,6 +294,310 @@ function classifySecret(
   return { severity: 'high', confidence: 'strong', note: 'a hardcoded credential in shipped code' };
 }
 
+/** One candidate finding, collected before the per-rule cap is applied. */
+interface Candidate {
+  rule: string;
+  file: string;
+  index: number;
+  reach: Reach;
+  nonRuntime: boolean;
+  /** Danger, for ordering: the call shape for SRC-002, the severity otherwise. */
+  danger: number;
+  finding: Finding;
+}
+
+const SEVERITY_RANK: Record<Severity, number> = { critical: 5, high: 4, medium: 3, low: 2, info: 1 };
+const REACH_RANK = (r: Reach): number => (r === true ? 0 : r === 'unknown' ? 1 : 2);
+
+
+/** Shape → severity, confidence, capability tag and the plain-language description of what the call does. */
+const SHAPE_PROFILE: Record<CallShape | 'import-only', { severity: Severity; confidence: Confidence; tag: CapabilityTag | null }> = {
+  'shell-dynamic': { severity: 'high', confidence: 'strong', tag: 'code-exec' },
+  'dynamic-program': { severity: 'high', confidence: 'strong', tag: 'code-exec' },
+  'fixed-program-dynamic-args': { severity: 'low', confidence: 'heuristic', tag: 'process-spawn' },
+  'shell-fixed': { severity: 'low', confidence: 'strong', tag: 'process-spawn' },
+  'fixed-program-fixed-args': { severity: 'info', confidence: 'strong', tag: null },
+  'import-only': { severity: 'info', confidence: 'strong', tag: null },
+};
+
+function minSeverity(a: Severity, b: Severity): Severity {
+  return SEVERITY_RANK[a] <= SEVERITY_RANK[b] ? a : b;
+}
+
+/** A stable identity for one location: rule + file + the normalized code at it (never the line number). */
+export function findingFingerprint(rule: string, file: string, fragment: string): string {
+  const norm = fragment.replace(/\s+/g, ' ').trim();
+  return createHash('sha256').update(`${rule}|${file}|${norm}`).digest('hex');
+}
+
+/** Where a file sits, in words, for titles and descriptions. */
+function placeOf(nonRuntime: boolean, reach: Reach): { where: string; suffix: string } {
+  if (nonRuntime) return { where: 'a packaging/dev/install script (shipped, but not the server runtime)', suffix: 'in packaging/dev tooling' };
+  if (reach === false) return { where: 'a non-server entry point (shipped in the package, but the MCP server does not import it — CLI / daemon / library code)', suffix: 'in a non-server entry point' };
+  if (reach === true) return { where: "the MCP server's implementation", suffix: 'in server code' };
+  return { where: "the package's implementation", suffix: 'in package code' };
+}
+
+const SHAPE_WORDS: Record<CallShape, string> = {
+  'shell-dynamic': 'a shell runs a command line built at runtime',
+  'dynamic-program': 'the program to run is chosen at runtime',
+  'fixed-program-dynamic-args': 'a fixed program with runtime arguments, no shell',
+  'shell-fixed': 'a shell runs a command line that is entirely literal',
+  'fixed-program-fixed-args': 'a fixed program with fixed arguments',
+};
+
+function src002Title(worst: ProcessCall | null, path: string, suffix: string): string {
+  if (!worst) return `Imports child_process; no call site found (${path})`;
+  const prog = worst.program.length > 48 ? `${worst.program.slice(0, 45)}…` : worst.program;
+  switch (worst.shape) {
+    case 'shell-dynamic':
+    case 'dynamic-program':
+      return `Shell/command execution ${suffix} (${path})`;
+    case 'fixed-program-dynamic-args':
+      return `Spawns \`${prog}\` with runtime arguments, no shell, ${suffix} (${path})`;
+    case 'shell-fixed':
+      return `Runs a fixed shell command \`${prog}\` ${suffix} (${path})`;
+    case 'fixed-program-fixed-args':
+      return `Spawns \`${prog}\` with fixed arguments ${suffix} (${path})`;
+  }
+}
+
+/** MTC-SRC-006: is this credential-file literal an element of a deny-list that is only ever membership-tested? */
+function isProtectiveDenyList(ctx: FileCtx, index: number): boolean {
+  const { src, mask } = ctx;
+  // The string literal that holds the match.
+  let i = index;
+  while (i < src.length && mask[i] !== 1 && i < index + 4) i++;
+  if (mask[i] !== 1) return false;
+  let start = i;
+  while (start > 0 && mask[start - 1] === 1) start--;
+  // Nearest unmatched opening bracket before the literal.
+  let depth = 0;
+  let open = -1;
+  for (let k = start - 1; k >= 0 && k > start - 20_000; k--) {
+    if (mask[k] !== CODE) continue;
+    const c = src[k]!;
+    if (c === ')' || c === ']' || c === '}') depth++;
+    else if (c === '(' || c === '[' || c === '{') {
+      if (depth === 0) { open = k; break; }
+      depth--;
+    }
+  }
+  if (open < 0) return false;
+  const before = src.slice(Math.max(0, open - 120), open);
+  const decl =
+    /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]{1,60})?=\s*(?:new\s+(?:Set|ReadonlySet)\s*(?:<[^>]*>)?\s*\(\s*|Object\.freeze\s*\(\s*)?$/.exec(before) ??
+    /(?:^|\n)[ \t]*([A-Za-z_]\w*)\s*(?::[^=\n]{1,60})?=\s*(?:frozenset\s*\(\s*|set\s*\(\s*|tuple\s*\(\s*)?$/.exec(before);
+  if (!decl) return false;
+  const name = decl[1]!;
+  const declAt = open - (before.length - decl.index) ;
+  const uses = identOffsets(src, mask, name).filter((u) => u < declAt || u > open);
+  if (!uses.length) return false;
+  return uses.every((u) => {
+    const after = src.slice(u + name.length, u + name.length + 24);
+    const back = src.slice(Math.max(0, u - 12), u);
+    const line = src.slice(src.lastIndexOf('\n', u) + 1, u);
+    if (/\bfor\b[^;:]*\bin\s+$/.test(line) || /\bfor\s*\([^;)]*\bin\s+$/.test(line)) return false; // iteration, not a membership test
+    return /^\s*\.\s*(?:has|includes|indexOf|__contains__)\s*\(/.test(after) || /\bin\s+$/.test(back) || /\bnot\s+in\s+$/.test(back);
+  });
+}
+
+/** MTC-SRC-005: does this `require(x)` / `import(x)` load a constant — usually a file of the package itself? */
+function loadsConstantModule(ctx: FileCtx, index: number): boolean {
+  const open = ctx.src.indexOf('(', index);
+  if (open < 0 || open > index + 20) return false;
+  const args = splitArgs(ctx.src, ctx.mask, open);
+  if (!args || args.args.length !== 1) return false;
+  const v = fold(ctx, args.args[0]!, { at: index, pathContext: true });
+  if (v.kind === 'own-path') {
+    const parts: string[] = [];
+    for (const seg of `${ctx.path.includes('/') ? ctx.path.slice(0, ctx.path.lastIndexOf('/')) : ''}/${v.value}`.split('/')) {
+      if (!seg || seg === '.') continue;
+      if (seg === '..') {
+        if (!parts.length) return false; // climbs out of the package: not its own module
+        parts.pop();
+      } else parts.push(seg);
+    }
+    return true;
+  }
+  return v.kind === 'literal' && isConst(v) && !v.values.some((x) => /^(?:\/|[A-Za-z]:[\\/]|~)/.test(x));
+}
+
+/** Report order of the rules (pattern order, then secrets) — keeps output stable. */
+function ruleIndex(rule: string): number {
+  const i = SOURCE_PATTERNS.findIndex((p) => p.id === rule);
+  return i >= 0 ? i : rule === 'MTC-SRC-008' ? SOURCE_PATTERNS.length : SOURCE_PATTERNS.length + 1;
+}
+
+/** A finding for a lexical pattern rule (everything but SRC-002 and SRC-008). */
+function patternCandidate(
+  p: SourcePattern,
+  f: SourceFile,
+  path: string,
+  m: RegExpExecArray,
+  nonRuntime: boolean,
+  reach: Reach,
+  entry: string | undefined,
+): Candidate {
+  const fctx = fileCtxOf(f);
+  const line = fctx.line(m.index);
+  const capabilityRule = CAPABILITY_SINK_RULES.has(p.id);
+  // A capability sink in packaging/dev tooling, or in a file the MCP server does
+  // not import, ships — but it is not the server's request-handling surface. It
+  // is right-sized and flagged `nonRuntime` so the capability score skips it.
+  // Reachability is evidence; a path name is a guess. A file the MCP server is
+  // proven to load is server code even under `vendor/` or `scripts/`.
+  const outside = capabilityRule && reach !== true && (nonRuntime || reach === false);
+  const severity: Severity = outside ? minSeverity(p.severity, 'low') : p.severity;
+  const confidence: Confidence = outside ? 'heuristic' : p.confidence;
+  const place = placeOf(nonRuntime && capabilityRule && reach !== true, reach);
+  const base = p.title.replace(/ in server code$/, '');
+  const title = place.suffix === 'in server code' && p.title === base ? `${p.title} (${path})` : `${base} ${place.suffix} (${path})`;
+  const evidence = f.content.slice(Math.max(0, m.index - 24), m.index + 96).replace(/\s+/g, ' ').trim().slice(0, 160);
+  return {
+    rule: p.id,
+    file: path,
+    index: m.index,
+    reach,
+    nonRuntime: outside || nonRuntime,
+    danger: SEVERITY_RANK[severity],
+    finding: {
+      ruleId: p.id,
+      title,
+      category: p.category,
+      severity,
+      confidence,
+      description:
+        `In ${place.where} (\`${path}:${line}\`): ${p.why} ` +
+        (reach === true && entry ? `Reachable from the MCP server via ${entry}. ` : '') +
+        'This is read from the code itself — not from the tool description — so a poisoned server cannot hide it behind honest-looking metadata.' +
+        (capabilityRule ? ` ${CAPABILITY_NOTE}` : ''),
+      remediation:
+        'Review this call path: confirm it never receives unsanitized tool input, constrain it, or remove it. ' +
+        'Treat a server whose code reaches these sinks as high-capability regardless of what its tools claim.',
+      location: { kind: 'server', name: path },
+      // Evidence carries a little surrounding source, not the bare token, so the
+      // claim is auditable ("why is this HIGH?") rather than an opaque `exec(`.
+      evidence,
+      owasp: p.category === 'exfiltration' ? 'LLM02:2025 Sensitive Information Disclosure' : 'LLM05:2025 Improper Output Handling',
+      // `nonRuntime` lets the capability scorer skip tooling/unreachable findings so
+      // the low/heuristic downgrade actually stops the -6/-10, not just relabels.
+      data: {
+        rule: p.id,
+        file: path,
+        line,
+        nonRuntime: outside,
+        reachable: reach,
+        ...(reach === true && entry ? { entry } : {}),
+        fingerprint: findingFingerprint(p.id, path, m[0] + f.content.slice(m.index + m[0].length, m.index + m[0].length + 60)),
+      },
+    },
+  };
+}
+
+/** MTC-SRC-002 for one file: the worst process call (or the bare import) and the reason. */
+function processCandidate(
+  fctx: FileCtx,
+  f: SourceFile,
+  path: string,
+  nonRuntime: boolean,
+  fileReach: Reach,
+  entry: string | undefined,
+  effReach: (index: number) => Reach = () => fileReach,
+): Candidate | null {
+  const scan = scanProcessCalls(fctx, toolFlowOf(fctx));
+  if (!scan.calls.length && !scan.importsModule) return null;
+  // Calls the server can run come first; then the most dangerous.
+  const worst = [...scan.calls].sort((a, b) => REACH_RANK(effReach(a.index)) - REACH_RANK(effReach(b.index)) || SHAPE_RANK[b.shape] - SHAPE_RANK[a.shape] || a.index - b.index)[0] ?? null;
+  const reach: Reach = worst ? effReach(worst.index) : fileReach;
+  const shape: CallShape | 'import-only' = worst ? worst.shape : 'import-only';
+  const profile = SHAPE_PROFILE[shape];
+  let severity = profile.severity;
+  let confidence = profile.confidence;
+  // A fixed program whose argv visibly carries a tool's input: the model can
+  // steer the arguments (an option-injection surface), still not the program.
+  if (shape === 'fixed-program-dynamic-args' && worst?.toolInput) severity = 'medium';
+  const outside = reach !== true && (nonRuntime || reach === false);
+  if (outside) {
+    severity = minSeverity(severity, 'low');
+    if (severity !== 'info') confidence = 'heuristic';
+  }
+  const place = placeOf(nonRuntime && reach !== true, reach);
+  const at = worst ? worst.index : Math.max(0, scan.importIndex);
+  const line = fctx.line(at);
+  const codeExec = shape === 'shell-dynamic' || shape === 'dynamic-program';
+
+  let what: string;
+  if (!worst) {
+    what = `the file imports child_process, but no call to it was found (it may be unused, or re-exported).`;
+  } else if (codeExec) {
+    what =
+      `\`${worst.method}(…)\` — ${SHAPE_WORDS[worst.shape]}. Spawning a process whose command line or program is decided at runtime ` +
+      'is code execution: with unsanitized tool input it is command injection / RCE.';
+  } else {
+    what =
+      `\`${worst.method}(…)\` spawns \`${worst.program}\` — ${SHAPE_WORDS[worst.shape]}. The program is fixed in the code, ` +
+      'so this is a process-spawning capability, not arbitrary code execution.' +
+      (worst.toolInput
+        ? ` An argument visibly comes from a tool's input, so check it cannot smuggle options into \`${worst.program}\`.`
+        : '');
+  }
+  const others = scan.calls.length > 1
+    ? ` ${scan.calls.length} process calls in this file: ` +
+      scan.calls
+        .slice(0, 6)
+        .map((c) => `:${c.line} ${c.shape} (${c.program.length > 32 ? `${c.program.slice(0, 29)}…` : c.program})`)
+        .join('; ') +
+      (scan.calls.length > 6 ? `; …${scan.calls.length - 6} more` : '') +
+      '.'
+    : '';
+  const remediation = codeExec
+    ? 'Pass a fixed program and an argv array instead of a shell string; never let tool input choose the program or the command line. ' +
+      'If a shell is genuinely required, validate every value that reaches it.'
+    : worst
+      ? 'Nothing to fix by itself: the program is fixed. Keep the argv array (no shell), and validate any argument that comes from tool input so it cannot start with `-`.'
+      : 'If the import is unused, drop it.';
+  const evidence = worst
+    ? worst.snippet
+    : f.content.slice(at, at + 120).replace(/\s+/g, ' ').trim().slice(0, 160);
+  return {
+    rule: 'MTC-SRC-002',
+    file: path,
+    index: at,
+    reach,
+    nonRuntime: outside,
+    danger: worst ? SHAPE_RANK[worst.shape] : 0,
+    finding: {
+      ruleId: 'MTC-SRC-002',
+      title: src002Title(worst, path, place.suffix),
+      category: 'permissions',
+      severity,
+      confidence,
+      description:
+        `In ${place.where} (\`${path}:${line}\`): ${what}${others} ` +
+        (reach === true && entry ? `Reachable from the MCP server via ${entry}. ` : '') +
+        `This is read from the code itself, not from the tool description. ${CAPABILITY_NOTE}`,
+      remediation,
+      location: { kind: 'server', name: path },
+      evidence,
+      owasp: 'LLM05:2025 Improper Output Handling',
+      data: {
+        rule: 'MTC-SRC-002',
+        file: path,
+        line,
+        nonRuntime: outside,
+        callShape: shape,
+        reachable: reach,
+        ...(reach === true && entry ? { entry } : {}),
+        capabilityTag: profile.tag,
+        toolInput: !!worst?.toolInput,
+        calls: scan.calls.map((c) => ({ line: c.line, method: c.method, shape: c.shape, program: c.program, toolInput: c.toolInput })),
+        fingerprint: findingFingerprint('MTC-SRC-002', path, evidence),
+      },
+    },
+  };
+}
+
 export const sourceDetector: Detector = {
   id: 'source',
   stage: 4,
@@ -284,118 +614,95 @@ export const sourceDetector: Detector = {
       const y = typeof b?.path === 'string' ? b.path : '';
       return x < y ? -1 : x > y ? 1 : 0;
     });
-    const findings: Finding[] = [];
-    const perRule = new Map<string, number>();
+    const valid = files.filter((f): f is SourceFile => !!f && typeof f.content === 'string');
+    // Which files the MCP server can actually reach (`unknown` when that cannot be decided).
+    const reach = buildReachability(valid, ctx.surface.packageLayout);
+    const candidates: Candidate[] = [];
 
-    for (const f of files) {
-      if (!f || typeof f.content !== 'string') continue;
+    for (const f of valid) {
       const path = typeof f.path === 'string' ? f.path : 'source';
       // Declaration files are types only — never runtime code. Skip them entirely.
       if (DECLARATION_FILE.test(path)) continue;
       const nonRuntime = isNonRuntimePath(path);
+      const r: Reach = reach.reach(path);
+      const fctx = fileCtxOf(f);
+      // A file the server's entry loads statically at startup: its TOP-LEVEL code
+      // runs in the server process, its functions only when something calls them.
+      const startup = r === false && reach.loadsAtStartup(path);
+      // A function defined there can still be handed to the server (a global, an
+      // injected dependency), so a call inside one is `unknown`, never "unreachable".
+      const effReach = (index: number): Reach => (startup ? (fctx.enclosingFn(index) === null ? true : 'unknown') : r);
 
       for (const p of SOURCE_PATTERNS) {
         if (nonRuntime && RUNTIME_ONLY_RULES.has(p.id)) continue;
-        const seen = perRule.get(p.id) ?? 0;
-        if (seen >= MAX_FINDINGS_PER_RULE) continue;
+        if (p.id === 'MTC-SRC-002') continue; // decided per call site, below
 
         // Take the first REAL match — skipping comments/JSDoc, the optional-import
-        // loader (SRC-001), and SQL passed to a DB `.exec()` (SRC-009) — so a benign
+        // loader (SRC-001), SQL passed to a DB `.exec()` (SRC-009), an own-package
+        // module path (SRC-005) and a protective deny-list (SRC-006) — so a benign
         // lexical hit can neither raise a finding nor mask a genuine later one.
         let m: RegExpExecArray | undefined;
         for (const cand of allMatches(f.content, p.pattern)) {
           if (cand.index === undefined) continue;
           if (isCommentLine(f.content, cand.index)) continue;
-          // Vendored/generated eval idioms (optional-import loader, wasm-bindgen
-          // glue, empty/escaped `new Function`) — benign for both SRC-001 (presence)
-          // and SRC-010 (dynamic eval).
           if ((p.id === 'MTC-SRC-001' || p.id === 'MTC-SRC-010') && isOptionalImportLoader(f.content, cand.index)) continue;
-          // A DB `.exec()` is not a shell command sink (SRC-009).
           if (p.id === 'MTC-SRC-009' && isSqlExec(f.content, cand.index)) continue;
-          // An `exec(`/`eval(`/decode-blob/deserialize match that is string DATA — a
-          // security scanner's detection pattern, a remediation example, a red-team
-          // payload fixture — is not executed code. SRC-004 (obfuscation) and SRC-007
-          // (unsafe deser) join SRC-009/010 here so a scanner cataloguing these
-          // shapes as strings does not self-flag.
-          if (STRING_GUARD_RULES.has(p.id) && isInsideStringLiteral(f.content, cand.index)) continue;
+          if (STRING_GUARD_RULES.has(p.id) && isInsideStringLiteral(f.content, cand.index, f)) continue;
+          if (p.id === 'MTC-SRC-005' && loadsConstantModule(fctx, cand.index)) continue;
+          if (p.id === 'MTC-SRC-006' && isProtectiveDenyList(fctx, cand.index)) continue;
           m = cand;
           break;
         }
         if (!m || m.index === undefined) continue;
+        candidates.push(patternCandidate(p, f, path, m, nonRuntime, effReach(m.index), reach.entryOf(path)));
+      }
 
-        // A capability sink in packaging/dev/install tooling ships, but it is not
-        // the server runtime (and an install-time shell is already MTC-SUP-010), so
-        // right-size it instead of overstating it as a HIGH threat "in server code".
-        const inTooling = nonRuntime && CAPABILITY_SINK_RULES.has(p.id);
-        const severity = inTooling ? ('low' as Finding['severity']) : p.severity;
-        const confidence = inTooling ? ('heuristic' as Finding['confidence']) : p.confidence;
-        const title = inTooling
-          ? `${p.title.replace(/ in server code$/, '')} in packaging/dev tooling (${path})`
-          : `${p.title} (${path})`;
-        const where = inTooling
-          ? 'a packaging/dev/install script (shipped, but not the server runtime)'
-          : "the server's implementation";
-
-        perRule.set(p.id, seen + 1);
-        findings.push({
-          ruleId: p.id,
-          title,
-          category: p.category,
-          severity,
-          confidence,
-          description:
-            `In ${where} (\`${path}:${lineOf(f.content, m.index)}\`): ${p.why} ` +
-            `This is read from the code itself — not from the tool description — so a poisoned server cannot hide it behind honest-looking metadata.`,
-          remediation:
-            'Review this call path: confirm it never receives unsanitized tool input, constrain it, or remove it. ' +
-            'Treat a server whose code reaches these sinks as high-capability regardless of what its tools claim.',
-          location: { kind: 'server', name: path },
-          // Evidence carries a little surrounding source, not the bare token, so the
-          // claim is auditable ("why is this HIGH?") rather than an opaque `exec(`.
-          evidence: f.content.slice(Math.max(0, m.index - 24), m.index + 96).replace(/\s+/g, ' ').trim().slice(0, 160),
-          owasp: p.category === 'exfiltration' ? 'LLM02:2025 Sensitive Information Disclosure' : 'LLM05:2025 Improper Output Handling',
-          // `nonRuntime` lets the capability scorer skip tooling findings so the
-          // low/heuristic downgrade actually stops the -6/-10, not just relabels.
-          data: { rule: p.id, file: path, line: lineOf(f.content, m.index), nonRuntime: inTooling },
-        });
+      // MTC-SRC-002 — per call site, with the call's shape.
+      if (/child_process|subprocess|\bos\.(?:system|popen)|create_subprocess|cross-spawn|['"]execa['"]|\b(?:exec|execSync|execFile|execFileSync|spawn|spawnSync)\s*\(/.test(f.content)) {
+        const c = processCandidate(fctx, f, path, nonRuntime, r, reach.entryOf(path), effReach);
+        if (c) candidates.push(c);
       }
 
       // Embedded credential VALUE hardcoded in source (not just referenced).
-      const seenSecret = perRule.get('MTC-SRC-008') ?? 0;
-      if (seenSecret < MAX_FINDINGS_PER_RULE) {
-        for (const sp of SECRET_PATTERNS) {
-          let hit: { m: RegExpExecArray; sev: Finding['severity']; conf: Finding['confidence']; note: string } | undefined;
-          for (const cand of allMatches(f.content, sp.pattern)) {
-            if (cand.index === undefined) continue;
-            // A secret on a comment line, or a placeholder/sample/public-by-design
-            // value, is not a leaked credential — skip and keep looking.
-            if (isCommentLine(f.content, cand.index)) continue;
-            const win = f.content.slice(Math.max(0, cand.index - 80), cand.index + 120);
-            const cls = classifySecret(sp.id, cand[0]!, win);
-            if (!cls) continue;
-            let { severity, confidence } = cls;
-            // A "secret" in test/benchmark/example/vendor/build code is a fixture,
-            // not a runtime credential leak: cap it at low/heuristic so it can
-            // neither trip the confirmed-high gate nor demote a band, and attribute
-            // it honestly ("in test/example/packaging").
-            if (nonRuntime) {
-              severity = 'low';
-              confidence = 'heuristic';
-            } else if (confidence === 'confirmed' && isCorroboratedFixture(path, f.content, cand.index)) {
-              // A confirmed live-secret shape sitting in a CORROBORATED fixture — a
-              // scanner's own vector corpus, or a file marked leak/demo/fixture — is
-              // test data, not a runtime leak. Downgrade so it cannot trip the gate.
-              // (Requires corroboration; a plain single embedded credential stays confirmed.)
-              severity = 'low';
-              confidence = 'heuristic';
-            }
-            hit = { m: cand, sev: severity, conf: confidence, note: cls.note };
-            break;
+      for (const sp of SECRET_PATTERNS) {
+        let hit: { m: RegExpExecArray; sev: Finding['severity']; conf: Finding['confidence']; note: string } | undefined;
+        for (const cand of allMatches(f.content, sp.pattern)) {
+          if (cand.index === undefined) continue;
+          // A secret on a comment line, or a placeholder/sample/public-by-design
+          // value, is not a leaked credential — skip and keep looking.
+          if (isCommentLine(f.content, cand.index)) continue;
+          const win = f.content.slice(Math.max(0, cand.index - 80), cand.index + 120);
+          const cls = classifySecret(sp.id, cand[0]!, win);
+          if (!cls) continue;
+          let { severity, confidence } = cls;
+          // A "secret" in test/benchmark/example/vendor/build code is a fixture,
+          // not a runtime credential leak: cap it at low/heuristic so it can
+          // neither trip the confirmed-high gate nor demote a band, and attribute
+          // it honestly ("in test/example/packaging").
+          if (nonRuntime) {
+            severity = 'low';
+            confidence = 'heuristic';
+          } else if (confidence === 'confirmed' && isCorroboratedFixture(path, f.content, cand.index)) {
+            // A confirmed live-secret shape sitting in a CORROBORATED fixture — a
+            // scanner's own vector corpus, or a file marked leak/demo/fixture — is
+            // test data, not a runtime leak. Downgrade so it cannot trip the gate.
+            // (Requires corroboration; a plain single embedded credential stays confirmed.)
+            severity = 'low';
+            confidence = 'heuristic';
           }
-          if (!hit) continue;
-          perRule.set('MTC-SRC-008', seenSecret + 1);
-          const line = lineOf(f.content, hit.m.index!);
-          findings.push({
+          hit = { m: cand, sev: severity, conf: confidence, note: cls.note };
+          break;
+        }
+        if (!hit) continue;
+        const line = fctx.line(hit.m.index!);
+        candidates.push({
+          rule: 'MTC-SRC-008',
+          file: path,
+          index: hit.m.index!,
+          reach: r,
+          nonRuntime,
+          danger: SEVERITY_RANK[hit.sev],
+          finding: {
             ruleId: 'MTC-SRC-008',
             title: nonRuntime
               ? `Hardcoded ${sp.label} in test/example/packaging (${path})`
@@ -412,10 +719,43 @@ export const sourceDetector: Detector = {
             location: { kind: 'server', name: path },
             evidence: `${sp.label}: ${hit.m[0]!.slice(0, 4)}…(redacted)`,
             owasp: 'LLM02:2025 Sensitive Information Disclosure',
-            data: { secretType: sp.id, file: path, line },
-          });
-          break; // one secret finding per file is enough
-        }
+            data: { secretType: sp.id, file: path, line, fingerprint: findingFingerprint('MTC-SRC-008', path, sp.id + hit.m[0]!.slice(0, 8)) },
+          },
+        });
+        break; // one secret finding per file is enough
+      }
+    }
+
+    // Apply the per-rule cap AFTER ordering: reachable from the MCP server first,
+    // then the most dangerous, runtime before tooling, then path — so a capped
+    // report shows what makes the server what it is, not the first ten files in
+    // alphabetical order (which used to be CLI scraps, hiding the one call that
+    // earned the capability level).
+    const findings: Finding[] = [];
+    const byRule = new Map<string, Candidate[]>();
+    for (const c of candidates) {
+      const list = byRule.get(c.rule) ?? [];
+      list.push(c);
+      byRule.set(c.rule, list);
+    }
+    const ruleOrder = [...byRule.keys()].sort((a, b) => ruleIndex(a) - ruleIndex(b) || (a < b ? -1 : a > b ? 1 : 0));
+    for (const rule of ruleOrder) {
+      const list = byRule.get(rule)!;
+      list.sort(
+        (a, b) =>
+          REACH_RANK(a.reach) - REACH_RANK(b.reach) ||
+          b.danger - a.danger ||
+          Number(a.nonRuntime) - Number(b.nonRuntime) ||
+          (a.file < b.file ? -1 : a.file > b.file ? 1 : 0) ||
+          a.index - b.index,
+      );
+      const kept = list.slice(0, MAX_FINDINGS_PER_RULE);
+      const omitted = list.length - kept.length;
+      for (const c of kept) findings.push(c.finding);
+      if (omitted > 0) {
+        const last = kept[kept.length - 1]!.finding;
+        last.data = { ...(last.data ?? {}), omitted };
+        last.description += ` …and ${omitted} more location${omitted === 1 ? '' : 's'} for this rule (the report keeps the ${MAX_FINDINGS_PER_RULE} most significant).`;
       }
     }
 

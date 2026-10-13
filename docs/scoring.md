@@ -58,7 +58,7 @@ Higher score = safer. A clean, fully-inspected, minimal-capability surface score
 
 | Term | What it prices | Values |
 | --- | --- | ---: |
-| `E_cap` | blast radius if the model driving the server is manipulated | minimal 0 · moderate 3 · high 6 · critical 10 |
+| `E_cap` | blast radius if the model driving the server is manipulated | minimal 0 · moderate 3 · high 6 · critical 10 — a fixed program spawned without a shell (`process-spawn`) reaches moderate at most; only a runtime-chosen command or program is `code-exec` (high) |
 | `E_ver` | how verifiable the artifact's origin is | vendor scope 0 · build provenance 0 · public repo 1 · unlocatable 5 |
 | `E_cov` | how much of the target the scan could actually read | live/source 0 · manifest 4 · metadata 8 · **empty 25** |
 

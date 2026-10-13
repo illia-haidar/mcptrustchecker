@@ -9,6 +9,7 @@
  */
 
 import { gunzipSync, inflateRawSync } from 'node:zlib';
+import type { SkippedFile } from '../types.js';
 
 export interface ArchiveEntry {
   /** Normalized relative path inside the archive (always `/`-separated). */
@@ -109,7 +110,7 @@ function parsePax(body: Buffer): Record<string, string> {
  * directories, links and device nodes; stops on the first malformed header
  * rather than guessing at offsets.
  */
-export function extractTar(tar: Buffer, wanted: (path: string) => boolean, limits: ArchiveLimits): ArchiveEntry[] {
+export function extractTar(tar: Buffer, wanted: (path: string) => boolean, limits: ArchiveLimits, skipped?: SkippedFile[]): ArchiveEntry[] {
   const out: ArchiveEntry[] = [];
   let total = 0;
   let off = 0;
@@ -158,10 +159,22 @@ export function extractTar(tar: Buffer, wanted: (path: string) => boolean, limit
     // '0' and NUL are regular files; everything else (dirs, links, devices) is skipped.
     if (type === '0' || type === '\0') {
       const path = safeEntryPath(name);
-      if (path && size <= limits.maxFileBytes && wanted(path)) {
-        if (out.length >= limits.maxFiles || total + size > limits.maxTotalBytes) return out;
-        out.push({ path, data: Buffer.from(tar.subarray(dataStart, dataStart + size)) });
-        total += size;
+      if (path && wanted(path)) {
+        // A wanted file that is not read must be RECORDED, not silently dropped:
+        // a 6 MB single-file bundle used to vanish here and the scan reported
+        // "metadata only — add --online" for a package it had downloaded.
+        if (size > limits.maxFileBytes) {
+          skipped?.push({ path, bytes: size, reason: 'over-per-file-limit' });
+        } else if (out.length >= limits.maxFiles) {
+          skipped?.push({ path, bytes: size, reason: 'over-file-count' });
+          return out;
+        } else if (total + size > limits.maxTotalBytes) {
+          skipped?.push({ path, bytes: size, reason: 'over-total-limit' });
+          return out;
+        } else {
+          out.push({ path, data: Buffer.from(tar.subarray(dataStart, dataStart + size)) });
+          total += size;
+        }
       }
     }
     off = next;
@@ -187,7 +200,7 @@ function findEocd(zip: Buffer): number {
  * skips encrypted entries and directories; zip64 archives are rejected (a
  * package artifact has no business being >4 GB).
  */
-export function extractZip(zip: Buffer, wanted: (path: string) => boolean, limits: ArchiveLimits): ArchiveEntry[] {
+export function extractZip(zip: Buffer, wanted: (path: string) => boolean, limits: ArchiveLimits, skipped?: SkippedFile[]): ArchiveEntry[] {
   const eocd = findEocd(zip);
   if (eocd < 0) throw new Error('Not a zip archive (no end-of-central-directory record).');
   const count = zip.readUInt16LE(eocd + 10);
@@ -229,10 +242,17 @@ export function extractZip(zip: Buffer, wanted: (path: string) => boolean, limit
     const path = safeEntryPath(rawName);
     // Cheap rejections (bad path, declared over-cap, unwanted, over-budget
     // compressed size, or an already-inflated stream) cost no decompression.
-    if (!path || uncompSize > limits.maxFileBytes || !wanted(path)) continue;
+    if (!path || !wanted(path)) continue;
+    if (uncompSize > limits.maxFileBytes) {
+      skipped?.push({ path, bytes: uncompSize, reason: 'over-per-file-limit' });
+      continue;
+    }
     if (compSize > limits.maxTotalBytes || seen.has(localOff)) continue;
     // Stop before any more work once ANY budget is spent.
-    if (processed >= limits.maxFiles || total >= limits.maxTotalBytes || inflatedBytes >= limits.maxTotalBytes) break;
+    if (processed >= limits.maxFiles || total >= limits.maxTotalBytes || inflatedBytes >= limits.maxTotalBytes) {
+      skipped?.push({ path, bytes: uncompSize, reason: processed >= limits.maxFiles ? 'over-file-count' : 'over-total-limit' });
+      break;
+    }
 
     // Local header re-read: its name/extra lengths can differ from the central directory's.
     if (localOff + 30 > zip.length || zip.readUInt32LE(localOff) !== ZIP_LOCAL_SIG) continue;
@@ -267,6 +287,7 @@ export function extractZip(zip: Buffer, wanted: (path: string) => boolean, limit
     }
     if (data.length > limits.maxFileBytes) {
       total += data.length;
+      skipped?.push({ path, bytes: data.length, reason: 'over-per-file-limit' });
       continue;
     }
     out.push({ path, data });
@@ -295,11 +316,12 @@ export function extractArchive(
   nameHint: string,
   wanted: (path: string) => boolean,
   limits: ArchiveLimits,
+  skipped?: SkippedFile[],
 ): ArchiveEntry[] {
   const kind = detectArchiveKind(buf, nameHint);
-  if (kind === 'zip') return extractZip(buf, wanted, limits);
+  if (kind === 'zip') return extractZip(buf, wanted, limits, skipped);
   const tar = kind === 'tgz' ? gunzipBounded(buf) : buf;
-  return extractTar(tar, wanted, limits);
+  return extractTar(tar, wanted, limits, skipped);
 }
 
 /**

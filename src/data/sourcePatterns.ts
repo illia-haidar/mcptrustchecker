@@ -83,6 +83,9 @@ export const SOURCE_PATTERNS: SourcePattern[] = [
   // ── Shell / command execution ───────────────────────────────────────────────
   {
     id: 'MTC-SRC-002',
+    // Pre-filter only. The finding itself is built per CALL SITE in
+    // detectors/source.ts (analysis/callSites.ts): its shape and its reach from
+    // the MCP server decide severity, tag and wording — never this first match.
     title: 'Shell/command execution in server code',
     lang: 'any',
     // Bare `exec(` / `spawn(` must not be preceded by a dot: `regex.exec(str)`
@@ -98,7 +101,7 @@ export const SOURCE_PATTERNS: SourcePattern[] = [
     severity: 'high',
     confidence: 'strong',
     category: 'permissions',
-    why: 'Spawning a shell/process is command-execution capability; with unsanitized tool input it is command injection / RCE.',
+    why: 'Spawning a process whose command line or program is decided at runtime is code execution; with unsanitized tool input it is command injection / RCE. A fixed program spawned without a shell is a process-spawning capability.',
   },
   // ── Outbound egress to a hardcoded external host ────────────────────────────
   {

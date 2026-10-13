@@ -110,6 +110,7 @@ async function attachPublishedSource(surface: ServerSurface, opts: ResolveOption
     if (!src) return;
     meta.tarballSha256 = src.tarballSha256;
     surface.sourceFiles = src.sourceFiles;
+    surface.packageLayout = src.layout;
     // With the real source in hand but no running server to enumerate tools,
     // reconstruct the tool surface statically so the MCP-specific detectors
     // (tool-poisoning, unicode smuggling, toxic flows, name collisions, per-tool

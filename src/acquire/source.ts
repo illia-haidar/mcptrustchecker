@@ -8,27 +8,33 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, relative, extname } from 'node:path';
-import type { ServerSurface, SourceFile } from '../types.js';
+import type { PackageLayout, ServerSurface, SkippedFile, SourceFile } from '../types.js';
+import { LICENSE_FILE, licenseFromNpmManifest, licenseFromPyproject, licenseFromSetupCfg } from '../util/license.js';
 import { SOURCE_EXTENSIONS } from '../data/sourcePatterns.js';
 import { surfaceFromManifest } from './manifest.js';
 
 export const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'coverage', '.next', '__pycache__', 'venv', '.venv', 'vendor']);
 export const SOURCE_LIMITS = {
   maxFiles: 400,
-  // Modern MCP servers ship a single bundled esbuild/tsup `dist` file that is
-  // routinely 0.5–4 MB. A 512 KB cap silently DROPPED those, so the package was
-  // graded coverage=metadata (−8) AND every source detector ran on zero bytes —
-  // an unfair penalty and a security false-negative (a bundled malicious server
-  // scored like an empty stub). 4 MB recovers the vast majority of bundled builds.
-  maxFileBytes: 4 * 1024 * 1024, // 4 MB per file
+  // Modern MCP servers ship a single bundled esbuild/tsup `dist` file. A 512 KB
+  // cap silently DROPPED those (coverage=metadata, every source detector on zero
+  // bytes); 4 MB still dropped the 6–8 MB bundles that inline a whole SDK — and
+  // the report then advised "add --online" for a package it HAD downloaded. 16 MB
+  // per file, under the unchanged 24 MB total, reads them; the per-file analyses
+  // are linear (one lexer pass, one string-state pass), measured at ~1 s for a
+  // 6 MB bundle. Anything still over the cap is recorded and named in the report.
+  maxFileBytes: 16 * 1024 * 1024, // 16 MB per file
   maxTotalBytes: 24 * 1024 * 1024, // 24 MB total
 } as const;
 const MAX_FILES = SOURCE_LIMITS.maxFiles;
 const MAX_FILE_BYTES = SOURCE_LIMITS.maxFileBytes;
 const MAX_TOTAL_BYTES = SOURCE_LIMITS.maxTotalBytes;
 
+/** Root-level metadata the analyses read: entry points (reachability) and license. */
+export const LAYOUT_FILES = ['package.json', 'pyproject.toml', 'setup.cfg', 'server.json'] as const;
+
 /** Recursively collect scannable source files from a directory (bounded). */
-export function readSourceFiles(dir: string): SourceFile[] {
+export function readSourceFiles(dir: string, skipped?: SkippedFile[]): SourceFile[] {
   const out: SourceFile[] = [];
   let total = 0;
   const walk = (d: string): void => {
@@ -53,7 +59,10 @@ export function readSourceFiles(dir: string): SourceFile[] {
         continue;
       }
       if (!SOURCE_EXTENSIONS.has(extname(name).toLowerCase())) continue;
-      if (st.size > MAX_FILE_BYTES) continue;
+      if (st.size > MAX_FILE_BYTES) {
+        skipped?.push({ path: relative(dir, full) || name, bytes: st.size, reason: 'over-per-file-limit' });
+        continue;
+      }
       try {
         out.push({ path: relative(dir, full) || name, content: readFileSync(full, 'utf8') });
         total += st.size;
@@ -82,7 +91,7 @@ export function packageMetaFromJson(text: string): ServerSurface['packageMeta'] 
       version: typeof pkg.version === 'string' ? pkg.version : undefined,
       scripts: (pkg.scripts as Record<string, string>) ?? undefined,
       dependencies: pkg.dependencies ? Object.keys(pkg.dependencies as object) : undefined,
-      license: typeof pkg.license === 'string' ? pkg.license : null,
+      license: licenseFromNpmManifest(pkg),
       repositoryUrl:
         typeof pkg.repository === 'string'
           ? pkg.repository
@@ -128,6 +137,37 @@ export function surfaceFromPackageDir(dir: string): ServerSurface {
   const surface = surfaceFromManifest(manifest, dir, dir);
   surface.source = { kind: 'package', origin: dir };
   surface.packageMeta = { ...readPackageMeta(dir), ...(surface.packageMeta ?? {}) };
-  surface.sourceFiles = readSourceFiles(dir);
+  const skipped: SkippedFile[] = [];
+  surface.sourceFiles = readSourceFiles(dir, skipped);
+  const layout = readLayout(dir, skipped);
+  surface.packageLayout = layout;
+  // A Python project (or a JS one that declares nothing in package.json) may
+  // declare its license in pyproject.toml / setup.cfg instead.
+  if (!surface.packageMeta.license) {
+    const declared = licenseFromPyproject(layout.files['pyproject.toml']) ?? licenseFromSetupCfg(layout.files['setup.cfg']);
+    if (declared) surface.packageMeta.license = declared;
+    else if (surface.packageMeta.license === undefined && (layout.files['pyproject.toml'] || layout.files['setup.cfg'])) surface.packageMeta.license = null;
+  }
   return surface;
+}
+
+/** Root-level metadata files and license files of a local package directory. */
+function readLayout(dir: string, skipped: SkippedFile[]): PackageLayout {
+  const files: Record<string, string> = {};
+  for (const n of LAYOUT_FILES) {
+    const p = join(dir, n);
+    if (!existsSync(p)) continue;
+    try {
+      if (statSync(p).size <= 1024 * 1024) files[n] = readFileSync(p, 'utf8');
+    } catch {
+      /* unreadable — skip */
+    }
+  }
+  let licenseFiles: string[] = [];
+  try {
+    licenseFiles = readdirSync(dir).filter((n) => LICENSE_FILE.test(n)).sort();
+  } catch {
+    /* unreadable directory */
+  }
+  return { files, licenseFiles, skipped: skipped.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)) };
 }

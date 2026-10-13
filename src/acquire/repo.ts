@@ -21,7 +21,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import type { ServerSurface } from '../types.js';
+import type { ServerSurface, SkippedFile } from '../types.js';
 import { extractArchive } from './archive.js';
 import { SOURCE_LIMITS, SIDECAR_MANIFESTS, packageMetaFromJson } from './source.js';
 import { surfaceFromManifest } from './manifest.js';
@@ -108,8 +108,9 @@ export async function surfaceFromGithubRepo(
   const url = assertTrustedTarballUrl(target, 'github');
 
   const buf = await downloadCapped(url, 'github', authedFetch(fetchImpl, opts.token));
-  const entries = extractArchive(buf, 'repo.tar.gz', wantedSourceEntry, SOURCE_LIMITS);
-  const { sourceFiles, sidecars } = classifyArchiveEntries(entries);
+  const skipped: SkippedFile[] = [];
+  const entries = extractArchive(buf, 'repo.tar.gz', wantedSourceEntry, SOURCE_LIMITS, skipped);
+  const { sourceFiles, sidecars, layout } = classifyArchiveEntries(entries, skipped);
 
   let manifest: unknown = {};
   for (const name of SIDECAR_MANIFESTS) {
@@ -137,6 +138,7 @@ export async function surfaceFromGithubRepo(
     tarballSha256: createHash('sha256').update(buf).digest('hex'),
   };
   surface.sourceFiles = sourceFiles;
+  surface.packageLayout = layout;
   return surface;
 }
 

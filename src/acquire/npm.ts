@@ -5,6 +5,7 @@
  */
 
 import type { PackageMeta } from '../types.js';
+import { licenseFromNpmManifest, licenseFromPypiInfo } from '../util/license.js';
 import { classifyPublisher } from './publisher.js';
 
 async function getJson(url: string, timeoutMs = 8000): Promise<unknown> {
@@ -79,10 +80,15 @@ const CODE_FORGE = /^https:\/\/(www\.)?(github\.com|gitlab\.com|bitbucket\.org|c
  * code forge — a docs `homepage` is not a repository. `/issues|/discussions|/wiki`
  * suffixes (a `bugs.url`) are trimmed back to the repo root.
  */
-export function pickNpmRepoUrl(pkg: Record<string, any>, v: Record<string, any> | undefined): string | null {
-  const fromRepo = normalizeRepoUrl(v?.repository ?? pkg?.repository);
+export function pickNpmRepoUrl(pkg: Record<string, any>, v: Record<string, any> | undefined, pinned = false): string | null {
+  // The packument's TOP-LEVEL repository/homepage/bugs mirror the LATEST
+  // version. For an exact pinned version they are someone else's answer: a
+  // scan of 1.3.0 inherited 1.7.0's repository and passed MTC-SUP-011 for a
+  // release that declared none. A pin reads only its own manifest.
+  const top = pinned ? undefined : pkg;
+  const fromRepo = normalizeRepoUrl(v?.repository ?? top?.repository);
   if (fromRepo) return fromRepo;
-  for (const cand of [v?.homepage, pkg?.homepage, v?.bugs?.url, pkg?.bugs?.url, v?.bugs, pkg?.bugs]) {
+  for (const cand of [v?.homepage, top?.homepage, v?.bugs?.url, top?.bugs?.url, v?.bugs, top?.bugs]) {
     const raw = typeof cand === 'string' ? cand : undefined;
     if (!raw) continue;
     const trimmed = raw.replace(/\/(issues|discussions|wiki|pulls?)(\/.*)?$/i, '');
@@ -136,8 +142,10 @@ export async function fetchNpmMeta(name: string, requested?: string): Promise<Pa
     if (v) {
       meta.scripts = v.scripts ?? {};
       meta.dependencies = Object.keys(v.dependencies ?? {});
-      meta.license = typeof v.license === 'string' ? v.license : v.license == null ? null : String(v.license);
-      meta.repositoryUrl = pickNpmRepoUrl(packument, v);
+      // A pin reads only its own manifest; an unpinned scan may fall back to the
+      // packument's top level (which mirrors latest — the version being read).
+      meta.license = licenseFromNpmManifest(v) ?? (wantExact ? null : licenseFromNpmManifest(packument));
+      meta.repositoryUrl = pickNpmRepoUrl(packument, v, wantExact);
       // The published artifact: URL + registry-declared hash (SRI, or legacy sha1 hex).
       meta.tarballUrl = typeof v.dist?.tarball === 'string' ? v.dist.tarball : null;
       meta.tarballIntegrity =
@@ -188,7 +196,7 @@ export async function fetchPypiMeta(name: string, requested?: string): Promise<P
       : typeof data.info.version === 'string'
         ? data.info.version
         : undefined;
-    meta.license = data.info.license || null;
+    meta.license = licenseFromPypiInfo(data.info);
     meta.repositoryUrl = pickPypiRepoUrl(data.info);
     // The published artifact: prefer the sdist (real source layout) over a wheel.
     const files = Array.isArray(data.urls) ? data.urls : [];

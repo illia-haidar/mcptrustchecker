@@ -8,7 +8,8 @@
  * / provenance risk. Anchored to the curated protected list (never all-pairs).
  */
 
-import type { Detector, DetectorContext, Finding, PackageMeta, ResolvedConfig } from '../types.js';
+import type { Detector, DetectorContext, Finding, PackageLayout, PackageMeta, ResolvedConfig, SourceFile } from '../types.js';
+import { reviewInstallHook, type HookReview } from '../analysis/installHook.js';
 import {
   COMBOSQUAT_SUFFIXES,
   GENERIC_COMBO_TOKENS,
@@ -139,7 +140,13 @@ export function analyzeTyposquat(name: string, meta: PackageMeta | undefined, co
 }
 
 /** Install-script & provenance risk from package metadata. */
-export function analyzeProvenance(meta: PackageMeta): Finding[] {
+/** What the scan read alongside the metadata: the package's files and layout. */
+export interface ProvenanceContext {
+  sourceFiles?: SourceFile[];
+  layout?: PackageLayout;
+}
+
+export function analyzeProvenance(meta: PackageMeta, extra: ProvenanceContext = {}): Finding[] {
   const findings: Finding[] = [];
   const name = meta.name ?? 'package';
 
@@ -175,6 +182,7 @@ export function analyzeProvenance(meta: PackageMeta): Finding[] {
     let confidence: Finding['confidence'];
     let title: string;
     let why: string;
+    let hookData: HookReview | null = null;
     if (pipedToShell) {
       severity = 'high';
       confidence = 'confirmed';
@@ -186,12 +194,23 @@ export function analyzeProvenance(meta: PackageMeta): Finding[] {
       title = 'Install script downloads and runs a remote binary';
       why = 'The install hook fetches an external artifact and makes it executable — vet the source and the binary before trusting it.';
     } else {
-      // Benign one-liner (npm rebuild, only-allow, husky…) or a script FILE whose
-      // body is not in the manifest: a mild, worth-noting signal, never an F-driver.
+      // Benign one-liner (npm rebuild, only-allow, husky…) or a script FILE. When
+      // the hook is a single `node <file>` that ships in the package, read the
+      // file: a self-disabling hook that only runs the package's own CLI is not
+      // the same signal as one that writes another tool's agent rules.
       severity = 'low';
       confidence = 'heuristic';
       title = 'Package runs install-time scripts';
       why = 'An install hook runs at install time; most are routine build/setup, but review what it does before trusting it.';
+      const review = lifecycle.length === 1 ? reviewInstallHook(scripts[lifecycle[0]!] ?? '', extra.sourceFiles ?? []) : null;
+      const verdict = review ? hookVerdict(review) : null;
+      if (verdict) {
+        severity = verdict.severity;
+        confidence = 'heuristic';
+        title = verdict.title;
+        why = verdict.why;
+        hookData = review;
+      }
     }
     findings.push({
       ruleId: 'MTC-SUP-010',
@@ -205,7 +224,7 @@ export function analyzeProvenance(meta: PackageMeta): Finding[] {
       evidence: cmds.slice(0, 160),
       owasp: 'LLM03:2025 Supply Chain',
       references: SUP_REF,
-      data: { scripts: lifecycle },
+      data: hookData ? { scripts: lifecycle, hook: hookData } : { scripts: lifecycle },
     });
   }
 
@@ -251,7 +270,10 @@ export function analyzeProvenance(meta: PackageMeta): Finding[] {
       location: { kind: 'package', name },
     });
   }
-  if (meta.license === null) {
+  // A license FILE that ships at the package root is a declaration, even when
+  // the metadata field is empty (common for repositories and older sdists).
+  const shipsLicenseFile = (extra.layout?.licenseFiles ?? []).length > 0;
+  if (meta.license === null && !shipsLicenseFile) {
     findings.push({
       ruleId: 'MTC-SUP-012',
       title: 'Package has no license',
@@ -267,6 +289,50 @@ export function analyzeProvenance(meta: PackageMeta): Finding[] {
   }
 
   return findings;
+}
+
+/** npm 7+ runs a dependency's install scripts with piped stdio. Verified on npm 11. */
+const NPM_NO_TTY_NOTE =
+  'npm 7 and later run install scripts without a terminal unless `--foreground-scripts` is set (verified on npm 11), ' +
+  'so on an ordinary `npm install` or `npx` this hook exits without doing anything.';
+
+function hookVerdict(r: HookReview): { severity: Finding['severity']; title: string; why: string } | null {
+  // No self-disabling gate, network access, or a call into a dependency whose
+  // code was not read: no reviewed verdict — keep the generic signal.
+  if (!r.gate.length || r.network || r.opaqueDeps.length) return null;
+  const gate = `It exits early ${r.gate.map((x) => (x === 'CI' || /\s/.test(x) ? x : `when ${x} is set`)).join(', ')}.`;
+  const tty = r.ttyGated ? ` ${NPM_NO_TTY_NOTE}` : '';
+  const procs = r.ownCliOnly ? 'Besides its own code it starts only the package\'s own CLI (whose behaviour is part of the package)' : `It runs ${r.programs.join(', ')}`;
+  if (r.toolConfigWrites.length) {
+    const asks =
+      r.prompt === 'default-yes'
+        ? 'On an interactive install it asks, and on yes (the default) writes'
+        : r.prompt === 'default-no'
+          ? 'On an interactive install it asks, and only on an explicit yes writes'
+          : 'On an interactive install it writes';
+    return {
+      severity: 'low',
+      title: 'Install hook writes another AI tool\'s configuration into your home directory',
+      why:
+        `\`${r.script}\` was read. ${asks} MCP configuration / agent rules for another AI tool into the user's home directory: ` +
+        `${r.toolConfigWrites.map((p) => `\`${p}\``).join(', ')}. ${procs}, and it makes no network requests. ${gate}${tty}`,
+    };
+  }
+  if (r.homeWrites.length) {
+    return {
+      severity: 'low',
+      title: 'Install hook writes into your home directory',
+      why: `\`${r.script}\` was read. It writes under ${r.homeWrites.map((p) => `\`${p}\``).join(', ')}. ${procs}, and it makes no network requests. ${gate}${tty}`,
+    };
+  }
+  if (r.ownCliOnly && !r.writes) {
+    return {
+      severity: 'info',
+      title: 'Install hook (reviewed): self-disables in CI / non-interactive installs, runs only the package\'s own CLI, no network',
+      why: `\`${r.script}\` and the package files it loads were read: they load no networking module, start no program other than the package's own CLI, and write no files. ${gate}${tty}`,
+    };
+  }
+  return null;
 }
 
 /** Check a package's declared dependencies for squats / known-vuln names. */
@@ -406,7 +472,7 @@ export const supplyChainDetector: Detector = {
     const name = meta?.name ?? (ctx.surface.source.kind === 'package' ? ctx.surface.id : undefined);
     if (name) findings.push(...analyzeTyposquat(name, meta, ctx.config));
     if (meta) {
-      findings.push(...analyzeProvenance(meta));
+      findings.push(...analyzeProvenance(meta, { sourceFiles: ctx.surface.sourceFiles, layout: ctx.surface.packageLayout }));
       findings.push(...analyzeDependencies(meta, ctx.config));
       findings.push(...analyzeArtifactError(meta));
     }

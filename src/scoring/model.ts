@@ -199,6 +199,13 @@ export const CAPABILITY_RULES = new Set<string>([
   'MTC-SRC-010', // dynamic evaluation of a non-literal present in implementation
 ]);
 
+/**
+ * Every capability observation says, in its own text, that it does not move the
+ * grade — publishers read "high · strong · shell execution" as an accusation
+ * otherwise, though by construction these rules only size the blast radius.
+ */
+export const CAPABILITY_NOTE = 'Capability observation — this does not lower the trust grade; it sizes the blast radius.';
+
 /** True if a rule describes capability/blast-radius rather than a trust threat. */
 export function isCapabilityRule(ruleId: string): boolean {
   return CAPABILITY_RULES.has(ruleId);
