@@ -5,6 +5,232 @@ deterministic: the **methodology version** is bumped whenever a change could
 move a score, so a grade is always reproducible against the version that
 produced it.
 
+## 1.16.0 — methodology `mcptrustchecker-1.16`
+
+**Scores move in both directions, each for a stated reason.** A server that
+declares — or visibly performs — writes is no longer rated as if it had none,
+and a server is no longer charged with the dynamic code of a dependency its
+bundler inlined. This release answers a publisher ticket (p_4774) and an appeal
+(APL-0012) filed on a marketplace that runs this engine; both were reproduced
+from the published artifacts before anything changed. Re-scan stored results
+before comparing them with 1.15.
+
+### Tools registered through a helper are recovered (p_4774)
+
+`@prerenderbuddy/mcp@0.3.1` registers three tools directly and eleven through a
+local helper — `function register(server, name, definition, handler) {
+server.registerTool(name, { ...definition, annotations: definition.annotations
+|| ANNOTATIONS }, …) }` — and two of the eleven declare and perform writes to
+its API (`readOnlyHint: false`, `client.post(…)`). 1.15 recovered three tools
+and rated the server `minimal`. The static extractor now reads registrations the
+way the language runs them:
+
+- a **helper** — a function that passes its own parameter as the tool name to
+  `registerTool` / `tool` / `addTool` — and a helper calling a helper; each call
+  with a literal name is a tool, with its description, schema and annotations
+  read from the definition passed at that call;
+- a **loop** over a definitions table: `for (const [name, def] of
+  Object.entries(TOOLS))`, `TOOLS.forEach(t => server.tool(t.name, …))`;
+- the TS SDK's positional `server.tool(name, description, schema, annotations,
+  cb)`, `{ ...DEFAULTS, ...hints }` in the annotations slot included;
+- Python decorators with nested calls (`@mcp.tool(annotations=ToolAnnotations(…))`,
+  which the line matcher missed entirely), `{**BASE, **WRITE}`, decorator
+  wrappers that pass their keywords through, `add_tool(…)`, `Tool(…, annotations=…)`.
+
+### Annotations are read for every tool — and unknown stays unknown
+
+Every recovered tool now carries the hints it declares, evaluated rather than
+grepped: object literals and spreads in source order, `||` / `??` fallbacks,
+`Object.freeze` / `Object.assign`, same-file constants, helper parameters bound
+to each call's arguments. Each records where its hints came from
+(`capabilities[].hintSource`: `declared`, `default`, `merged`, `unreadable`,
+`none`). The order is the language's:
+
+- the tool's own `annotations` first; a helper's default (`def.annotations ||
+  DEFAULTS`, `?? DEFAULTS`, through `Object.freeze` too) only where the call site
+  has **no** `annotations` key at all;
+- merges are layered as written — `{ ...DEFAULTS, ...def.annotations }`,
+  `...(P ?? {})`, `...(P || {})`, `Object.assign({}, DEFAULTS, P)` — defaults
+  first, the tool on top.
+
+The traps a reader of annotations falls into are closed and pinned by tests:
+annotations that exist but cannot be read (an imported constant, a definition
+from another file, a function call, a spread of an unknown object) are
+**unknown** and never replaced by the default; an unreadable spread **resets**
+the hints written before it; `annotations: {}` is truthy, so the default does
+not apply; a call chained on a Python constructor (`ToolAnnotations(…).model_copy(
+update=…)`) is unreadable.
+
+### Hints and handlers raise the capability level — and nothing lowers it
+
+Before 1.16 the annotations were read only to catch a contradiction. An explicit
+hint now adds a role, and never removes one:
+
+| The tool declares | Role added |
+|---|---|
+| `openWorldHint: true`, no write hint | `untrusted-input` — its answers come from outside |
+| `readOnlyHint: false` / `destructiveHint: true` with `openWorldHint: true` | `external-sink` — it acts on an external service |
+| `readOnlyHint: false` / `destructiveHint: true` without it | `state-write` (new) — it changes the state it holds |
+
+For a statically recovered tool, a handler that visibly sends an HTTP
+`POST`/`PUT`/`PATCH`/`DELETE` to an API raises `external-sink` the same way; a
+POST that only asks (GraphQL, a search endpoint) and `Map.prototype.delete` do
+not. The rule that matters most: **a hint can only raise a tool's level, never
+lower it below what its name and behaviour show** — `delete_file` or a handler
+calling `api.delete(…)` stays a writer under `readOnlyHint: true`, and the
+contradiction is still `MTC-CAP-003`. Otherwise a scan would under-state the
+risk, and a gateway's read-only key would reach a writing tool.
+
+`state-write` is a new capability tag; like `process-spawn` it raises the blast
+radius to `moderate` at most. One tool's hints cannot complete a trifecta on
+their own: the open-world branches above are exclusive.
+
+### Conditional registration is part of the surface
+
+An early `if (!client.enabled) return`, an `if (apiKey) { … }` block, a Python
+`if os.getenv(…):` — the tools behind them are still the server's surface and
+are analysed. The report lists them by condition (`coverage.conditionalTools`)
+and a caveat says what a server started without that configuration exposes
+("11 of the 14 recovered tools are registered only when `options.enabled ===
+false || !client.enabled` is false … a server started without that
+configuration exposes only the other 3").
+
+### Every way the source arrives recovers the same tools
+
+Static tool recovery ran for `--online` packages and GitHub repositories but not
+for a local directory or a packed artifact, so a tarball of a server an online
+scan credited with three tools reported none. All four paths now share one step.
+
+### Bundled code generators are no longer the server's dynamic code (APL-0012)
+
+Single-file `dist` bundles inline their dependencies — above all Ajv's JSON-schema
+compiler, which arrives with `@modelcontextprotocol/sdk`. Its
+``new Function(`${…self}`, `${…scope}`, …)(this, this.scope.get())`` was reported as
+the server's MTC-SRC-001 and inflated the capability level of hundreds of servers
+(on the marketplace that filed the appeal, 726 of 1,754 servers with MTC-SRC-001
+matched the Ajv shape).
+
+A MTC-SRC-001/010 site in generated JavaScript (`.js`/`.mjs`/`.cjs`) is now
+**discounted** — `info`, titled "in bundled dependency <pkg>@<version>", with
+`data.vendored` and `capabilityTag: null`, so the capability level is recomputed
+without it — only when the call at the site matches a verified signature of a code
+generator, taken from its published source: Ajv's validator and JTD compilers
+(pinned to Ajv's own `CodeGen` in the same file), depd's `wrapfunction`, or
+get-intrinsic's evalled-constructor probe. Each signature pins the call and the
+provenance of every runtime value in it, and is corroborated either by the
+bundle's source map — sidecar, `sourceMappingURL` target or inline `data:` map,
+kept under its own byte budget and never scanned as source — tracing the site into
+that package's `node_modules/` directory (and an embedded original showing the
+same call), or, with no usable map, by the file being a real bundle that carries
+the generator's own identifying text in code. Fingerprints are unchanged.
+
+Code a map traces to **any other** package — other generators included — is named
+(`data.vendored.discounted: false`, and `codeExecutionLibrary: true` for evaluators
+and template engines such as vm2, safe-eval, ses, handlebars, ejs, jsdom) but
+counted in full: dependency code runs in the server process, and what reaches it
+is the server's choice. A pnpm, bun or yarn store is believed only when it agrees
+with the package directory; maps never apply to Python or TypeScript sources.
+
+Maps and bundles are written by the package's author, so a deliberate full copy of
+a generator inside a genuine bundle can still lower the capability level.
+Attribution therefore moves **only the capability axis**: no threat-axis rule
+(MTC-SRC-004/007/008/009/011, every non-source rule) is relaxed by it, and a site a
+decode-and-execute dropper covers is never attributed.
+
+### Hardened before release
+
+The new readers were attacked directly over four rounds — correctness bugs,
+hostile packages, forged source maps, then the fixes themselves — and every
+reproduced case was fixed and is pinned by a test (`test/appeals-1.16.test.ts`,
+`test/vendored-1.16.test.ts`). Among them:
+
+- only the exact hint names the SDKs read count — a `read_only_hint: true` twin no
+  longer overrides `readOnlyHint: false`;
+- the evaluation budget is per registration and constants are evaluated once, so
+  an expensive decoy early in a file cannot make a later (poisoned) tool vanish; a
+  helper that decorates the description (`` `[x] ${def.description}` ``, `+`) keeps
+  the call site's text, so tool-poisoning still sees it;
+- the TS SDK's positional `server.tool(...)` is read by arity, as the SDK reads it:
+  a referenced or wrapped callback and an unreadable description no longer shift
+  the annotations into the schema;
+- a tool registered twice (an if/else pair, a legacy file) merges toward the write,
+  unites the handler evidence and keeps BOTH descriptions, so a poisoned one beside
+  a longer clean one is still scanned; an if/else pair is not "conditional";
+- caps count distinct tools, helpers are read before direct calls, and a file that
+  hits a cap says so (`Tool recovery stopped early in …`), so decoy registrations
+  cannot hide a tool silently;
+- rest destructuring, per-key defaults, explicit `undefined`, TypeScript generics
+  and typed arrows in helper parameters; a helper that rewrites its parameter
+  (`def.annotations ??= …`, `kwargs.setdefault(…)`) makes it unreadable; a constant
+  changed after its declaration, aliased, or written through a function is not its
+  initializer; a definitions table longer than 4,000 characters is read whole;
+- handler evidence needs an HTTP client — `Map#delete`, `Headers#delete`, KV
+  bindings and route definitions (`app.post('/x', handler)`) are not requests, and a
+  token-refresh POST in a shared helper is not every tool's write; an ORM or SQL
+  write in the handler is `state-write`;
+- conditions: entry guards (`require.main === module`), argument guards (`if
+  (!server) throw`), idempotency flags and callers in both branches are not
+  configuration; braceless `if`, `&&`, ternaries, an exit after a log line, a
+  callback inside an `if`, and `if (t.disabled) continue` in a loop are;
+- Python: positional names (`@mcp.tool("name")`, `add_tool(fn, "name")`),
+  `dict(WRITE)`, Python truthiness for `or`, and only MCP code — a LangChain
+  `Tool(func=…)` or a pydantic-ai `@agent.tool` is not an MCP tool;
+- a minified bundle is recognised by lines dense with code, not by its average
+  line length — an embedded base64 logo or a one-line lookup table no longer
+  switches helper recovery off;
+- a `tools/list` object is a tool only with an `inputSchema`, as the protocol
+  requires: prompts, their arguments and resources listed in the same file are no
+  longer reported as tools (1.15 did);
+- source maps (part two): a forged map — even with a generator's real source as
+  `sourcesContent` — can no longer discount the server's own `eval`: a verified
+  signature must match at the generated site in every case; signatures can no
+  longer be satisfied by a comment, a decoy class or code that passes runtime
+  input; maps apply to generated JavaScript only, are parsed
+  once per scan (a shared 30 MB map stalled a scan for minutes, a crafted
+  `sourceRoot` ran out of memory), and their paths are normalized before deciding.
+
+### Also
+
+- `FileCtx` (1.15) builds its function index in linear time: a file of deeply
+  nested callbacks took seconds to minutes; it now takes milliseconds, and the
+  1.15 analyses benefit too. Generic arguments (`Map<string, unknown>`) no longer
+  shift parameter positions, and a constant passed before an arrow callback
+  (`f(x, NAME, async () => …)`) is no longer mistaken for a destructuring
+  assignment of `NAME` — that made it unreadable for the whole file.
+- `FileCtx.mutated` (1.15) read `...x }, async () =>` as a destructuring
+  assignment — the `=>` of an arrow — and refused to fold `x` as a constant.
+  Fixed; it matters wherever a constant is spread next to a callback.
+- The registration reader is linear on hostile input: a step budget bounds
+  spreads of spreads, `if` statements are indexed once per file, and the import
+  and Python-condition scans no longer use overlapping quantifiers (a crafted
+  400 KB file took 0.7 s in an intermediate build; pinned under a timing test).
+
+### Measured movement
+
+- **p_4774** — `@prerenderbuddy/mcp@0.3.1`: 1.15 recovered three tools from an online
+  scan (none from the tarball) and rated it A 100 / `minimal`; 1.16 recovers all
+  fourteen — the two writers as `external-sink`, the three crawlers as
+  `untrusted-input`, nine readers with no role — reports the eleven key-gated tools
+  as conditional, and rates it **A 97 / `moderate`**.
+- **APL-0012** — `@scorezilla/mcp@0.4.2`: A 94 / `high` → **A 100 / `minimal`**;
+  its MTC-SRC-001 is `info`, "in bundled dependency ajv@8.20.0" (source map).
+- **A population of 531 published servers** (a deterministic sample of the
+  registry: 400 with statically recovered tools, 111 with MTC-SRC-001, 20 widely
+  used ones), the same versions scanned by 1.15.0 and 1.16.0: 123 changed. The
+  capability level went down for 41 (bundled Ajv, depd, get-intrinsic) and up for
+  37 (declared writes, `openWorldHint`, handler writes, newly recovered tools).
+  Twenty-four lost tools 1.15 had invented — prompts, prompt arguments, parameter
+  names. **No threat finding disappeared anywhere.** Five grades moved, each for a
+  reason the published package states: `proxmox-mcps` A 93 → B 81 and
+  `@oss-autopilot/mcp` A 94 → B 88 (MTC-CAP-003 — tools that unlink disks or run
+  commands declare `destructiveHint: false` or `readOnlyHint: true`, which a client
+  uses to skip the confirmation prompt); `@wundervault/mcp-server` A 93 → C 77,
+  `@lerianstudio/matcher-mcp` A 96 → F 58 and `@quackai/q402-mcp` A 97 → F 50 (the
+  injection rules now read the full description a running server sends — a
+  concatenated string, or a tool 1.15 did not recover). The full list is attached
+  to the release.
+- The 81-server benchmark holds at 100% precision and 100% recall. 666 tests pass (113 new).
+
 ## 1.15.0 — methodology `mcptrustchecker-1.15`
 
 **Scores move**, and almost always toward what the code actually does. This

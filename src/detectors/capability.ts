@@ -38,15 +38,6 @@ const MUTATION_TAGS = new Set<CapabilityTag>(['code-exec', 'file-write']);
  * lie (MTC-CAP-003), so a description-only mention must not trip that rule.
  */
 function mutationOperativelyEvidenced(tool: ToolDef): boolean {
-  const nameNorm = normalizeForMatch(typeof tool.name === 'string' ? tool.name : '');
-  const nameTokens = new Set(nameNorm.split(' ').filter(Boolean));
-  for (const sig of CAPABILITY_SIGNALS) {
-    if (!MUTATION_TAGS.has(sig.tag)) continue;
-    for (const kw of sig.keywords) {
-      const k = normalizeForMatch(kw);
-      if (k.includes(' ') ? nameNorm.includes(k) : nameTokens.has(k)) return true;
-    }
-  }
   const pTokens = new Set(
     Object.keys(tool.inputSchema?.properties ?? {}).flatMap((n) =>
       n.toLowerCase().split(/[^a-z0-9]+/i).filter(Boolean),
@@ -55,6 +46,18 @@ function mutationOperativelyEvidenced(tool: ToolDef): boolean {
   for (const sig of PARAM_NAME_SIGNALS) {
     if (!MUTATION_TAGS.has(sig.tag)) continue;
     for (const pn of sig.names) if (pTokens.has(pn)) return true;
+  }
+  // No exemption for "getter" names here: a hostile server can name a command
+  // runner `exec_shell_info` and declare it read-only; the contradiction is the
+  // signal this rule exists for.
+  const nameNorm = normalizeForMatch(typeof tool.name === 'string' ? tool.name : '');
+  const nameTokens = new Set(nameNorm.split(' ').filter(Boolean));
+  for (const sig of CAPABILITY_SIGNALS) {
+    if (!MUTATION_TAGS.has(sig.tag)) continue;
+    for (const kw of sig.keywords) {
+      const k = normalizeForMatch(kw);
+      if (k.includes(' ') ? nameNorm.includes(k) : nameTokens.has(k)) return true;
+    }
   }
   return false;
 }

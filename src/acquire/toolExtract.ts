@@ -27,7 +27,8 @@
  * code" foot-guns of a real evaluator.
  */
 
-import type { SourceFile, ToolDef, JsonSchema } from '../types.js';
+import type { SourceFile, StaticToolOrigin, ToolDef, JsonSchema } from '../types.js';
+import { MAX_MERGED_DESC, mergeDescriptions, mergeHints, readRegistrationsWithStats } from '../analysis/toolRegistry.js';
 
 export interface ToolExtractionResult {
   tools: ToolDef[];
@@ -35,6 +36,10 @@ export interface ToolExtractionResult {
   extracted: boolean;
   /** Files that contributed ≥1 tool — for the coverage caveat / debugging. */
   fromFiles: string[];
+  /** How each tool was recovered (registration shape, hints, condition, handler evidence). */
+  origins: Record<string, StaticToolOrigin>;
+  /** Files where a reading cap was hit — some of their tools may be missing. */
+  truncated: string[];
 }
 
 // A source file is worth scanning only if it can contain a tool registration.
@@ -61,14 +66,14 @@ function looksLikeToolName(name: string): boolean {
 }
 
 /** Decode the common escapes in a captured string literal, bounded in length. */
-function cleanString(raw: string | undefined): string | undefined {
+function cleanString(raw: string | undefined, max = MAX_DESC_LEN): string | undefined {
   if (typeof raw !== 'string') return undefined;
   let s = raw
     .replace(/\\n/g, '\n')
     .replace(/\\t/g, '\t')
     .replace(/\\r/g, '')
     .replace(/\\(['"`\\])/g, '$1');
-  if (s.length > MAX_DESC_LEN) s = s.slice(0, MAX_DESC_LEN);
+  if (s.length > max) s = s.slice(0, max);
   return s;
 }
 
@@ -171,8 +176,25 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/** Resolve `const <ident> = "literal"` (', " or `) in the source, else undefined. */
+const constStringMemo = new WeakMap<object, Map<string, string | undefined>>();
+const constBodyMemo = new WeakMap<object, Map<string, string | undefined>>();
+let memoKey: object = {};
+
+function memo<T>(store: WeakMap<object, Map<string, T>>, ident: string, compute: () => T): T {
+  let m = store.get(memoKey);
+  if (!m) store.set(memoKey, (m = new Map()));
+  if (m.has(ident)) return m.get(ident)!;
+  const v = compute();
+  m.set(ident, v);
+  return v;
+}
+
+/** Resolve `const <ident> = "literal"` (', " or `) in the source, else undefined. Memoised per file. */
 function resolveConstString(src: string, ident: string): string | undefined {
+  return memo(constStringMemo, ident, () => resolveConstStringUncached(src, ident));
+}
+
+function resolveConstStringUncached(src: string, ident: string): string | undefined {
   const re = new RegExp(
     `\\b(?:const|let|var)\\s+${escapeRegExp(ident)}\\s*=\\s*(?:\`([^\`]*)\`|'((?:[^'\\\\]|\\\\.)*)'|"((?:[^"\\\\]|\\\\.)*)")`,
   );
@@ -180,8 +202,12 @@ function resolveConstString(src: string, ident: string): string | undefined {
   return m ? cleanString(m[1] ?? m[2] ?? m[3]) : undefined;
 }
 
-/** Resolve `const <ident> = { … }` and return its brace-balanced object body. */
+/** Resolve `const <ident> = { … }` and return its brace-balanced object body. Memoised per file. */
 function resolveConstObjectBody(src: string, ident: string): string | undefined {
+  return memo(constBodyMemo, ident, () => resolveConstObjectBodyUncached(src, ident));
+}
+
+function resolveConstObjectBodyUncached(src: string, ident: string): string | undefined {
   const decl = new RegExp(`\\b(?:const|let|var)\\s+${escapeRegExp(ident)}\\s*=\\s*\\{`).exec(src);
   if (!decl) return undefined;
   const braceStart = src.indexOf('{', decl.index);
@@ -199,6 +225,7 @@ function resolveConstObjectBody(src: string, ident: string): string | undefined 
 }
 
 function extractJsTools(src: string): ToolDef[] {
+  memoKey = {};
   const out: ToolDef[] = [];
   const seen = new Set<string>();
 
@@ -271,6 +298,14 @@ function extractJsTools(src: string): ToolDef[] {
       // Require a description here: a bare `name:` object in a list handler with no
       // description is too weak a signal to attribute as a real tool.
       if (!description) continue;
+      // An MCP tool object carries an inputSchema (the protocol requires one). A
+      // prompt, a resource, a prompt's argument or a CLI option does not — in a
+      // file that also lists prompts, they filled the tool cap and pushed the
+      // real tools out. Only the text up to the next `name:` is read, so a `uri`
+      // property inside a tool's own schema no longer disqualifies it.
+      const upToNext = src.slice(o.end, next > o.end ? Math.min(next, o.end + 12_000) : o.end + 12_000);
+      if (!/\b(?:inputSchema|input_schema)\s*:/.test(upToNext)) continue;
+      if (/\barguments\s*:\s*\[[^\]]*$/.test(src.slice(Math.max(0, o.idx - 400), o.idx))) continue;
       const params = schemaParamNames(win, 'inputSchema');
       const tool: ToolDef = { name: o.name, description };
       const schema = schemaFromParamNames(params);
@@ -346,11 +381,14 @@ function extractPyTools(src: string): ToolDef[] {
  * scan exactly as it was, so this can only ADD coverage, never remove it.
  */
 export function extractToolsFromSource(files: SourceFile[] | undefined): ToolExtractionResult {
-  const empty: ToolExtractionResult = { tools: [], extracted: false, fromFiles: [] };
+  // A null-prototype record: a tool named `__proto__` is an own key like any other.
+  const empty: ToolExtractionResult = { tools: [], extracted: false, fromFiles: [], origins: Object.create(null), truncated: [] };
   if (!Array.isArray(files) || !files.length) return empty;
 
   const byName = new Map<string, ToolDef>();
+  const origins: Record<string, StaticToolOrigin> = Object.create(null);
   const fromFiles: string[] = [];
+  const truncated: string[] = [];
 
   for (const f of files) {
     if (!f || typeof f.path !== 'string' || typeof f.content !== 'string') continue;
@@ -359,26 +397,122 @@ export function extractToolsFromSource(files: SourceFile[] | undefined): ToolExt
 
     const isPy = /\.py$/i.test(f.path);
     const found = isPy ? extractPyTools(f.content) : extractJsTools(f.content);
-    if (!found.length) continue;
+    const local = new Map<string, { tool: ToolDef; origin: StaticToolOrigin }>();
+    for (const t of found) local.set(t.name, { tool: t, origin: { file: f.path, line: lineOf(f.content, t.name), via: 'direct', hintSource: 'none' } });
+    // Registrations read the way the language runs them: helpers, loops, nested
+    // decorators — and, for every tool including the literal ones above, its
+    // annotations, the condition it sits behind and what its handler does. The
+    // name/description/schema the line matcher found are kept as they were.
+    // A reader failure on one file must never cost the scan its tools: that file
+    // keeps what the line matcher found, as in 1.15.
+    let read: ReturnType<typeof readRegistrationsWithStats>['regs'] = [];
+    try {
+      const got = readRegistrationsWithStats(f);
+      read = got.regs;
+      if (got.truncated) truncated.push(f.path);
+    } catch {
+      read = [];
+    }
+    for (const reg of read) {
+      if (!looksLikeToolName(reg.name)) continue;
+      // `@mcp.tool("delete_records") def _impl(…)` is the tool delete_records: the
+      // line matcher's tool named after the def is not a second tool.
+      if (reg.defName && reg.defName !== reg.name && local.get(reg.defName)?.origin.hintSource === 'none' && !read.some((x) => x.name === reg.defName)) {
+        local.delete(reg.defName);
+      }
+      const hit = local.get(reg.name);
+      const tool: ToolDef = hit ? hit.tool : { name: reg.name };
+      // The evaluated description is the one the server sends; the line matcher
+      // stops at the first literal (`'Sync notes. ' + NOTE` read as 'Sync notes. ').
+      // When the two differ — a second registration of the name — both are kept,
+      // so the injection detectors read every text the tool may present.
+      if (hit && reg.description !== undefined) {
+        const d = cleanString(reg.description, MAX_MERGED_DESC);
+        const merged = mergeDescriptions(tool.description, d);
+        if (merged) tool.description = merged;
+      }
+      if (!hit) {
+        const description =
+          reg.description !== undefined ? cleanString(reg.description, MAX_MERGED_DESC) : reg.defAt !== undefined ? pyDocstring(f.content, reg.defAt) : undefined;
+        if (description) tool.description = description;
+        if (reg.title) tool.title = reg.title;
+        const schema = schemaFromParamNames(reg.params);
+        if (schema) tool.inputSchema = schema;
+      }
+      if (reg.hints) tool.annotations = { ...(tool.annotations ?? {}), ...(mergeHints(hintsOf(tool), reg.hints) ?? {}) };
+      local.set(reg.name, {
+        tool,
+        origin: {
+          file: f.path,
+          line: reg.line,
+          via: reg.via,
+          ...(reg.helpers ? { helpers: reg.helpers } : {}),
+          hintSource: reg.hintSource,
+          ...(reg.condition ? { condition: reg.condition } : {}),
+          ...(reg.behavior ? { behavior: reg.behavior } : {}),
+        },
+      });
+    }
+    if (!local.size) continue;
 
     let contributed = false;
-    for (const t of found) {
+    for (const { tool: t, origin } of local.values()) {
       if (byName.has(t.name)) {
-        // Prefer the richer definition (one with a description / schema).
+        // The same name in two files (a legacy copy, a variant): keep the richer
+        // description and schema, but merge hints toward a write and unite the
+        // handler evidence — a read-only decoy must not hide the real writer.
         const prev = byName.get(t.name)!;
-        const prevScore = (prev.description ? 1 : 0) + (prev.inputSchema ? 1 : 0);
-        const curScore = (t.description ? 1 : 0) + (t.inputSchema ? 1 : 0);
-        if (curScore > prevScore) byName.set(t.name, t);
+        const prevOrigin = origins[t.name];
+        const score = (x: ToolDef): number => (x.description ? 1 : 0) + (x.inputSchema ? 1 : 0);
+        const keep = score(t) > score(prev) ? { ...t } : { ...prev };
+        const description = mergeDescriptions(prev.description, t.description);
+        if (description) keep.description = description;
+        const hints = mergeHints(hintsOf(prev), hintsOf(t));
+        if (hints) keep.annotations = { ...(keep.annotations ?? {}), ...hints };
+        const behavior = [...(prevOrigin?.behavior ?? []), ...(origin.behavior ?? [])].filter((b, i, all) => all.findIndex((x) => x.why === b.why) === i);
+        const base = score(t) > score(prev) ? origin : (prevOrigin ?? origin);
+        const merged: StaticToolOrigin = { ...base, ...(behavior.length ? { behavior: behavior.slice(0, 3) } : {}) };
+        // Registered unconditionally in either file: not conditional.
+        if (!(prevOrigin?.condition && origin.condition)) delete merged.condition;
+        byName.set(t.name, keep);
+        origins[t.name] = merged;
         continue;
       }
-      if (byName.size >= MAX_TOOLS) break;
+      if (byName.size >= MAX_TOOLS) {
+        // A package with more tools than the scanner keeps says so in the report.
+        if (!truncated.includes(f.path)) truncated.push(f.path);
+        break;
+      }
       byName.set(t.name, t);
+      origins[t.name] = origin;
       contributed = true;
     }
     if (contributed) fromFiles.push(f.path);
   }
 
   const tools = [...byName.values()];
-  if (!tools.length) return empty;
-  return { tools, extracted: true, fromFiles };
+  if (!tools.length) return { ...empty, truncated };
+  return { tools, extracted: true, fromFiles, origins, truncated };
+}
+
+/** The boolean hints a tool definition carries. */
+function hintsOf(t: ToolDef): Parameters<typeof mergeHints>[0] {
+  const a = t.annotations;
+  if (!a) return undefined;
+  const out: NonNullable<Parameters<typeof mergeHints>[0]> = {};
+  for (const k of ['readOnlyHint', 'destructiveHint', 'idempotentHint', 'openWorldHint'] as const) if (typeof a[k] === 'boolean') out[k] = a[k] as boolean;
+  return Object.keys(out).length ? out : undefined;
+}
+
+/** 1-based line of the first quoted occurrence of a tool name, for the origin record. */
+function lineOf(src: string, name: string): number {
+  let i = -1;
+  for (const q of ['"', "'", '`']) {
+    const j = src.indexOf(q + name + q);
+    if (j >= 0 && (i < 0 || j < i)) i = j;
+  }
+  if (i < 0) return 0;
+  let n = 1;
+  for (let k = 0; k < i; k++) if (src.charCodeAt(k) === 10) n++;
+  return n;
 }

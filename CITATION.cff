@@ -19,8 +19,8 @@ contact:
   - family-names: "Haidar"
     given-names: "Illia"
     email: "support@mcptrustchecker.com"
-version: "1.15.0"
-date-released: "2026-10-13"
+version: "1.16.0"
+date-released: "2026-10-14"
 url: "https://mcptrustchecker.com"
 repository-code: "https://github.com/illia-haidar/mcptrustchecker"
 license: MIT

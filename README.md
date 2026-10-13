@@ -9,7 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-3c873a.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/package.json)
 [![Methodology](https://img.shields.io/badge/methodology-mcptrustchecker--1.15-6f42c1.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/docs/methodology.md)
-[![Tests](https://img.shields.io/badge/tests-553%20passing-brightgreen.svg)](https://github.com/illia-haidar/mcptrustchecker/tree/main/test)
+[![Tests](https://img.shields.io/badge/tests-666%20passing-brightgreen.svg)](https://github.com/illia-haidar/mcptrustchecker/tree/main/test)
 [![Rules](https://img.shields.io/badge/rules-84-orange.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/docs/rules.md)
 [![No account](https://img.shields.io/badge/account-not%20required-brightgreen.svg)](#why-this-is-different)
 [![Offline](https://img.shields.io/badge/runs-100%25%20offline-brightgreen.svg)](#why-this-is-different)
@@ -37,7 +37,7 @@ npx mcptrustchecker                # 🔍 scan every MCP server you already have
 
 ## What makes the algorithm unique
 
-The **Capability-Flow Trust Model** (methodology `mcptrustchecker-1.15`) is an **original algorithm designed from scratch for this project** by [Illia Haidar](https://mcptrustchecker.com) — it is not a wrapper around, or derivative of, any existing scanner or methodology. It is named, versioned, fully specified in docs/methodology.md, and citable via [CITATION.cff](CITATION.cff).
+The **Capability-Flow Trust Model** (methodology `mcptrustchecker-1.16`) is an **original algorithm designed from scratch for this project** by [Illia Haidar](https://mcptrustchecker.com) — it is not a wrapper around, or derivative of, any existing scanner or methodology. It is named, versioned, fully specified in docs/methodology.md, and citable via [CITATION.cff](CITATION.cff).
 
 **It is refined against 30,000+ real MCP servers — and still improving.** The model is not theoretical: it is calibrated on a continuously-scanned corpus of **30,000+ MCP servers** published on npm and PyPI. Each revision comes from a **full-population audit** of that corpus — every server in a grade band re-examined for *both* false positives (benign code graded down) and false negatives (real threats graded up), each change measured against the threats it must keep catching, and the whole corpus re-scanned before the version ships. That loop produced `mcptrustchecker-1.9`, which moved "evaluating a runtime value" off the threat axis after the data showed it was charging capability as malice. The corpus keeps growing and the audits keep running, so the methodology is expected to keep tightening — which is why every score carries the version that produced it.
 
@@ -68,7 +68,7 @@ Real output, `mcptrustchecker scan test/fixtures/poisoned-server.json`:
    │  GRADE  F  │   Trust Score 46/100   (client adoption risk · threat 50)
    ╰────────────╯   Capability MINIMAL   (blast radius)
                     Coverage MANIFEST   (static tool list only — no source)
-   methodology mcptrustchecker-1.15
+   methodology mcptrustchecker-1.16
 
 Threats    2 critical · 4 high · 2 medium
 
@@ -352,7 +352,7 @@ const report  = await scanSurface(surface);
 
 report.score.grade;              // 'A' … 'F'
 report.score.score;              // 0 … 100
-report.score.methodologyVersion; // 'mcptrustchecker-1.15'  ← pin & display this
+report.score.methodologyVersion; // 'mcptrustchecker-1.16'  ← pin & display this
 report.toxicFlows;               // enumerated exfiltration primitives
 renderBadge(report);             // shields.io endpoint JSON for a live trust badge
 ```

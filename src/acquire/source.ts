@@ -12,6 +12,7 @@ import type { PackageLayout, ServerSurface, SkippedFile, SourceFile } from '../t
 import { LICENSE_FILE, licenseFromNpmManifest, licenseFromPyproject, licenseFromSetupCfg } from '../util/license.js';
 import { SOURCE_EXTENSIONS } from '../data/sourcePatterns.js';
 import { surfaceFromManifest } from './manifest.js';
+import { MAX_SOURCE_MAP_BYTES, sourceMapPathsFor } from '../util/sourceMap.js';
 
 export const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'coverage', '.next', '__pycache__', 'venv', '.venv', 'vendor']);
 export const SOURCE_LIMITS = {
@@ -25,6 +26,17 @@ export const SOURCE_LIMITS = {
   // 6 MB bundle. Anything still over the cap is recorded and named in the report.
   maxFileBytes: 16 * 1024 * 1024, // 16 MB per file
   maxTotalBytes: 24 * 1024 * 1024, // 24 MB total
+} as const;
+/**
+ * Source maps are read under their OWN budget, never the source budget above: a
+ * 20 MB map must not evict the bundle it describes. Only maps that sit next to a
+ * read source file (`<file>.map`, or the file its `sourceMappingURL` names) are
+ * kept, and they are never scanned as code.
+ */
+export const SOURCE_MAP_LIMITS = {
+  maxFiles: 64,
+  maxFileBytes: MAX_SOURCE_MAP_BYTES,
+  maxTotalBytes: 48 * 1024 * 1024, // 48 MB total
 } as const;
 const MAX_FILES = SOURCE_LIMITS.maxFiles;
 const MAX_FILE_BYTES = SOURCE_LIMITS.maxFileBytes;
@@ -78,6 +90,36 @@ export function readSourceFiles(dir: string, skipped?: SkippedFile[]): SourceFil
   // the scan byte-reproducible everywhere (matches util/hash.ts's ordering rule).
   out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   return out;
+}
+
+/**
+ * The source maps of the generated files in `files`, read from `dir` under
+ * {@link SOURCE_MAP_LIMITS}. A map path that would leave `dir` is never read.
+ */
+export function readSourceMaps(dir: string, files: readonly SourceFile[]): SourceFile[] {
+  const out: SourceFile[] = [];
+  const seen = new Set<string>();
+  let total = 0;
+  for (const f of files) {
+    for (const rel of sourceMapPathsFor(f.path.replace(/\\/g, '/'), f.content.slice(-2048))) {
+      if (seen.has(rel)) continue;
+      seen.add(rel);
+      if (out.length >= SOURCE_MAP_LIMITS.maxFiles) return out;
+      const full = join(dir, rel);
+      const back = relative(dir, full);
+      if (!back || back.startsWith('..')) continue;
+      try {
+        const st = statSync(full);
+        if (!st.isFile() || st.size > SOURCE_MAP_LIMITS.maxFileBytes || total + st.size > SOURCE_MAP_LIMITS.maxTotalBytes) continue;
+        out.push({ path: rel, content: readFileSync(full, 'utf8') });
+        total += st.size;
+        break; // one map per generated file
+      } catch {
+        /* no such map — try the next candidate */
+      }
+    }
+  }
+  return out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 }
 
 /** Parse a package.json's text into the surface's package metadata. */
@@ -139,6 +181,8 @@ export function surfaceFromPackageDir(dir: string): ServerSurface {
   surface.packageMeta = { ...readPackageMeta(dir), ...(surface.packageMeta ?? {}) };
   const skipped: SkippedFile[] = [];
   surface.sourceFiles = readSourceFiles(dir, skipped);
+  const maps = readSourceMaps(dir, surface.sourceFiles);
+  if (maps.length) surface.sourceMaps = maps;
   const layout = readLayout(dir, skipped);
   surface.packageLayout = layout;
   // A Python project (or a JS one that declares nothing in package.json) may

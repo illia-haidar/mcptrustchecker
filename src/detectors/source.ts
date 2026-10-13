@@ -16,10 +16,30 @@ import { SECRET_PATTERNS } from '../data/injectionPatterns.js';
 import { buildReachability, type Reach } from '../analysis/reachability.js';
 import { scanProcessCalls, SHAPE_RANK, type CallShape, type ProcessCall } from '../analysis/callSites.js';
 import { toolFlowOf } from '../analysis/toolFlow.js';
-import { fileCtxOf, type FileCtx } from '../util/fileCtx.js';
+import { fileCtxOf, type FileCtx, type FnInfo } from '../util/fileCtx.js';
 import { fold, isConst } from '../util/constFold.js';
 import { CAPABILITY_NOTE } from '../scoring/model.js';
-import { CODE, identOffsets, splitArgs } from '../util/jsLex.js';
+import { CODE, identOffsets, lineAt, lineStarts, splitArgs } from '../util/jsLex.js';
+import {
+  inlineSourceMap,
+  isGeneratedScript,
+  originalOffset,
+  originalTextAt,
+  parseSourceMap,
+  resolvePositions,
+  sourceInfoOf,
+  sourceMapRefOf,
+  type OriginalPosition,
+  type SourceMapData,
+} from '../util/sourceMap.js';
+import {
+  CODE_EXECUTION_LIBRARIES,
+  STATIC_CODEGEN_PACKAGES,
+  corroborated,
+  matchVendoredSignature,
+  vendoredNoteFor,
+  type SignatureFile,
+} from '../data/vendoredSignatures.js';
 
 const MAX_FINDINGS_PER_RULE = 10; // don't drown the report on a big codebase
 
@@ -75,6 +95,271 @@ function isOptionalImportLoader(content: string, index: number): boolean {
   // generated method-caller glue copied into `dist`, not the server's own eval.
   if (/^(?:new\s+)?Function\s*\(\s*getStringFromWasm0\b/.test(win)) return true;
   if (/\b(?:wasm_bindgen|WebAssembly|emscripten|getStringFromWasm|ASM_CONSTS)\b/.test(back)) return true;
+  return false;
+}
+
+/** The dynamic-code rules whose sites can be attributed to a bundled dependency. */
+const ATTRIBUTED_RULES = ['MTC-SRC-001', 'MTC-SRC-010'] as const;
+/** Sites per file resolved through its source map (one pass over `mappings` for all of them). */
+const MAX_ATTRIBUTED_SITES = 512;
+/** Distinct dependencies reported per file and rule. */
+const MAX_VENDORED_PER_FILE = 5;
+/**
+ * How far a site may sit after the start of the map segment that covers it:
+ * indentation (esbuild starts a statement's segment at column 0) plus at most
+ * this many other characters (the `$` of `$Function`).
+ */
+const SEGMENT_SLACK = 2;
+/** Source-map text parsed per scan, all maps together. */
+const MAX_MAP_BYTES_PER_SCAN = 64 * 1024 * 1024;
+
+/** Where a dynamic-code site in a bundle came from, when it is a dependency's code. */
+interface VendoredOrigin {
+  package: string;
+  version?: string;
+  via: 'source-map' | 'signature';
+  /** `<original path>:<line>` from the source map. */
+  source?: string;
+  /** The id of the `VENDORED_SIGNATURES` entry that matched. */
+  signature?: string;
+  /** The site is named but counts in full (not a vetted code generator). */
+  discounted?: false;
+  /** The dependency exists to run code it is handed. */
+  codeExecutionLibrary?: true;
+}
+
+/**
+ * The source maps of one scan, parsed at most once each. A sidecar map that more
+ * than one generated file claims describes none of them (a map is the map of ONE
+ * file) and is never read; parsing stops at a per-scan byte budget.
+ */
+class ScanMaps {
+  private readonly parsed = new Map<string, SourceMapData | null>();
+  private readonly claims = new Map<string, number>();
+  private budget = MAX_MAP_BYTES_PER_SCAN;
+
+  constructor(
+    private readonly texts: ReadonlyMap<string, string>,
+    files: readonly SourceFile[],
+  ) {
+    if (!texts.size) return;
+    for (const f of files) {
+      const ref = sourceMapRefOf(f.path, f.content, texts);
+      if (ref && 'path' in ref) this.claims.set(ref.path, (this.claims.get(ref.path) ?? 0) + 1);
+    }
+  }
+
+  mapFor(path: string, content: string): SourceMapData | null {
+    const ref = sourceMapRefOf(path, content, this.texts);
+    if (!ref) return null;
+    if ('inline' in ref) return this.parse(`inline:${path}`, () => inlineSourceMap(ref.inline));
+    if ((this.claims.get(ref.path) ?? 0) !== 1) return null;
+    return this.parse(ref.path, () => this.texts.get(ref.path) ?? null);
+  }
+
+  private parse(key: string, text: () => string | null): SourceMapData | null {
+    if (this.parsed.has(key)) return this.parsed.get(key)!;
+    const t = text();
+    let map: SourceMapData | null = null;
+    if (t && t.length <= this.budget) {
+      this.budget -= t.length;
+      map = parseSourceMap(t);
+    }
+    this.parsed.set(key, map);
+    return map;
+  }
+}
+
+/** True when `pkg` is the server's own package, or another package of its own npm scope (its workspace). */
+function isOwnPackage(pkg: string, ownName: string | undefined): boolean {
+  if (!ownName) return false;
+  if (pkg === ownName) return true;
+  const scope = /^(@[^/]+)\//.exec(ownName)?.[1];
+  return !!scope && pkg.startsWith(`${scope}/`);
+}
+
+/** Parameter names of a function (destructured locals included). */
+function paramNames(fn: FnInfo | null): string[] {
+  if (!fn) return [];
+  return fn.params.flatMap((p) => [p.name, ...(p.keys ? [...p.keys.values()] : [])]).filter(Boolean);
+}
+
+/** Text with all whitespace removed, for comparing a call's head across formatting. */
+const squash = (t: string): string => t.replace(/\s+/g, '');
+
+/**
+ * Dependency attribution for one file's MTC-SRC-001/010 sites (1.16). A single-
+ * file `dist` bundle inlines its dependencies — Ajv's schema compiler arrives with
+ * the MCP SDK — so a `new Function` in the bundle is often not the server's code.
+ * Only generated JavaScript (`.js`/`.mjs`/`.cjs`) is ever attributed, and never a
+ * site a decode-and-execute dropper (MTC-SRC-004) covers.
+ *
+ *   1. Source map. A site counts as mapped only when a segment STARTS at it (the
+ *      map fits the file: no more lines than it has, segments inside the lines).
+ *      Then the MAP DECIDES: a path that, normalized, is under `node_modules/` is
+ *      that package's code (the store's real name wins over an npm alias); any
+ *      other path — `src/…`, a pnpm `file+`/`link+` workspace store, a package of
+ *      the server's own scope — is the server's, and no signature overrides it.
+ *      When the map embeds `sourcesContent`, the original must show the same call
+ *      at that position (and not be a copy of the bundle), else the map is stale
+ *      and ignored. Only a vetted code generator ({@link STATIC_CODEGEN_PACKAGES})
+ *      is DISCOUNTED — and when it has a call signature, that very call must
+ *      show: in the embedded original, or, without one, at the generated site.
+ *      Any other dependency is NAMED but counts in full; a code-execution
+ *      library ({@link CODE_EXECUTION_LIBRARIES}) says so.
+ *   2. No map that covers the site: a vetted code-generator signature
+ *      ({@link matchVendoredSignature}), corroborated by the file being a bundle
+ *      that carries the dependency's own identifying text.
+ *
+ * Lazy: nothing is parsed until a site needs it, and then every SRC-001/010 site
+ * in the file is resolved in one linear pass.
+ */
+function vendorAttribution(
+  f: SourceFile,
+  path: string,
+  fctx: FileCtx,
+  maps: ScanMaps,
+  ownName: string | undefined,
+): (rule: string, index: number) => VendoredOrigin | null {
+  if (!isGeneratedScript(path)) return () => null;
+  const src = f.content;
+  let starts: number[] | undefined;
+  const lineStartOf = (i: number): number => {
+    starts ??= lineStarts(src);
+    return starts[lineAt(starts, i) - 1]!;
+  };
+  let sites: Map<number, OriginalPosition | null> | null | undefined;
+  const resolve = (): Map<number, OriginalPosition | null> | null => {
+    if (sites !== undefined) return sites;
+    sites = null;
+    const map = maps.mapFor(path, src);
+    if (!map) return null;
+    const at = new Set<number>();
+    for (const id of ATTRIBUTED_RULES) {
+      const p = SOURCE_PATTERNS.find((x) => x.id === id);
+      if (!p) continue;
+      for (const m of allMatches(src, p.pattern)) {
+        if (at.size >= MAX_ATTRIBUTED_SITES) break;
+        at.add(m.index);
+      }
+    }
+    const idx = [...at].sort((a, b) => a - b);
+    starts ??= lineStarts(src);
+    const ls = starts;
+    const file = {
+      lineCount: ls.length,
+      lineLength: (l: number): number => (l < 0 || l >= ls.length ? -1 : (l + 1 < ls.length ? ls[l + 1]! - 1 : src.length) - ls[l]!),
+    };
+    const res = resolvePositions(
+      map,
+      idx.map((i) => {
+        const line = lineAt(ls, i) - 1;
+        return { line, column: i - ls[line]! };
+      }),
+      file,
+    );
+    sites = new Map(idx.map((i, k) => [i, res[k] ?? null]));
+    return sites;
+  };
+  let droppers: [number, number][] | undefined;
+  const sig: SignatureFile = {
+    src,
+    mask: fctx.mask,
+    paramsAt: (i) => paramNames(fctx.enclosingFn(i)),
+    fnAt: (i) => fnRange(fctx.enclosingFn(i)),
+    memo: new Map(),
+  };
+  // Signature evaluations per rule are capped; past the cap a site is not
+  // attributed (fail closed), so the first such site is reported in full.
+  const evaluations = new Map<string, number>();
+  const budget = (rule: string): boolean => {
+    const n = (evaluations.get(rule) ?? 0) + 1;
+    evaluations.set(rule, n);
+    return n <= MAX_ATTRIBUTED_SITES;
+  };
+  const signature = (rule: string, index: number): VendoredOrigin | null => {
+    const s = matchVendoredSignature(sig, index, rule);
+    return s && corroborated(s, sig) ? { package: s.package, via: 'signature', signature: s.id } : null;
+  };
+
+  return (rule, index) => {
+    // A site a decode-and-execute dropper (MTC-SRC-004) covers is never attributed.
+    if (!droppers) {
+      droppers = [];
+      const p004 = SOURCE_PATTERNS.find((x) => x.id === 'MTC-SRC-004');
+      if (p004) for (const m of allMatches(src, p004.pattern)) if (droppers.push([m.index, m.index + m[0].length]) >= 64) break;
+    }
+    if (droppers.some(([a, b]) => index >= a && index < b)) return null;
+    if (!budget(rule)) return null;
+
+    const pos = resolve()?.get(index);
+    const lineStart = lineStartOf(index);
+    const segStart = lineStart + (pos?.generatedColumn ?? 0);
+    if (pos && segStart <= index && index - segStart <= 256 && src.slice(segStart, index).trimStart().length <= SEGMENT_SLACK) {
+      // The call as generated, from the segment to its `(`, must be the call the original shows.
+      const paren = src.indexOf('(', index);
+      const head = paren >= 0 && paren - index < 64 ? squash(src.slice(lineStart + pos.generatedColumn, paren + 1)) : '';
+      const original = originalTextAt(pos);
+      // An "original" that is the generated file itself describes nothing (checked once per source).
+      if (head && (original === null || squash(original).startsWith(head)) && !isCopiedOriginal(pos, src)) {
+        const info = sourceInfoOf(pos.map, pos.sourceIndex);
+        const dep = info.dependency;
+        if (!dep || isOwnPackage(dep.package, ownName)) return null; // the server's own code: the map decides
+        const base = { package: dep.package, ...(dep.version ? { version: dep.version } : {}), via: 'source-map' as const, source: `${info.label}:${pos.line}` };
+        if (CODE_EXECUTION_LIBRARIES.has(dep.package)) return { ...base, discounted: false, codeExecutionLibrary: true };
+        if (!STATIC_CODEGEN_PACKAGES.has(dep.package)) return { ...base, discounted: false };
+        // A vetted generator: its call signature must hold at the GENERATED site,
+        // whatever the map says; an embedded original must show that call too.
+        if (matchVendoredSignature(sig, index, rule, dep.package) && (original === null || originalShows(pos, rule, dep.package))) return base;
+      }
+      // A map that cannot vouch for this site (stale, copied, not the generator's
+      // call): read the code instead.
+    }
+    return signature(rule, index);
+  };
+}
+
+function fnRange(fn: FnInfo | null): { start: number; end: number } | null {
+  return fn ? { start: fn.bodyStart, end: fn.bodyEnd } : null;
+}
+
+/** Whether a map's `sourcesContent` entry is the generated file itself — compared once per (map, source). */
+const COPIED = new WeakMap<SourceMapData, Map<number, boolean>>();
+function isCopiedOriginal(pos: OriginalPosition, src: string): boolean {
+  let byIndex = COPIED.get(pos.map);
+  if (!byIndex) COPIED.set(pos.map, (byIndex = new Map()));
+  let hit = byIndex.get(pos.sourceIndex);
+  if (hit === undefined) {
+    hit = pos.map.sourcesContent[pos.sourceIndex] === src;
+    byIndex.set(pos.sourceIndex, hit);
+  }
+  return hit;
+}
+
+/** A map's original source as a signature file, built once per (map, source). */
+const ORIGINALS = new WeakMap<SourceMapData, Map<number, SignatureFile>>();
+function originalFile(map: SourceMapData, index: number): SignatureFile | null {
+  const content = map.sourcesContent[index];
+  if (typeof content !== 'string') return null;
+  let byIndex = ORIGINALS.get(map);
+  if (!byIndex) ORIGINALS.set(map, (byIndex = new Map()));
+  let file = byIndex.get(index);
+  if (!file) {
+    const ctx = fileCtxOf({ path: `original-${index}.js`, content });
+    file = { src: content, mask: ctx.mask, paramsAt: (i) => paramNames(ctx.enclosingFn(i)), fnAt: (i) => fnRange(ctx.enclosingFn(i)), memo: new Map() };
+    byIndex.set(index, file);
+  }
+  return file;
+}
+
+/** True when the ORIGINAL source a map traces the site to shows the generator's own call there. */
+function originalShows(pos: OriginalPosition, rule: string, pkg: string): boolean {
+  const file = originalFile(pos.map, pos.sourceIndex);
+  let at = originalOffset(pos);
+  if (!file || at === null) return false;
+  while (at < file.src.length && /\s/.test(file.src[at]!)) at++;
+  // Only the call's own shape: the one original module does not define the whole generator.
+  for (let k = 0; k <= SEGMENT_SLACK; k++) if (matchVendoredSignature(file, at + k, rule, pkg, { local: true })) return true;
   return false;
 }
 
@@ -303,6 +588,8 @@ interface Candidate {
   nonRuntime: boolean;
   /** Danger, for ordering: the call shape for SRC-002, the severity otherwise. */
   danger: number;
+  /** A dependency's code bundled into the file (ordered after the server's own sites). */
+  vendored?: boolean;
   finding: Finding;
 }
 
@@ -495,6 +782,99 @@ function patternCandidate(
   };
 }
 
+/**
+ * MTC-SRC-001/010 at a site attributed to a bundled dependency: kept, so the
+ * report says what is there, but `info`, with `capabilityTag: null` so it raises
+ * no capability — the dependency's code generator is not the server evaluating
+ * its input. The fingerprint is the one the same site always had.
+ */
+function vendoredCandidate(
+  p: SourcePattern,
+  f: SourceFile,
+  path: string,
+  m: RegExpExecArray,
+  nonRuntime: boolean,
+  reach: Reach,
+  entry: string | undefined,
+  origin: VendoredOrigin,
+): Candidate {
+  const c = patternCandidate(p, f, path, m, nonRuntime, reach, entry);
+  const dep = origin.version ? `${origin.package}@${origin.version}` : origin.package;
+  const line = fileCtxOf(f).line(m.index);
+  const base = p.title.replace(/ in server code$/, '');
+  const how =
+    origin.via === 'source-map'
+      ? `the package's source map traces this position to \`${origin.source}\`, inside the dependency`
+      : `no source map covers this position, and the call matches ${origin.package}'s generated-code signature \`${origin.signature}\``;
+  const note = vendoredNoteFor(origin.package);
+  return {
+    ...c,
+    vendored: true,
+    danger: SEVERITY_RANK.info,
+    finding: {
+      ...c.finding,
+      title: `${base} in bundled dependency ${dep} (${path})`,
+      severity: 'info',
+      confidence: origin.via === 'source-map' ? 'strong' : 'heuristic',
+      description:
+        `In \`${path}:${line}\`, code bundled from the dependency ${dep}: ${how}. ` +
+        (note ? `${note} ` : '') +
+        "It is the dependency's code, not the server's implementation: it does not lower the trust grade, is not counted as the server's dynamic code execution, and does not raise the capability level. " +
+        'Dynamic code the server itself contains is still reported at full severity.',
+      remediation: 'Nothing to fix in the server. Keep the dependency current; ship the source map with the bundle so the attribution can be checked.',
+      data: {
+        ...c.finding.data,
+        vendored: {
+          package: origin.package,
+          ...(origin.version ? { version: origin.version } : {}),
+          via: origin.via,
+          ...(origin.source ? { source: origin.source } : {}),
+          ...(origin.signature ? { signature: origin.signature } : {}),
+        },
+        capabilityTag: null,
+      },
+    },
+  };
+}
+
+/**
+ * MTC-SRC-001/010 at a site a source map traces into a bundled dependency that is
+ * NOT a vetted code generator: the dependency is named, but the finding keeps its
+ * severity and capability — dependency code runs in the server process, and what
+ * reaches it is the server's choice. A code-execution library (vm2, safe-eval, a
+ * template engine…) says so.
+ */
+function namedCandidate(c: Candidate, p: SourcePattern, path: string, origin: VendoredOrigin): Candidate {
+  const dep = origin.version ? `${origin.package}@${origin.version}` : origin.package;
+  const base = p.title.replace(/ in server code$/, '');
+  const library = origin.codeExecutionLibrary === true;
+  return {
+    ...c,
+    finding: {
+      ...c.finding,
+      title: library ? `${base} in bundled code-execution library ${dep} (${path})` : `${base} in bundled dependency ${dep}, counted in full (${path})`,
+      description:
+        (library
+          ? `The server bundles ${dep}, a library whose job is to run code it is handed at runtime; the package's source map traces this site to \`${origin.source}\`. `
+          : `The package's source map traces this site to \`${origin.source}\`, in the bundled dependency ${dep}. Only vetted code generators that compile static definitions are discounted, so `) +
+        (library ? 'It counts' : 'it counts') +
+        " as the server's own dynamic code execution: dependency code runs in the server process, and what reaches it is decided by the server. " +
+        c.finding.description,
+      data: {
+        ...c.finding.data,
+        vendored: {
+          package: origin.package,
+          ...(origin.version ? { version: origin.version } : {}),
+          via: 'source-map',
+          ...(origin.source ? { source: origin.source } : {}),
+          discounted: false,
+          ...(library ? { codeExecutionLibrary: true } : {}),
+        },
+      },
+    },
+  };
+}
+
 /** MTC-SRC-002 for one file: the worst process call (or the bare import) and the reason. */
 function processCandidate(
   fctx: FileCtx,
@@ -618,6 +998,13 @@ export const sourceDetector: Detector = {
     // Which files the MCP server can actually reach (`unknown` when that cannot be decided).
     const reach = buildReachability(valid, ctx.surface.packageLayout);
     const candidates: Candidate[] = [];
+    // Source maps the acquirer kept beside the generated files (attribution only).
+    const maps = new Map<string, string>();
+    for (const sm of Array.isArray(ctx.surface.sourceMaps) ? ctx.surface.sourceMaps : []) {
+      if (sm && typeof sm.path === 'string' && typeof sm.content === 'string') maps.set(sm.path, sm.content);
+    }
+    const scanMaps = new ScanMaps(maps, valid);
+    const ownName = typeof ctx.surface.packageMeta?.name === 'string' ? ctx.surface.packageMeta.name : undefined;
 
     for (const f of valid) {
       const path = typeof f.path === 'string' ? f.path : 'source';
@@ -632,6 +1019,7 @@ export const sourceDetector: Detector = {
       // A function defined there can still be handed to the server (a global, an
       // injected dependency), so a call inside one is `unknown`, never "unreachable".
       const effReach = (index: number): Reach => (startup ? (fctx.enclosingFn(index) === null ? true : 'unknown') : r);
+      let vendorOf: ReturnType<typeof vendorAttribution> | undefined;
 
       for (const p of SOURCE_PATTERNS) {
         if (nonRuntime && RUNTIME_ONLY_RULES.has(p.id)) continue;
@@ -641,7 +1029,12 @@ export const sourceDetector: Detector = {
         // loader (SRC-001), SQL passed to a DB `.exec()` (SRC-009), an own-package
         // module path (SRC-005) and a protective deny-list (SRC-006) — so a benign
         // lexical hit can neither raise a finding nor mask a genuine later one.
+        // A SRC-001/010 site in a bundled dependency is set aside the same way (and
+        // reported separately, as the dependency's), so it cannot hide the server's own.
         let m: RegExpExecArray | undefined;
+        let library: VendoredOrigin | undefined;
+        const attributed = p.id === 'MTC-SRC-001' || p.id === 'MTC-SRC-010';
+        const vendored = new Map<string, { m: RegExpExecArray; origin: VendoredOrigin }>();
         for (const cand of allMatches(f.content, p.pattern)) {
           if (cand.index === undefined) continue;
           if (isCommentLine(f.content, cand.index)) continue;
@@ -650,11 +1043,25 @@ export const sourceDetector: Detector = {
           if (STRING_GUARD_RULES.has(p.id) && isInsideStringLiteral(f.content, cand.index, f)) continue;
           if (p.id === 'MTC-SRC-005' && loadsConstantModule(fctx, cand.index)) continue;
           if (p.id === 'MTC-SRC-006' && isProtectiveDenyList(fctx, cand.index)) continue;
+          if (attributed) {
+            vendorOf ??= vendorAttribution(f, path, fctx, scanMaps, ownName);
+            const origin = vendorOf(p.id, cand.index);
+            // A dependency that is not a vetted code generator is named, but its site counts in full.
+            if (origin?.discounted === false) library = origin;
+            else if (origin) {
+              if (!vendored.has(origin.package) && vendored.size < MAX_VENDORED_PER_FILE) vendored.set(origin.package, { m: cand, origin });
+              continue;
+            }
+          }
           m = cand;
           break;
         }
+        for (const v of vendored.values()) {
+          candidates.push(vendoredCandidate(p, f, path, v.m, nonRuntime, effReach(v.m.index), reach.entryOf(path), v.origin));
+        }
         if (!m || m.index === undefined) continue;
-        candidates.push(patternCandidate(p, f, path, m, nonRuntime, effReach(m.index), reach.entryOf(path)));
+        const own = patternCandidate(p, f, path, m, nonRuntime, effReach(m.index), reach.entryOf(path));
+        candidates.push(library ? namedCandidate(own, p, path, library) : own);
       }
 
       // MTC-SRC-002 — per call site, with the call's shape.
@@ -743,6 +1150,7 @@ export const sourceDetector: Detector = {
       const list = byRule.get(rule)!;
       list.sort(
         (a, b) =>
+          Number(!!a.vendored) - Number(!!b.vendored) ||
           REACH_RANK(a.reach) - REACH_RANK(b.reach) ||
           b.danger - a.danger ||
           Number(a.nonRuntime) - Number(b.nonRuntime) ||

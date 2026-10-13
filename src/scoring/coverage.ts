@@ -53,6 +53,8 @@ export function computeCoverage(surface: ServerSurface, verification?: Verificat
   else level = 'empty';
 
   const caveats: string[] = [];
+  const conditional = conditionalGroups(surface);
+  const conditionalCount = conditional.reduce((n, g) => n + g.tools.length, 0);
   if (level === 'empty') {
     caveats.push('Nothing scannable was found on this target — an empty surface is not a clean bill of health.');
     // A package name on its own is the commonest way to land here, and it is
@@ -80,6 +82,26 @@ export function computeCoverage(surface: ServerSurface, verification?: Verificat
           'but a mis-parsed registration could be missed or mis-attributed, so tool-derived findings are capped below ' +
           '“confirmed”. To grade the real runtime surface, scan the running server: --command "npx -y <package>".',
       );
+      if (surface.staticToolsTruncated?.length) {
+        caveats.push(
+          `Tool recovery stopped early in ${surface.staticToolsTruncated.slice(0, 3).map((f) => `\`${f}\``).join(', ')}` +
+            `${surface.staticToolsTruncated.length > 3 ? ` and ${surface.staticToolsTruncated.length - 3} more` : ''} — the file registers more ` +
+            'tools than the scanner reads in one file, so some may be missing from this surface.',
+        );
+      }
+      for (const g of conditional) {
+        const always = surface.tools.length - conditionalCount;
+        const when = g.kind === 'if' ? `when \`${g.condition}\` holds` : `when \`${g.condition}\` is false`;
+        // The if and the else of one statement: one of the two groups is always registered.
+        const partner = conditional.some((o) => o !== g && o.file === g.file && o.line === g.line && o.condition === g.condition && (o.kind === 'if') !== (g.kind === 'if'));
+        const exposes = partner
+          ? 'the other branch of the same condition registers the rest'
+          : `a server started without that configuration exposes ${always === 0 ? 'none of the recovered tools' : `only the other ${always}`}`;
+        caveats.push(
+          `${g.tools.length} of the ${surface.tools.length} recovered tools are registered only ${when} (${g.file}:${g.line}) — ` +
+            `typically when a key or option is configured. They are part of the server's surface and were analysed; ${exposes}.`,
+        );
+      }
     }
     if (!implementationSource && !liveTransport) {
       caveats.push(
@@ -120,7 +142,24 @@ export function computeCoverage(surface: ServerSurface, verification?: Verificat
     inputs: { toolSurface, implementationSource, packageMetadata, liveTransport },
     caveats,
     ...(skipped.length ? { skipped: skipped.map((k) => ({ ...k })) } : {}),
+    ...(conditional.length ? { conditionalTools: conditional } : {}),
   };
+}
+
+/** Statically recovered tools registered behind a condition, grouped by that condition. */
+function conditionalGroups(surface: ServerSurface): NonNullable<Coverage['conditionalTools']> {
+  if (surface.toolProvenance !== 'static' || !surface.staticTools) return [];
+  const groups = new Map<string, NonNullable<Coverage['conditionalTools']>[number]>();
+  for (const t of surface.tools) {
+    const o = typeof t?.name === 'string' && Object.hasOwn(surface.staticTools, t.name) ? surface.staticTools[t.name] : undefined;
+    const c = o?.condition;
+    if (!o || !c) continue;
+    const key = `${o.file}\u0000${c.line}\u0000${c.kind}\u0000${c.expr}`;
+    const g = groups.get(key) ?? { condition: c.expr, kind: c.kind, file: o.file, line: c.line, tools: [] };
+    g.tools.push(t.name);
+    groups.set(key, g);
+  }
+  return [...groups.values()].sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : a.line - b.line));
 }
 
 /** A short human label for a coverage level (terminal/markdown headline). */

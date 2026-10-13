@@ -42,7 +42,11 @@ test('JS: a ListTools handler object array is mined only when a handler is wired
     }));
   `;
   const r = extractToolsFromSource([f('dist/everything.js', withHandler)]);
-  assert.deepEqual(r.tools.map((t) => t.name).sort(), ['add', 'echo']);
+  // 1.16: an object with no inputSchema is not an MCP tool (the protocol requires
+  // one, and the SDK rejects a tools/list answer without it) — it is a prompt, a
+  // resource or an option, and in a file that lists prompts those used to fill
+  // the tool cap.
+  assert.deepEqual(r.tools.map((t) => t.name).sort(), ['add']);
 
   // The SAME object shape WITHOUT a list handler must NOT be scraped — an
   // unrelated `{ name, description }` literal is not a tool registration.

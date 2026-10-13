@@ -65,6 +65,7 @@ export function computeCapabilityProfile(
   // A fixed program (`execFile("git", […])`) is a real capability but not code
   // execution: the model cannot choose what runs. Never more than moderate.
   if (has('process-spawn')) bump('moderate', 'can start a fixed program (a process-spawning capability, not arbitrary code execution)');
+  if (has('state-write')) bump('moderate', 'a tool declares that it changes state it has access to');
 
   if (has('sensitive-source') && (has('external-sink') || has('code-exec'))) {
     bump('high', 'has a read → egress path (a data-exfiltration surface)');

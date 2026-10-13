@@ -192,6 +192,13 @@ export interface ServerSurface {
    */
   packageLayout?: PackageLayout;
   /**
+   * Source maps that ship next to a generated source file (`<file>.map`, or the
+   * file its `sourceMappingURL` names), read under their own byte budget. Never
+   * scanned as code: they only attribute a finding in a bundle to the original
+   * file it came from — the server's own code or a bundled dependency.
+   */
+  sourceMaps?: SourceFile[];
+  /**
    * Where {@link tools} came from, when it matters for how far to trust them:
    *   - `live`   — enumerated from a running server (the real runtime surface).
    *   - `manifest`— a declared static tool list (a client-config/manifest).
@@ -203,6 +210,34 @@ export interface ServerSurface {
    * Undefined means the tools arrived with the surface as-declared (no inference).
    */
   toolProvenance?: 'live' | 'manifest' | 'static';
+  /**
+   * For a `static` surface: how each tool was recovered, keyed by tool name —
+   * the registration shape, where its annotations came from, a condition it is
+   * registered behind, and what its handler visibly does.
+   */
+  staticTools?: Record<string, StaticToolOrigin>;
+  /** Files where static tool recovery hit a reading cap (some tools may be missing). */
+  staticToolsTruncated?: string[];
+}
+
+/** How the static extractor recovered one tool (see {@link ServerSurface.staticTools}). */
+export interface StaticToolOrigin {
+  file: string;
+  line: number;
+  /** `direct` — a literal registration; `helper` — through a local wrapper; `loop` — from a table of definitions. */
+  via: 'direct' | 'helper' | 'loop' | 'decorator' | 'decorator-helper';
+  /** The helper chain, outermost first. */
+  helpers?: string[];
+  /**
+   * Where the tool's annotations came from: its own declaration, the helper's
+   * default, both merged, a declaration that exists but cannot be read (then no
+   * default is assumed), or none at all.
+   */
+  hintSource: 'declared' | 'default' | 'merged' | 'unreadable' | 'none';
+  /** A condition the registration sits behind (`if (!client.enabled) return`). */
+  condition?: { kind: 'if' | 'else' | 'unless'; expr: string; line: number };
+  /** Capability evidence read from the handler body (an HTTP write). */
+  behavior?: { tag: CapabilityTag; why: string; line: number }[];
 }
 
 export interface SourceFile {
@@ -293,13 +328,27 @@ export type CapabilityTag =
    * `execSync("npm --version")`). A real capability, but not arbitrary code
    * execution: it raises the blast radius to `moderate` at most.
    */
-  | 'process-spawn';
+  | 'process-spawn'
+  /**
+   * Changes state it has access to, as the TOOL ITSELF declares it
+   * (`readOnlyHint: false` / `destructiveHint: true` without `openWorldHint:
+   * true`) — a database row, a document, local memory. Not a file write and not
+   * an exfiltration sink: `moderate` at most.
+   */
+  | 'state-write';
 
 export interface ToolCapability {
   tool: string;
   tags: CapabilityTag[];
   /** Why each tag was assigned (keyword/schema evidence), for explainability. */
   reasons: Partial<Record<CapabilityTag, string[]>>;
+  /**
+   * The behaviour hints the tool declares, as read (explicit booleans only).
+   * They can add tags, never remove one.
+   */
+  hints?: { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean; openWorldHint?: boolean };
+  /** For a statically recovered tool: where those hints came from. */
+  hintSource?: StaticToolOrigin['hintSource'];
 }
 
 /** How much a server could do if the model driving it were manipulated. */
@@ -368,6 +417,13 @@ export interface Coverage {
   caveats: string[];
   /** Source files that exist but were not read (size limits), when any. */
   skipped?: SkippedFile[];
+  /**
+   * Statically recovered tools that are registered only when a condition holds
+   * (`if (!client.enabled) return`), grouped by condition. They are part of the
+   * server's surface and are analysed; a server started without that
+   * configuration exposes only the rest.
+   */
+  conditionalTools?: { condition: string; kind: 'if' | 'else' | 'unless'; file: string; line: number; tools: string[] }[];
 }
 
 export interface ToxicFlow {

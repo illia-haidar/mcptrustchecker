@@ -101,13 +101,26 @@ export class FileCtx {
     return this._fns;
   }
 
-  /** The innermost function whose body contains `i`, or null at top level. */
+  private _owner?: Int32Array;
+  private _close?: Int32Array;
+
+  /** The partner of the bracket at `i` (code only), or -1 — O(1) after one pass. */
+  closeOf(i: number): number {
+    if (!this._close) this._close = bracketTables(this.src, this.mask).close;
+    return i >= 0 && i < this.src.length ? this._close[i]! : -1;
+  }
+
+  /**
+   * The innermost function whose body contains `i`, or null at top level. O(1)
+   * after one sweep: a lookup per call used to walk every function, which a file
+   * of deeply nested callbacks turned into minutes.
+   */
   enclosingFn(i: number): FnInfo | null {
-    let best: FnInfo | null = null;
-    for (const f of this.functions()) {
-      if (i >= f.bodyStart && i < f.bodyEnd && (!best || f.bodyEnd - f.bodyStart < best.bodyEnd - best.bodyStart)) best = f;
-    }
-    return best;
+    const fns = this.functions();
+    if (!fns.length || i < 0 || i >= this.src.length) return null;
+    if (!this._owner) this._owner = ownerIndex(fns, this.src.length);
+    const k = this._owner[i]!;
+    return k < 0 ? null : fns[k]!;
   }
 
   /**
@@ -209,7 +222,9 @@ export class FileCtx {
     const re =
       this.lang === 'py'
         ? new RegExp(`^${esc}\\s*(?::[^=\\n]{1,80})?=(?!=)`, 'gm')
-        : new RegExp(`\\b(const|let|var)\\s+${esc}\\s*(?::[^=;]{1,80})?=(?!=)`, 'g');
+        : // A TypeScript annotation may hold `;` inside an object type:
+          // `const TOOLS: Array<{ name: string; description: string }> = [`.
+          new RegExp(`\\b(const|let|var)\\s+${esc}\\s*(?::[^=]{1,200}?)?=(?![=>])`, 'g');
     let m: RegExpExecArray | null;
     while ((m = re.exec(this.src))) {
       if (!this.isCode(m.index)) continue;
@@ -275,7 +290,18 @@ export class FileCtx {
     return null;
   }
 
+  private readonly _other = new Map<string, boolean>();
+
   private otherBinding(name: string, scope: FnInfo | null, declAt: number): boolean {
+    const key = `${name}\u0000${scope ? scope.bodyStart : -1}\u0000${declAt}`;
+    const hit = this._other.get(key);
+    if (hit !== undefined) return hit;
+    const v = this.computeOtherBinding(name, scope, declAt);
+    this._other.set(key, v);
+    return v;
+  }
+
+  private computeOtherBinding(name: string, scope: FnInfo | null, declAt: number): boolean {
     const from = scope ? scope.bodyStart : 0;
     const to = scope ? scope.bodyEnd : this.src.length;
     const region = this.src.slice(from, to);
@@ -296,7 +322,10 @@ export class FileCtx {
             new RegExp(`\\b(?:let|var)\\s+${n}\\s*[;,\\n]`, 'g'),
             new RegExp(`\\b(?:const|let|var)\\s+${n}\\s*(?::[^=;]{1,80})?=(?!=)`, 'g'),
             new RegExp(`(?<![\\w$.])${n}\\s*(?:\\+|-|\\*|/|\\|\\||&&|\\?\\?)?=(?![=>])`, 'g'),
-            new RegExp(`[\\[{,]\\s*${n}\\s*[\\]},][^=;]*\\]?\\s*=(?!=)`, 'g'),
+            // A destructuring assignment target: `[a, NAME] = …`, `({ NAME } = …)`.
+            // `=>` is an arrow, not an assignment: `f(x, NAME, async () => …)`
+            // read as one made NAME unreadable for the whole file.
+            new RegExp(`[\\[{,]\\s*${n}\\s*[\\]},][^=;]*\\]?\\s*=(?![=>])`, 'g'),
           ];
     for (const re of forms) {
       let m: RegExpExecArray | null;
@@ -312,12 +341,36 @@ export class FileCtx {
     return false;
   }
 
-  /** Is NAME (an array/object) mutated anywhere in the given scope after being declared? */
+  private readonly _mutated = new Map<string, boolean>();
+
+  /** Is NAME (an array/object) mutated anywhere in the given scope after being declared? Memoised per (name, scope). */
   mutated(name: string, scope: FnInfo | null): boolean {
+    const key = `${name}\u0000${scope ? scope.bodyStart : -1}`;
+    const hit = this._mutated.get(key);
+    if (hit !== undefined) return hit;
+    const v = this.computeMutated(name, scope);
+    this._mutated.set(key, v);
+    return v;
+  }
+
+  private computeMutated(name: string, scope: FnInfo | null): boolean {
     const region = scope ? this.src.slice(scope.bodyStart, scope.bodyEnd) : this.src;
     const n = name.replace(/[$]/g, '\\$');
+    // Through an element (`TOOLS[1].disabled = false`, `delete TOOLS[0].x`,
+    // `Object.assign(TOOLS[1], …)`) or a loop variable over it (`for (const t of TOOLS) t.x = …`).
+    if (
+      new RegExp(`(?<![\\w$.])${n}\\s*\\[[^\\]\\n]{0,100}\\]\\s*(?:\\.\\s*[A-Za-z_$][\\w$]*\\s*|\\[[^\\]\\n]{0,100}\\]\\s*)*(?:=(?![=>])|\\+\\+|--)|\\bdelete\\s+${n}\\s*[[.]|Object\\.assign\\s*\\(\\s*${n}\\s*[[.]`).test(region)
+    ) {
+      return true;
+    }
+    const loopVar = new RegExp(`\\bfor\\s*\\(\\s*(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s+of\\s+${n}\\s*\\)|(?<![\\w$.])${n}\\s*\\.\\s*forEach\\s*\\(\\s*\\(?\\s*([A-Za-z_$][\\w$]*)`, 'g');
+    for (const m of region.matchAll(loopVar)) {
+      const v = (m[1] ?? m[2])!.replace(/[$]/g, '\\$');
+      const after = region.slice(m.index!, m.index! + 4000);
+      if (new RegExp(`(?<![\\w$.])${v}\\s*(?:\\.\\s*[A-Za-z_$][\\w$]*|\\[[^\\]\\n]{0,100}\\])\\s*(?:\\.\\s*[A-Za-z_$][\\w$]*\\s*)*=(?![=>])|Object\\.assign\\s*\\(\\s*${v}\\b|\\bdelete\\s+${v}\\s*[[.]`).test(after)) return true;
+    }
     return new RegExp(
-      `(?<![\\w$.])${n}\\s*(?:\\.\\s*(?:push|unshift|splice|fill|copyWithin|reverse|sort|set|add|append|extend|insert|update)\\s*\\(|\\[[^\\]]*\\]\\s*=(?!=)|\\.\\s*[A-Za-z_$][\\w$]*\\s*=(?!=)|\\.length\\s*=)|Object\\.(?:assign|defineProperty|defineProperties)\\s*\\(\\s*${n}\\b|\\.\\.\\.\\s*${n}\\b(?=[^)]*\\)\\s*=)`,
+      `(?<![\\w$.])${n}\\s*(?:\\.\\s*(?:push|unshift|splice|fill|copyWithin|reverse|sort|set|add|append|extend|insert|update)\\s*\\(|\\[[^\\]]*\\]\\s*=(?!=)|\\.\\s*[A-Za-z_$][\\w$]*\\s*=(?!=)|\\.length\\s*=)|Object\\.(?:assign|defineProperty|defineProperties)\\s*\\(\\s*${n}\\b|\\.\\.\\.\\s*${n}\\b(?=[^)]*\\)\\s*=(?![=>]))`,
     ).test(region);
   }
 
@@ -370,8 +423,23 @@ export class FileCtx {
 
 // --- JS function index ------------------------------------------------------
 
+/**
+ * Remove TypeScript generic arguments from a parameter list: a comma inside
+ * `Map<string, unknown>` is not a parameter boundary, and splitting there
+ * shifted every later parameter's index.
+ */
+export function stripGenerics(text: string): string {
+  let t = text;
+  for (let k = 0; k < 8; k++) {
+    const next = t.replace(/([A-Za-z_$][\w$.]*)\s*<[^<>()=;]{0,400}>/g, '$1');
+    if (next === t) break;
+    t = next;
+  }
+  return t;
+}
+
 function parseParams(text: string): FnParam[] {
-  const parts = splitTopLevel(text, ',').filter(Boolean);
+  const parts = splitTopLevel(stripGenerics(text), ',').filter(Boolean);
   return parts.map((raw, index) => {
     let p = raw.replace(/^\.\.\./, '').trim();
     // Strip a default value (kept: an omitted argument takes it) and a TypeScript annotation.
@@ -399,6 +467,17 @@ function parseParams(text: string): FnParam[] {
 function indexJsFunctions(ctx: FileCtx): FnInfo[] {
   const { src, mask } = ctx;
   const out: FnInfo[] = [];
+  // Matching brackets and expression ends for the whole file, in two linear
+  // passes. Calling matchBracket per function scanned every nested body again —
+  // quadratic on a file of deeply nested callbacks (minutes at 180 KB).
+  const t = bracketTables(src, mask);
+  const matchBracket = (_s: string, _m: Uint8Array, open: number, _limit?: number): number => (open >= 0 && open < src.length ? t.close[open]! : -1);
+  const matchOpen = (_s: string, _m: Uint8Array, close: number): number => (close >= 0 && close < src.length ? t.open[close]! : -1);
+  const exprEnd = (_s: string, _m: Uint8Array, from: number): number => {
+    let i = from;
+    while (i < src.length && mask[i] !== CODE) i++;
+    return i < src.length ? t.term[i]! : src.length;
+  };
   const add = (name: string | null, headerStart: number, paramOpen: number, kind: FnInfo['kind']): void => {
     const close = matchBracket(src, mask, paramOpen, 20_000);
     if (close < 0) return;
@@ -424,7 +503,7 @@ function indexJsFunctions(ctx: FileCtx): FnInfo[] {
   };
 
   // `function name(…) {` and `function (…) {`
-  const reFn = /\bfunction\b\s*\*?\s*([A-Za-z_$][\w$]*)?\s*\(/g;
+  const reFn = /\bfunction\b\s*\*?\s*([A-Za-z_$][\w$]*)?\s*(?:<[^()]{0,200}?>\s*)?\(/g;
   let m: RegExpExecArray | null;
   while ((m = reFn.exec(src))) {
     if (mask[m.index] !== CODE) continue;
@@ -441,13 +520,34 @@ function indexJsFunctions(ctx: FileCtx): FnInfo[] {
     if (mask[a] !== CODE) continue;
     let k = a - 1;
     while (k >= 0 && /\s/.test(src[k]!)) k--;
-    // A TypeScript return type `(a): T =>` is rare in shipped JS; handled by the `)` path only.
+    // A TypeScript return type: `(a: A): Promise<void> =>` — step back to its `)`.
+    if (src[k] !== ')') {
+      const back = src.slice(Math.max(0, k - 160), k + 1);
+      const rt = /\)\s*:\s*[^=;{}()]{1,150}$/.exec(back);
+      if (rt) k = k - (back.length - rt.index) + 1;
+    }
     if (src[k] === ')') {
       const open = matchOpen(src, mask, k);
       if (open < 0) continue;
       let h = open - 1;
       while (h >= 0 && /\s/.test(src[h]!)) h--;
-      const asyncKw = src.slice(Math.max(0, h - 4), h + 1) === 'async' ? h - 4 : open;
+      // A generic arrow: `const register = <T extends X>(server, …) => …`.
+      let headAt = open;
+      if (src[h] === '>' && src[h - 1] !== '=') {
+        let d = 0;
+        for (let q = h; q >= Math.max(0, h - 300); q--) {
+          if (src[q] === '>') d++;
+          else if (src[q] === '<' && --d === 0) {
+            headAt = q;
+            break;
+          }
+        }
+        if (headAt !== open) {
+          h = headAt - 1;
+          while (h >= 0 && /\s/.test(src[h]!)) h--;
+        }
+      }
+      const asyncKw = src.slice(Math.max(0, h - 4), h + 1) === 'async' ? h - 4 : headAt;
       add(assignedName(src, asyncKw), asyncKw, open, isPropertyAssignment(src, asyncKw) ? 'property' : 'arrow');
     } else if (/[\w$]/.test(src[k] ?? '')) {
       let s = k;
@@ -470,7 +570,7 @@ function indexJsFunctions(ctx: FileCtx): FnInfo[] {
   // Anchored by a LOOKBEHIND and horizontal whitespace only: the old form,
   // `(?:^|[;{}\n,])\s*…\s*`, let `\n` be both the anchor and part of two adjacent
   // `\s*`, which is cubic on a run of blank lines (minutes on a few thousand).
-  const reMethod = /(?<=^|[;{},\n])[ \t]*(?:(?:async|static|get|set|public|private|protected|override)[ \t]+)*\*?[ \t]*(#?[A-Za-z_$][\w$]*)[ \t]*\(/g;
+  const reMethod = /(?<=^|[;{},\n])[ \t]*(?:(?:async|static|get|set|public|private|protected|override)[ \t]+)*\*?[ \t]*(#?[A-Za-z_$][\w$]*)[ \t]*(?:<[^()\n]{0,200}?>[ \t]*)?\(/g;
   while ((m = reMethod.exec(src))) {
     const nameIdx = m.index + m[0].lastIndexOf(m[1]!);
     if (mask[nameIdx] !== CODE) continue;
@@ -571,6 +671,71 @@ function indexPyFunctions(ctx: FileCtx): FnInfo[] {
     out.push({ name: m[2]!, kind: isMethod ? 'method' : 'function', params, headerStart: m.index + m[0].indexOf(m[2]!), bodyStart, bodyEnd: end });
   }
   return out;
+}
+
+// --- linear-time indexes ------------------------------------------------------
+
+/**
+ * For every bracket in code: its partner (`close[open]`, `open[close]`), and
+ * for every code offset the end of the expression it starts — the first `,`
+ * `;` or closing bracket at the same depth (`term`). Two passes, O(n).
+ */
+function bracketTables(src: string, mask: Uint8Array): { close: Int32Array; open: Int32Array; term: Int32Array } {
+  const n = src.length;
+  const close = new Int32Array(n).fill(-1);
+  const open = new Int32Array(n).fill(-1);
+  const term = new Int32Array(n).fill(n);
+  const stack: number[] = [];
+  for (let i = 0; i < n; i++) {
+    if (mask[i] !== CODE) continue;
+    const c = src.charCodeAt(i);
+    if (c === 40 || c === 91 || c === 123) stack.push(i);
+    else if (c === 41 || c === 93 || c === 125) {
+      const o = stack.pop();
+      if (o !== undefined) {
+        close[o] = i;
+        open[i] = o;
+      }
+    }
+  }
+  // Right to left: the nearest terminator at each depth.
+  const last: number[] = [n];
+  for (let i = n - 1; i >= 0; i--) {
+    if (mask[i] !== CODE) {
+      term[i] = last[last.length - 1]!;
+      continue;
+    }
+    const c = src.charCodeAt(i);
+    if (c === 41 || c === 93 || c === 125) {
+      term[i] = last[last.length - 1]!;
+      last.push(i); // inside this group, the closer ends the expression
+    } else if (c === 40 || c === 91 || c === 123) {
+      if (last.length > 1) last.pop();
+      term[i] = last[last.length - 1]!;
+    } else {
+      if (c === 44 || c === 59) last[last.length - 1] = i;
+      term[i] = last[last.length - 1]!;
+    }
+  }
+  return { close, open, term };
+}
+
+/** For every offset, the index (into `fns`) of the innermost function body holding it, or -1. */
+function ownerIndex(fns: FnInfo[], n: number): Int32Array {
+  const owner = new Int32Array(n).fill(-1);
+  const order = fns.map((_, i) => i).sort((a, b) => fns[a]!.bodyStart - fns[b]!.bodyStart || fns[b]!.bodyEnd - fns[a]!.bodyEnd);
+  const stack: number[] = [];
+  let k = 0;
+  for (let p = 0; p < n; p++) {
+    while (stack.length && fns[stack[stack.length - 1]!]!.bodyEnd <= p) stack.pop();
+    while (k < order.length && fns[order[k]!]!.bodyStart <= p) {
+      const f = fns[order[k]!]!;
+      if (f.bodyEnd > p) stack.push(order[k]!);
+      k++;
+    }
+    if (stack.length) owner[p] = stack[stack.length - 1]!;
+  }
+  return owner;
 }
 
 // --- cache ------------------------------------------------------------------

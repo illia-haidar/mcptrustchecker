@@ -22,10 +22,9 @@
 
 import { createHash } from 'node:crypto';
 import type { ServerSurface, SkippedFile } from '../types.js';
-import { extractArchive } from './archive.js';
-import { SOURCE_LIMITS, SIDECAR_MANIFESTS, packageMetaFromJson } from './source.js';
+import { SIDECAR_MANIFESTS, packageMetaFromJson } from './source.js';
 import { surfaceFromManifest } from './manifest.js';
-import { assertTrustedTarballUrl, downloadCapped, classifyArchiveEntries, wantedSourceEntry } from './packageSource.js';
+import { assertTrustedTarballUrl, downloadCapped, classifyArchiveEntries, extractPackageArchive } from './packageSource.js';
 
 /** A resolved repository target. `ref` is a branch, tag or commit-ish. */
 export interface RepoRef {
@@ -109,8 +108,8 @@ export async function surfaceFromGithubRepo(
 
   const buf = await downloadCapped(url, 'github', authedFetch(fetchImpl, opts.token));
   const skipped: SkippedFile[] = [];
-  const entries = extractArchive(buf, 'repo.tar.gz', wantedSourceEntry, SOURCE_LIMITS, skipped);
-  const { sourceFiles, sidecars, layout } = classifyArchiveEntries(entries, skipped);
+  const { entries, maps } = extractPackageArchive(buf, 'repo.tar.gz', skipped);
+  const { sourceFiles, sidecars, layout, sourceMaps } = classifyArchiveEntries(entries, skipped, maps);
 
   let manifest: unknown = {};
   for (const name of SIDECAR_MANIFESTS) {
@@ -139,6 +138,7 @@ export async function surfaceFromGithubRepo(
   };
   surface.sourceFiles = sourceFiles;
   surface.packageLayout = layout;
+  if (sourceMaps.length) surface.sourceMaps = sourceMaps;
   return surface;
 }
 

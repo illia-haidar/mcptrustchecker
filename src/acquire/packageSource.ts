@@ -20,8 +20,9 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type { PackageLayout, PackageMeta, ServerSurface, SkippedFile, SourceFile } from '../types.js';
 import { SOURCE_EXTENSIONS } from '../data/sourcePatterns.js';
-import { extractArchive, stripCommonRoot, type ArchiveEntry } from './archive.js';
-import { LAYOUT_FILES, packageMetaFromJson, SIDECAR_MANIFESTS, SOURCE_LIMITS } from './source.js';
+import { detectArchiveKind, extractTar, extractZip, gunzipBounded, stripCommonRoot, type ArchiveEntry } from './archive.js';
+import { LAYOUT_FILES, packageMetaFromJson, SIDECAR_MANIFESTS, SOURCE_LIMITS, SOURCE_MAP_LIMITS } from './source.js';
+import { sourceMapPathsFor } from '../util/sourceMap.js';
 import { LICENSE_FILE } from '../util/license.js';
 import { surfaceFromManifest } from './manifest.js';
 import { isBlockedHost } from './live.js';
@@ -53,6 +54,8 @@ export interface PackageSourceResult {
   layout: PackageLayout;
   /** SHA-256 (hex) of the verified compressed artifact. */
   tarballSha256: string;
+  /** Source maps of the generated files (attribution only, never scanned as code). */
+  sourceMaps: SourceFile[];
 }
 
 /**
@@ -229,7 +232,8 @@ function isSourcePath(path: string): boolean {
 export function classifyArchiveEntries(
   entries: ArchiveEntry[],
   skipped: SkippedFile[] = [],
-): { sourceFiles: SourceFile[]; sidecars: Record<string, string>; layout: PackageLayout } {
+  maps: ArchiveEntry[] = [],
+): { sourceFiles: SourceFile[]; sidecars: Record<string, string>; layout: PackageLayout; sourceMaps: SourceFile[] } {
   const sourceFiles: SourceFile[] = [];
   const sidecars: Record<string, string> = {};
   const licenseFiles: string[] = [];
@@ -243,6 +247,10 @@ export function classifyArchiveEntries(
   }
   // Code-unit sort (never localeCompare) so order is reproducible on every machine.
   sourceFiles.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  // Maps sit beside the source, under the same shared root.
+  const sourceMaps: SourceFile[] = maps
+    .map((e) => ({ path: root && e.path.startsWith(root) ? e.path.slice(root.length) : e.path, content: e.data.toString('utf8') }))
+    .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   const files: Record<string, string> = {};
   for (const n of LAYOUT_FILES) if (sidecars[n] !== undefined) files[n] = sidecars[n]!;
   const layout: PackageLayout = {
@@ -252,7 +260,7 @@ export function classifyArchiveEntries(
       .map((k) => ({ ...k, path: root && k.path.startsWith(root) ? k.path.slice(root.length) : k.path }))
       .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)),
   };
-  return { sourceFiles, sidecars, layout };
+  return { sourceFiles, sidecars, layout, sourceMaps };
 }
 
 /** The extraction predicate: implementation source + shallow sidecar files. */
@@ -262,6 +270,35 @@ export function wantedSourceEntry(path: string): boolean {
   const base = parts[parts.length - 1]!;
   if (parts.length <= 2 && (SIDECAR_NAMES.has(base) || LICENSE_FILE.test(base))) return true;
   return isSourcePath(path);
+}
+
+/**
+ * Extract an artifact's implementation source AND the source maps of its
+ * generated files, decompressing once. The source read is exactly the bounded
+ * {@link SOURCE_LIMITS} read every scan has always done; the maps are a second
+ * read under their own {@link SOURCE_MAP_LIMITS}, restricted to the paths the
+ * extracted files point at (`<file>.map`, or what `sourceMappingURL` names) — so
+ * a large map can neither evict real source nor drag in unrelated `.map` files.
+ */
+export function extractPackageArchive(
+  buf: Buffer,
+  nameHint: string,
+  skipped: SkippedFile[],
+): { entries: ArchiveEntry[]; maps: ArchiveEntry[] } {
+  const kind = detectArchiveKind(buf, nameHint);
+  const body = kind === 'tgz' ? gunzipBounded(buf) : buf;
+  const read = (wanted: (path: string) => boolean, limits: typeof SOURCE_LIMITS | typeof SOURCE_MAP_LIMITS, sk?: SkippedFile[]): ArchiveEntry[] =>
+    kind === 'zip' ? extractZip(body, wanted, limits, sk) : extractTar(body, wanted, limits, sk);
+  const entries = read(wantedSourceEntry, SOURCE_LIMITS, skipped);
+  const want = new Set<string>();
+  for (const e of entries) {
+    if (!/\.[cm]?js$/i.test(e.path)) continue;
+    const tail = e.data.subarray(Math.max(0, e.data.length - 2048)).toString('utf8');
+    for (const p of sourceMapPathsFor(e.path, tail)) want.add(p);
+  }
+  // A map that is not read is not a coverage gap: the source itself was read.
+  const maps = want.size ? read((p) => want.has(p), SOURCE_MAP_LIMITS) : [];
+  return { entries, maps };
 }
 
 /**
@@ -280,8 +317,8 @@ export async function fetchPackageSource(
   verifyTarballIntegrity(buf, meta.tarballIntegrity);
   const tarballSha256 = createHash('sha256').update(buf).digest('hex');
   const skipped: SkippedFile[] = [];
-  const entries = extractArchive(buf, url.pathname, wantedSourceEntry, SOURCE_LIMITS, skipped);
-  return { ...classifyArchiveEntries(entries, skipped), tarballSha256 };
+  const { entries, maps } = extractPackageArchive(buf, url.pathname, skipped);
+  return { ...classifyArchiveEntries(entries, skipped, maps), tarballSha256 };
 }
 
 /**
@@ -293,8 +330,8 @@ export async function fetchPackageSource(
 export function surfaceFromArchiveFile(path: string): ServerSurface {
   const buf = readFileSync(path);
   const skipped: SkippedFile[] = [];
-  const entries = extractArchive(buf, path, wantedSourceEntry, SOURCE_LIMITS, skipped);
-  const { sourceFiles, sidecars, layout } = classifyArchiveEntries(entries, skipped);
+  const { entries, maps } = extractPackageArchive(buf, path, skipped);
+  const { sourceFiles, sidecars, layout, sourceMaps } = classifyArchiveEntries(entries, skipped, maps);
 
   let manifest: unknown = {};
   for (const name of SIDECAR_MANIFESTS) {
@@ -318,5 +355,6 @@ export function surfaceFromArchiveFile(path: string): ServerSurface {
   };
   surface.sourceFiles = sourceFiles;
   surface.packageLayout = layout;
+  if (sourceMaps.length) surface.sourceMaps = sourceMaps;
   return surface;
 }

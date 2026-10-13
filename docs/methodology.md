@@ -1,4 +1,4 @@
-# Methodology — the Capability-Flow Trust Model (`mcptrustchecker-1.15`)
+# Methodology — the Capability-Flow Trust Model (`mcptrustchecker-1.16`)
 
 This document specifies exactly what MCP Trust Checker does, stage by stage. It is the spec behind every finding. The design goal is **auditability**: nothing here depends on a model's opinion, so a result can be reproduced and defended.
 
@@ -129,8 +129,24 @@ Each tool is tagged with the roles it can play, derived from its **name, descrip
 - `external-sink` — sends data out / acts externally (HTTP, email, publish, webhook…)
 - `code-exec` — runs shell commands or evaluates code (a severe sink)
 - `file-write` — writes or deletes files
+- `process-spawn` — starts a fixed program without a shell (`moderate` at most; added in `mcptrustchecker-1.15`)
+- `state-write` — changes state it has access to, as the tool itself declares (`moderate` at most; added in `mcptrustchecker-1.16`)
 
-Two rules matter here. First, **`untrusted-input` and `sensitive-source` are kept separate** — merging them would both over- and under-flag the trifecta. Second, MCP Trust Checker **never trusts the server's `annotations`** (`readOnlyHint`, `destructiveHint`): the SDK itself says not to. Instead it *derives* behavior and raises a finding when an annotation **contradicts** it — a destructive tool claiming `readOnlyHint: true` is exactly how a hostile server hides (`MTC-CAP-003`); an honest `openWorldHint: true` on a sensitive-reading tool is itself a trifecta signal (`MTC-CAP-004`).
+Two rules matter here. First, **`untrusted-input` and `sensitive-source` are kept separate** — merging them would both over- and under-flag the trifecta. Second, **a server's `annotations` can only ever RAISE a tool's roles, never lower them**: the SDK itself says not to trust them, so a self-declared `readOnlyHint: true` never strips what the name, the parameters or the handler show — `delete_file` declaring itself read-only stays a writer, and the contradiction is a finding (`MTC-CAP-003`). An honest `openWorldHint: true` on a sensitive-reading tool is itself a trifecta signal (`MTC-CAP-004`).
+
+**Declared hints raise (changed in `mcptrustchecker-1.16`).** Before 1.16 the annotations were read only to catch a contradiction, so a server that *declared* its writes was rated as if it had none. Now an explicit hint adds a role:
+
+| The tool declares | Role added |
+|---|---|
+| `openWorldHint: true` and no write hint | `untrusted-input` — its answers come from outside the server |
+| `readOnlyHint: false` or `destructiveHint: true`, with `openWorldHint: true` | `external-sink` — it acts on an external service |
+| `readOnlyHint: false` or `destructiveHint: true`, without `openWorldHint: true` | `state-write` — it changes the state it holds |
+
+Only explicit booleans count (the spec's defaults are not assumed), one tool's hints can never complete a trifecta on their own (the open-world branches are exclusive), and a hint that says "read-only, closed world" adds and removes nothing. For a statically recovered tool, a handler that visibly sends an HTTP `POST`/`PUT`/`PATCH`/`DELETE` to an API (`client.post('/v1/…')`, `fetch(url, { method: 'POST' })`, `requests.post(…)`) raises `external-sink` the same way; a POST that only asks — GraphQL, a search endpoint — and `Map.prototype.delete` do not.
+
+**Statically recovered tools (extended in `mcptrustchecker-1.16`).** When no server was run, the tool surface is reconstructed from the source. Registrations are now read the way the language runs them: a local **helper** that passes its own parameter as the tool name (`function register(server, name, def, h) { server.registerTool(name, …) }`), a helper calling a helper, a **loop** over a definitions table (`for (const [name, def] of Object.entries(TOOLS))`, `TOOLS.forEach(t => server.tool(t.name, …))`), Python decorators with nested calls and **decorator wrappers**. For every tool — literal registrations included — its annotations are evaluated: object literals and spreads in source order, `||` / `??` fallbacks, `Object.freeze` / `Object.assign`, same-file constants, helper parameters bound to each call's arguments. A helper's default (`def.annotations || DEFAULTS`) stands in **only** where the call site has no `annotations` key at all; annotations that exist but cannot be read — an imported constant, a function call, a spread of an unknown object, a call chained on a constructor — are *unknown*, and an unreadable spread resets everything written before it. Each tool records where its hints came from (`declared`, `default`, `merged`, `unreadable`, `none`).
+
+A registration behind a condition — an early `if (!client.enabled) return`, an `if (apiKey) { … }` block, a Python `if os.getenv(…):` — is still part of the server's surface and is analysed; the report lists those tools by condition (`coverage.conditionalTools`) and says what a server started without that configuration exposes. The same recovery now runs for every way the source arrives — an `--online` package, a GitHub repository, a local directory, a packed artifact — so a package reports the same tools however it was handed to the scanner.
 
 This stage also emits **schema-level injection preconditions** — a command-, URL/host-, or path-shaped parameter with *no* enum/pattern constraint on a tool that already has the matching capability is the advertised half of command-injection / SSRF / path-traversal (`MTC-CAP-006/007/008`) — and **declared-capability findings**: a server advertising the MCP `sampling` (`MTC-CAP-009`) or `elicitation` (`MTC-CAP-010`) capability is a reverse-trust / consent-phishing precondition that a static scanner can flag offline, escalated when an elicitation server also exposes secret-seeking fields.
 
@@ -235,7 +251,43 @@ the published source (JS/TS `registerTool`/`.tool`/`ListTools`; Python FastMCP
 `@mcp.tool`, `Tool(…)`). It is **biased to miss, never to mis-attribute**: only
 recognised SDK shapes are read, and any finding derived from a statically-inferred
 tool is capped below `confirmed`, so a parse slip can never trigger the F-gate — a
-live scan is what escalates that far.
+live scan is what escalates that far. Since `mcptrustchecker-1.16` it also reads
+helpers, loops, `tools/list` objects and Python decorator wrappers, and evaluates
+every tool's annotations — see stage [3].
+
+**Bundled code generators are not the server's code (added in `mcptrustchecker-1.16`).**
+MTC-SRC-001/010 describe the server's *own* dynamic code. A single-file `dist`
+bundle inlines its dependencies — above all Ajv's JSON-schema compiler, which
+arrives with `@modelcontextprotocol/sdk` — and Ajv's `new Function(…)` used to be
+reported as the server's, inflating the capability level of hundreds of servers.
+A site in generated JavaScript (`.js`/`.mjs`/`.cjs`; never Python or TypeScript
+sources) is **discounted** only when the call AT THE SITE matches a verified
+signature of a code generator that compiles static definitions, taken from that
+generator's published source ([`src/data/vendoredSignatures.ts`](../src/data/vendoredSignatures.ts)):
+Ajv's validator and JTD compilers (pinned to Ajv's own `CodeGen` defined in the
+same file), depd's `wrapfunction`, get-intrinsic's evalled-constructor probe. Each
+signature pins the argument shapes, the invocation and the origin of every runtime
+value. It must be corroborated either by a **source map** (sidecar,
+`sourceMappingURL` target or inline `data:` map — bounded in size, nesting, string
+count, `sourceRoot` and path length, parsed once per scan) that fits the file,
+starts a segment at the site and traces it into that package's `node_modules/`
+directory, whose embedded original (if any) shows the same call; or by the file
+being a real bundle (it calls a module wrapper) that carries the generator's own
+identifying text in code.
+
+A discounted site is `info` — "in bundled dependency <pkg>@<version>",
+`data.vendored`, `capabilityTag: null` — so the capability level is recomputed
+without it. Code a map traces to **any other** package — other generators included
+— is named (`data.vendored.discounted: false`, plus `codeExecutionLibrary: true`
+for evaluators and template engines such as vm2, safe-eval, ses, handlebars, ejs,
+jsdom) but counted in full: dependency code runs in the server process, and what
+reaches it is the server's choice. A pnpm, bun or yarn store is believed only when
+it agrees with the package directory; anything ambiguous fails closed. Maps and
+bundles are author-supplied, so a deliberate full copy of a generator inside a
+genuine bundle can still lower the capability level; attribution therefore moves
+**only the capability axis** — it never changes a threat-axis rule
+(MTC-SRC-004/007/008/009/011 and every non-source rule), and a site a
+decode-and-execute dropper covers is never attributed.
 
 ---
 

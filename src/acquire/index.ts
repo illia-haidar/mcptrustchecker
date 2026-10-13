@@ -111,19 +111,7 @@ async function attachPublishedSource(surface: ServerSurface, opts: ResolveOption
     meta.tarballSha256 = src.tarballSha256;
     surface.sourceFiles = src.sourceFiles;
     surface.packageLayout = src.layout;
-    // With the real source in hand but no running server to enumerate tools,
-    // reconstruct the tool surface statically so the MCP-specific detectors
-    // (tool-poisoning, unicode smuggling, toxic flows, name collisions, per-tool
-    // capability) have a surface to inspect. Marked `static` so the engine caps
-    // tool-derived finding confidence — an inferred tool never forces the F-gate.
-    // Fail-open: if nothing is recovered, the scan is left exactly as it was.
-    if ((!surface.tools || surface.tools.length === 0) && surface.sourceFiles.length) {
-      const extracted = extractToolsFromSource(surface.sourceFiles);
-      if (extracted.extracted) {
-        surface.tools = extracted.tools;
-        surface.toolProvenance = 'static';
-      }
-    }
+    if (src.sourceMaps.length) surface.sourceMaps = src.sourceMaps;
   } catch (err) {
     const kind = err instanceof PackageSourceError ? err.kind : 'other';
     const detail = (err as Error).message;
@@ -134,6 +122,36 @@ async function attachPublishedSource(surface: ServerSurface, opts: ResolveOption
         : 'artifact byte-check skipped';
     process.stderr.write(`! ${surface.id}: ${label} (${detail}).\n`);
   }
+  // Outside the download's try: a problem recovering tools is not an artifact
+  // failure, and must never be reported as one (MTC-TOFU-004).
+  attachStaticTools(surface);
+}
+
+/**
+ * With the real source in hand but no running server to enumerate tools,
+ * reconstruct the tool surface statically so the MCP-specific detectors
+ * (tool-poisoning, unicode smuggling, toxic flows, name collisions, per-tool
+ * capability) have a surface to inspect. Marked `static` so the engine caps
+ * tool-derived finding confidence — an inferred tool never forces the F-gate.
+ * Fail-open: if nothing is recovered, the surface is left exactly as it was.
+ *
+ * One function for every way the source arrives — an `--online` package, a
+ * GitHub repository, a local directory, a packed artifact — so the same package
+ * reports the same tools however it was handed to the scanner. (Before 1.16 the
+ * directory and archive paths skipped this, and a tarball of a server that an
+ * online scan credited with three tools reported none.)
+ */
+function attachStaticTools(surface: ServerSurface): ServerSurface {
+  if ((!surface.tools || surface.tools.length === 0) && surface.sourceFiles?.length) {
+    const extracted = extractToolsFromSource(surface.sourceFiles);
+    if (extracted.extracted) {
+      surface.tools = extracted.tools;
+      surface.toolProvenance = 'static';
+      surface.staticTools = extracted.origins;
+      if (extracted.truncated.length) surface.staticToolsTruncated = extracted.truncated;
+    }
+  }
+  return surface;
 }
 
 /** Strip the query string from a stored URL so config-embedded tokens don't leak. */
@@ -190,13 +208,7 @@ export async function resolveTargets(target: string | undefined, opts: ResolveOp
     const repoRef = parseRepoTarget(target);
     if (repoRef) {
       const surface = await surfaceFromGithubRepo(repoRef, { token: opts.githubToken });
-      if ((!surface.tools || surface.tools.length === 0) && surface.sourceFiles?.length) {
-        const extracted = extractToolsFromSource(surface.sourceFiles);
-        if (extracted.extracted) {
-          surface.tools = extracted.tools;
-          surface.toolProvenance = 'static';
-        }
-      }
+      attachStaticTools(surface);
       return [{ label: repoLabel(repoRef), surface }];
     }
   }
@@ -227,13 +239,13 @@ export async function resolveTargets(target: string | undefined, opts: ResolveOp
 
   // A local package DIRECTORY → analyze its implementation source + metadata.
   if (existsSync(target) && statSync(target).isDirectory()) {
-    return [{ label: target, surface: surfaceFromPackageDir(target) }];
+    return [{ label: target, surface: attachStaticTools(surfaceFromPackageDir(target)) }];
   }
 
   // A packed release artifact (.tgz/.tar.gz/.tar/.zip/.whl) → read the real
   // shipped source in memory, offline, without installing or executing it.
   if (isArchiveFile && existsSync(target) && statSync(target).isFile()) {
-    return [{ label: target, surface: surfaceFromArchiveFile(target) }];
+    return [{ label: target, surface: attachStaticTools(surfaceFromArchiveFile(target)) }];
   }
 
   // 2) A file on disk: manifest or client config.
