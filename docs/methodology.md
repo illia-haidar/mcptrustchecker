@@ -1,4 +1,4 @@
-# Methodology — the Capability-Flow Trust Model (`mcptrustchecker-1.16`)
+# Methodology — the Capability-Flow Trust Model (`mcptrustchecker-1.16.1`)
 
 This document specifies exactly what MCP Trust Checker does, stage by stage. It is the spec behind every finding. The design goal is **auditability**: nothing here depends on a model's opinion, so a result can be reproduced and defended.
 
@@ -67,6 +67,16 @@ Text that a human reviewer sees as blank or normal can carry instructions the mo
 
 **Homoglyphs** are a separate detector: a codepoint blocklist can't catch a *visible* Cyrillic `а` masquerading as Latin `a`. MCP Trust Checker resolves the Unicode **script** of each token and flags any single token that mixes scripts (the signature of impersonation), and maintains a small confusables `skeleton()` used by the typosquat stage. **ANSI/CSI/OSC terminal escapes** (`MTC-UNI-010`) are flagged too — in a terminal client they can hide, recolor, or overwrite text so the approved action differs from what's shown (consent phishing).
 
+
+**Orthographic joiners (changed in `mcptrustchecker-1.16.1`).** A single ZWNJ /
+ZWJ between two letters of a script that needs it in normal spelling — Arabic
+(Persian, Urdu), Syriac, the Indic scripts, Sinhala — is spelling, not a hidden
+channel, and is not counted toward `MTC-UNI-005`; joiners between Latin letters,
+in runs, and zero-width spaces still are. A lone C1 control right after
+non-ASCII punctuation is mojibake (`MTC-UNI-008`, low). Escapes in string
+literals (`\uXXXX`, `\u{…}`, `\xHH`, Python `\N{…}`) are decoded as the language
+decodes them before any of this runs.
+
 ---
 
 ## [2] Content injection heuristics
@@ -118,13 +128,43 @@ These are **soft** signals, gated three ways: they are suppressed entirely in a 
 
 A tool's **interface** is the honest statement of what it touches. When the prose names a credential store — `~/.ssh`, `.aws/credentials`, a keychain — that nothing in the input schema can address, the prose is not documenting the tool; it is addressing the model. `MTC-INJ-SCHEMA-1` fires on exactly that mismatch, and because it keys on literal path identifiers it works in any language. A tool that exposes a matching parameter, or whose subject legitimately *is* the credential store, is left alone.
 
+
+### [2d] Mention is not use (changed in `mcptrustchecker-1.16.1`)
+
+1.16 began reading descriptions whole, and the detectors met text they had not
+seen before: honesty rules, defensive caveats, quoted examples, negations. The
+injection layer now separates **mentioning** an attack from **using** one:
+
+- an override or secrecy phrase that is quoted as an example ("such as 'ignore
+  your previous instructions'", "a user might type …") or sits inside a
+  defensive caveat needs a second, real signal outside that fragment before
+  `MTC-INJ-POISON` fires — while a quotation attributed to an authority ("your
+  system prompt says: '…'", "… Follow it.") is an order;
+- `MTC-INJ-SECRECY-1` reads the clause after "tell the user": a statement of
+  fact the model must not misstate ("do not tell the user it can be sent", "…
+  'the payment did not go through'") is an honesty rule; hiding an event or the
+  user's data ("… their key leaked") is concealment; a condition excuses a claim
+  only when a system verifies it ("unless the call succeeded"), never a person;
+- `MTC-INJ-CMD-1` needs an order to the model — a command named in prose, an
+  install note for a person, or what a guard detects or blocks is not one; an
+  order counts in the command's own sentence, or in the next one when it orders
+  the command just named ("… Then answer the question.");
+- `MTC-INJ-ESCALATE-1` (new) reports metadata that has the model lift its own
+  guard rails: high when both guards are lifted or the lift is hidden from the
+  user, low for a single lift.
+
+Every such decision is pinned by a control suite of over a thousand sentences,
+each carrying the verdict 1.16.0 gave it: an attack 1.16.0 caught must not be
+caught weaker unless a rule above lowers it on purpose, and honest text 1.16.0
+left alone must not gain a finding.
+
 ---
 
 ## [3] Capability extraction
 
 Each tool is tagged with the roles it can play, derived from its **name, description verbs, and parameter shape** — [`src/util/capabilities.ts`](../src/util/capabilities.ts), lexicon in [`src/data/capabilityLexicon.ts`](../src/data/capabilityLexicon.ts):
 
-- `untrusted-input` — ingests attacker-controllable content (web fetch, read issue/email/ticket…)
+- `untrusted-input` — ingests attacker-controllable content (web fetch, read issue/email/ticket…). A full leg of every toxic flow, but on its own an entry point, not blast radius: it is listed in `capabilityProfile.observations` and costs no points, unless the model chooses the destination — an unpinned `url`/`uri`/`host`/`hostname` parameter, or a handler fetching a URL from its input — which is `moderate` (SSRF, egress through the URL; changed in `mcptrustchecker-1.16.1`)
 - `sensitive-source` — reads private/local data (files, env, secrets, db…)
 - `external-sink` — sends data out / acts externally (HTTP, email, publish, webhook…)
 - `code-exec` — runs shell commands or evaluates code (a severe sink)
@@ -134,11 +174,13 @@ Each tool is tagged with the roles it can play, derived from its **name, descrip
 
 Two rules matter here. First, **`untrusted-input` and `sensitive-source` are kept separate** — merging them would both over- and under-flag the trifecta. Second, **a server's `annotations` can only ever RAISE a tool's roles, never lower them**: the SDK itself says not to trust them, so a self-declared `readOnlyHint: true` never strips what the name, the parameters or the handler show — `delete_file` declaring itself read-only stays a writer, and the contradiction is a finding (`MTC-CAP-003`). An honest `openWorldHint: true` on a sensitive-reading tool is itself a trifecta signal (`MTC-CAP-004`).
 
+**A contradiction is graded by its evidence (changed in `mcptrustchecker-1.16.1`).** `destructiveHint: false` means "only additive updates" in the MCP spec, so it is contradicted only by execution or a destructive write — `create_file`, `save_file`, `append_file` are additive; `readOnlyHint: true` is contradicted by any write or execution. A name keyword or handler evidence is strong (`MTC-CAP-003` medium); a command-shaped parameter alone, or a name that reads an execution's result (`…_exec_status`), is weak and reported low — never dropped. Homonyms are read in context, at tag time and in the contradiction alike: `eval` in evaluation names, `spawn` beside a game object, `unlink_<record>` as an association, a `script` that is spoken text, an enum-bound `shell` dialect. A keyword in a description does not count when the prose negates it ("Do NOT use curl or fetch") or when it is part of another tool's name; and a POST counts as a read only when the read is proven — a get/list/search path, a JSON-RPC read, a SQL `SELECT` — and its body carries nothing but the tool's own unmodified arguments.
+
 **Declared hints raise (changed in `mcptrustchecker-1.16`).** Before 1.16 the annotations were read only to catch a contradiction, so a server that *declared* its writes was rated as if it had none. Now an explicit hint adds a role:
 
 | The tool declares | Role added |
 |---|---|
-| `openWorldHint: true` and no write hint | `untrusted-input` — its answers come from outside the server |
+| `openWorldHint: true` and no write hint | `untrusted-input` — its answers come from outside the server (on its own an observation, no points; see above) |
 | `readOnlyHint: false` or `destructiveHint: true`, with `openWorldHint: true` | `external-sink` — it acts on an external service |
 | `readOnlyHint: false` or `destructiveHint: true`, without `openWorldHint: true` | `state-write` — it changes the state it holds |
 
@@ -327,6 +369,7 @@ Multi-signal, anchored to a curated protected list ([`src/data/protectedPackages
 - **Unpinned spec** (`MTC-SUP-013`): an explicit `@latest`/floating install spec is the rug-pull *enabler*. Advisory only, and not raised for a bare scan-by-name (unpinned by construction) — a scored penalty there would fire on essentially every package and say nothing about this one.
 - **Dependency signals** (`MTC-SUP-014`): declared dependencies are run through the same squat check and matched against the known-vuln table by name.
 - **Missing pinned version** (`MTC-SUP-015`): the exact version you pinned is not listed by the registry — unpublished, yanked, or hidden by a hostile registry response serving a different "latest". The scanner **does not** silently substitute another version: no source is read and no byte pin is recorded for a version that isn't there, and the gap is reported instead of being papered over.
+- **PyPI attestations** (PEP 740): PyPI publishes them per file through its integrity API (`/integrity/<name>/<version>/<file>/provenance`), never in the JSON document, so `--online` asks for the file the scan actually reads (the sdist, else the wheel). An attestation earns `source` verification only when the repository its publisher names (GitHub → `github.com/<repository>`, GitLab → `gitlab.com/<repository>`) matches the package's own `project_urls` repository, compared case-insensitively, or the package names none. A publisher with no locatable repository is not counted; a different repository is not counted either and is recorded as `MTC-SUP-016` (info, never scored). A 404 means unsigned; a PyPI that cannot answer fails the scan as retryable rather than guessing. npm's `dist.attestations` is still accepted without reading its subject.
 
 Package metadata is best-effort and **offline by default**; `--online` pulls registry data (npm/PyPI) for richer signals.
 
@@ -371,3 +414,5 @@ Deterministic penalties from 100, with diminishing returns per rule, per-categor
 3. **Hard gates are weakest-link and confidence-aware**: a `confirmed` critical caps the grade at F, any critical at D, and confirmed high findings at D (≥2) or C (1). All but the any-critical floor require `confirmed`, so a heuristic can never force a cap.
 
 The reproducibility contract is **same methodology version + same target ⇒ identical score**, which is why `score.methodologyVersion` is stamped on every report and bumped whenever a change could move a grade.
+
+**What a report contains.** The JSON report carries the findings, the itemized score, per-tool capabilities, the capability profile, coverage, toxic flows, the integrity result and the `surfaceDigest` fingerprint. On request (`--surface`, or `scanSurface(surface, { surface: true })`) it also carries `surface`: the tools, prompts and resources the score was computed on — taken after normalization and before analysis, so tools the extractor skips as test or example code are not in it — with `provenance` (`live`, `manifest` or `static`), each tool's description, schemas and annotations as read (line endings normalized, nothing stripped), and, for a statically recovered tool, the file, line and shape of its registration. Tools are listed in the canonical order behind `surfaceDigest`; at most 500 are listed, with 8,000 characters per description and 64 KB per schema, and every cut is named in `surface.truncated`. The field is descriptive only: it moves no score and leaves `surfaceDigest` as it is.

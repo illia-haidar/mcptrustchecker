@@ -29,6 +29,7 @@
 
 import type { SourceFile, StaticToolOrigin, ToolDef, JsonSchema } from '../types.js';
 import { MAX_MERGED_DESC, mergeDescriptions, mergeHints, readRegistrationsWithStats } from '../analysis/toolRegistry.js';
+import { decodeEscapes } from '../util/constFold.js';
 
 export interface ToolExtractionResult {
   tools: ToolDef[];
@@ -65,14 +66,14 @@ function looksLikeToolName(name: string): boolean {
   return /^[A-Za-z0-9._:\- ]{1,128}$/.test(name) && /[A-Za-z0-9]/.test(name);
 }
 
-/** Decode the common escapes in a captured string literal, bounded in length. */
-function cleanString(raw: string | undefined, max = MAX_DESC_LEN): string | undefined {
+/**
+ * Decode a captured string literal the way the language reads it — `\u4E0A`,
+ * `\x41`, `\u{…}`, Python's `\N{…}` included (see `escapeAt`) — bounded in
+ * length. The reader decodes the same way, so the two reads of one literal agree.
+ */
+function cleanString(raw: string | undefined, max = MAX_DESC_LEN, py = false): string | undefined {
   if (typeof raw !== 'string') return undefined;
-  let s = raw
-    .replace(/\\n/g, '\n')
-    .replace(/\\t/g, '\t')
-    .replace(/\\r/g, '')
-    .replace(/\\(['"`\\])/g, '$1');
+  let s = decodeEscapes(raw, py);
   if (s.length > max) s = s.slice(0, max);
   return s;
 }
@@ -82,11 +83,13 @@ function cleanString(raw: string | undefined, max = MAX_DESC_LEN): string | unde
  * of a bounded window of source. Handles ', " and ` quoting. Returns the FIRST
  * match only — windows are small and scoped to a single registration.
  */
-function fieldString(window: string, key: string): string | undefined {
-  const re = new RegExp(`\\b${key}\\s*[:=]\\s*(?:(?:String\\.raw)?\`([^\`]*)\`|'((?:[^'\\\\]|\\\\.)*)'|"((?:[^"\\\\]|\\\\.)*)")`, 'm');
+function fieldString(window: string, key: string, py = false): string | undefined {
+  const re = new RegExp(`\\b${key}\\s*[:=]\\s*(?:String\\.raw\`([^\`]*)\`|\`([^\`]*)\`|'((?:[^'\\\\]|\\\\.)*)'|"((?:[^"\\\\]|\\\\.)*)")`, 'm');
   const m = re.exec(window);
   if (!m) return undefined;
-  return cleanString(m[1] ?? m[2] ?? m[3]);
+  // `String.raw` keeps its backslashes.
+  if (m[1] !== undefined) return m[1].length > MAX_DESC_LEN ? m[1].slice(0, MAX_DESC_LEN) : m[1];
+  return cleanString(m[2] ?? m[3] ?? m[4], MAX_DESC_LEN, py);
 }
 
 /**
@@ -332,7 +335,11 @@ function pyDocstring(src: string, defParenIdx: number): string | undefined {
   if (colon < 0) return undefined;
   const after = src.slice(colon, colon + 2000);
   const m = /^[\s\S]{0,80}?("""|''')([\s\S]*?)\1/.exec(after);
-  return m ? cleanString((m[2] ?? '').trim()) : undefined;
+  if (!m) return undefined;
+  // `r"""…"""` keeps its backslashes.
+  const raw = /[rR]$/.test(after.slice(0, m[0].length - (m[2] ?? '').length - 6));
+  const body = (m[2] ?? '').trim();
+  return raw ? body.slice(0, MAX_DESC_LEN) : cleanString(body, MAX_DESC_LEN, true);
 }
 
 function extractPyTools(src: string): ToolDef[] {
@@ -345,10 +352,10 @@ function extractPyTools(src: string): ToolDef[] {
     const decoratorArgs = m[2] ?? '';
     const fnName = m[3];
     if (!fnName) continue;
-    const explicitName = fieldString(decoratorArgs, 'name');
+    const explicitName = fieldString(decoratorArgs, 'name', true);
     const name = explicitName ?? fnName;
     if (!looksLikeToolName(name) || seen.has(name)) continue;
-    const description = fieldString(decoratorArgs, 'description') ?? pyDocstring(src, RE_PY_DECORATOR.lastIndex);
+    const description = fieldString(decoratorArgs, 'description', true) ?? pyDocstring(src, RE_PY_DECORATOR.lastIndex);
     const tool: ToolDef = { name };
     if (description) tool.description = description;
     seen.add(name);
@@ -360,7 +367,7 @@ function extractPyTools(src: string): ToolDef[] {
     const name = m[2];
     if (!name || !looksLikeToolName(name) || seen.has(name)) continue;
     const win = windowFrom(src, RE_PY_TOOL_CTOR.lastIndex, -1);
-    const description = fieldString(win, 'description');
+    const description = fieldString(win, 'description', true);
     const params = schemaParamNames(win, 'inputSchema');
     const tool: ToolDef = { name };
     if (description) tool.description = description;
@@ -427,13 +434,20 @@ export function extractToolsFromSource(files: SourceFile[] | undefined): ToolExt
       // When the two differ — a second registration of the name — both are kept,
       // so the injection detectors read every text the tool may present.
       if (hit && reg.description !== undefined) {
-        const d = cleanString(reg.description, MAX_MERGED_DESC);
-        const merged = mergeDescriptions(tool.description, d);
+        // Already decoded by the reader: decoding it again would turn a literal
+        // `\u200B` the server sends as text into the character itself.
+        const merged = mergeDescriptions(tool.description, reg.description.slice(0, MAX_MERGED_DESC));
         if (merged) tool.description = merged;
+      }
+      // The line matcher saw the tool but not its schema (a `tools/list` table it
+      // does not read): the reader's parameters stand in.
+      if (hit && !tool.inputSchema) {
+        const schema = schemaFromParamNames(reg.params);
+        if (schema) tool.inputSchema = schema;
       }
       if (!hit) {
         const description =
-          reg.description !== undefined ? cleanString(reg.description, MAX_MERGED_DESC) : reg.defAt !== undefined ? pyDocstring(f.content, reg.defAt) : undefined;
+          reg.description !== undefined ? reg.description.slice(0, MAX_MERGED_DESC) : reg.defAt !== undefined ? pyDocstring(f.content, reg.defAt) : undefined;
         if (description) tool.description = description;
         if (reg.title) tool.title = reg.title;
         const schema = schemaFromParamNames(reg.params);

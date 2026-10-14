@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { classifyPublisher } from '../src/acquire/publisher.js';
 import { scanSurface } from '../src/engine.js';
 import { computeCoverage } from '../src/scoring/coverage.js';
-import { makeSurface } from './helpers.js';
+import { loadFixture, makeSurface } from './helpers.js';
 import type { ServerSurface } from '../src/types.js';
 
 // The verification classifier is the SAME engine signal used by the CLI, the
@@ -102,10 +102,18 @@ test('a scope name inside the package name proves nothing without the scope owni
   assert.equal(id.vendor, null);
 });
 
-test('pypi: PEP 740 attestation on a file ⇒ source verified', () => {
-  const doc = { info: {}, urls: [{ attestations: [{}] }] };
-  const id = classifyPublisher('pypi', 'mcp-thing', doc, 'https://github.com/someone/mcp-thing');
+test('pypi: PEP 740 attestation from the integrity API ⇒ source verified (real staan-mcp shape)', () => {
+  // Until 1.16.1 this test fed `urls: [{ attestations: [{}] }]` — a shape PyPI's
+  // JSON document never has, so the bug it should have caught (no signed PyPI
+  // release ever read as signed) passed. The fixture is PyPI's real answer.
+  const { json, provenance } = loadFixture('pypi-staan-mcp-1.0.1.json') as { json: Record<string, any>; provenance: unknown }; // eslint-disable-line @typescript-eslint/no-explicit-any
+  for (const file of json.urls) assert.ok(!('provenance' in file) && !('attestations' in file), 'the JSON document carries no provenance');
+  const repo = 'https://github.com/MarcinWolnyEU/Staan-MCP';
+  assert.equal(classifyPublisher('pypi', 'staan-mcp', json, repo).verification, 'repo', 'the JSON document alone proves nothing');
+  const id = classifyPublisher('pypi', 'staan-mcp', json, repo, '1.0.1', provenance);
   assert.equal(id.verification, 'source');
+  assert.equal(id.attestedRepo, repo);
+  assert.equal(id.attestationMismatch, false);
 });
 
 // --- Engine wiring: offline vs online is input-dependent, not a code fork. ---

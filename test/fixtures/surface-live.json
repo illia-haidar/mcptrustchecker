@@ -1,0 +1,31 @@
+{
+  "server": { "name": "surface-live-server", "version": "1.2.3", "title": "Surface fixture" },
+  "tools": [
+    {
+      "name": "write_note",
+      "title": "Write a note",
+      "description": "Writes a note to the notebook.\nKeeps the text​ exactly as sent.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": { "type": "string", "description": "Note body" },
+          "tags": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["text"],
+        "additionalProperties": false
+      },
+      "outputSchema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] },
+      "annotations": { "title": "Write a note", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
+    },
+    {
+      "name": "read_note",
+      "description": "Reads one note by id.",
+      "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] },
+      "annotations": { "readOnlyHint": true }
+    }
+  ],
+  "prompts": [
+    { "name": "summarize", "description": "Summarize notes.", "arguments": [{ "name": "topic", "description": "What to summarize", "required": true }] }
+  ],
+  "resources": [{ "uri": "notes://index", "name": "index", "description": "All notes.", "mimeType": "application/json" }]
+}

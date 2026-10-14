@@ -251,7 +251,10 @@ export function analyzeProvenance(meta: PackageMeta, extra: ProvenanceContext = 
     });
   }
 
-  if (meta.repositoryUrl === null) {
+  // A PyPI attestation that names a repository locates the source even when the
+  // package's own metadata names none, so the "cannot be compared" note below
+  // would contradict the verification it earned.
+  if (meta.repositoryUrl === null && !meta.attestedRepositoryUrl) {
     // When an --online scan already classified verification (repo/none/source/
     // vendor), the missing-repository fact is ALREADY priced by the verification
     // client term (none = -5). Re-charging it here as a scored supply-chain finding
@@ -268,6 +271,28 @@ export function analyzeProvenance(meta: PackageMeta, extra: ProvenanceContext = 
       description: `"${name}" declares no repository URL, so its published artifact cannot be compared against reviewable source.`,
       remediation: 'Prefer packages that link to public, reviewable source.',
       location: { kind: 'package', name },
+    });
+  }
+  // PyPI (PEP 740): the scanned file is attested from one repository while the
+  // package names another. The attestation was not counted toward verification,
+  // which already prices the gap; a rename, a fork or a mirror explains many of
+  // these, so the fact is recorded (info) and never lowers the threat score.
+  if (meta.attestationRepoMismatch && meta.attestedRepositoryUrl && meta.repositoryUrl) {
+    findings.push({
+      ruleId: 'MTC-SUP-016',
+      title: 'Attestation repository differs from the declared repository',
+      category: 'supply-chain',
+      severity: 'info',
+      confidence: 'confirmed',
+      description:
+        `PyPI's PEP 740 attestation binds the scanned file of "${name}" to ${meta.attestedRepositoryUrl}, but the ` +
+        `package names ${meta.repositoryUrl} as its source. The attestation is not counted as publisher ` +
+        `verification: the declared repository is not the one this release was built from.`,
+      remediation: 'Point project_urls at the repository that publishes the release, or publish from the declared one.',
+      location: { kind: 'package', name },
+      evidence: `attested ${meta.attestedRepositoryUrl} · declared ${meta.repositoryUrl}`.slice(0, 300),
+      references: ['https://peps.python.org/pep-0740/', 'https://docs.pypi.org/attestations/'],
+      data: { attestedRepository: meta.attestedRepositoryUrl, declaredRepository: meta.repositoryUrl },
     });
   }
   // A license FILE that ships at the package root is a declaration, even when

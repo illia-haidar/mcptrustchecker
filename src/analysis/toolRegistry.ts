@@ -31,7 +31,7 @@
 
 import type { CapabilityTag, SourceFile } from '../types.js';
 import { type FileCtx, type FnInfo, fileCtxOf } from '../util/fileCtx.js';
-import { fold } from '../util/constFold.js';
+import { decodeEscapes, fold } from '../util/constFold.js';
 import { CODE, braceDepths, splitArgs } from '../util/jsLex.js';
 
 export interface ToolHints {
@@ -236,8 +236,40 @@ class Reader {
   /** The parts of a `{…}` / `[…]` / `(…)` whose opening bracket is at `open`. */
   parts(open: number): [number, number][] | null {
     const a = splitArgs(this.src, this.ctx.mask, open);
-    if (!a) return null;
-    return a.args.map((t, i) => [a.starts[i]!, a.starts[i]! + t.length] as [number, number]);
+    if (a) return a.args.map((t, i) => [a.starts[i]!, a.starts[i]! + t.length] as [number, number]);
+    // The bracket scan gives up after 200 KB. A registration whose handler is
+    // longer is still one call: padding a handler with two thousand requests
+    // must not make the tool, and the sink after them, disappear. Its partner
+    // comes from the file's bracket table, and nested groups are jumped over,
+    // so splitting costs the call's top level only.
+    const close = this.close(open);
+    if (close < 0) return null;
+    const out: [number, number][] = [];
+    let from = open + 1;
+    const push = (to: number): void => {
+      const [a0, z0] = this.trimWs(from, to);
+      if (z0 > a0) out.push([a0, z0]);
+    };
+    for (let i = open + 1; i < close; i++) {
+      if (!this.ctx.isCode(i)) continue;
+      const c = this.src[i]!;
+      if (c === '(' || c === '[' || c === '{') {
+        const e = this.close(i);
+        if (e < 0 || e > close) return null;
+        i = e;
+      } else if (c === ',') {
+        push(i);
+        from = i + 1;
+      }
+    }
+    push(close);
+    return out;
+  }
+
+  private trimWs(from: number, to: number): [number, number] {
+    while (from < to && /\s/.test(this.src[from]!)) from++;
+    while (to > from && /\s/.test(this.src[to - 1]!)) to--;
+    return [from, to];
   }
 
   /** The environment in which a declaration at `at` evaluates: the innermost bound one whose function contains it. */
@@ -773,7 +805,7 @@ class Reader {
 }
 
 function unescapeTemplate(s: string): string {
-  return s.replace(/\\([`$\\])/g, '$1').replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+  return decodeEscapes(s, false, false);
 }
 
 // --- merging two reads of one tool ----------------------------------------------
@@ -1279,6 +1311,960 @@ const HTTP_CLIENT = /^(?:axios|got|ky|superagent|request|http|https|api|apiClien
 const NOT_HTTP = /^(?:map|set|weakmap|weakset|cache|caches|store|storage|localstorage|sessionstorage|headers|params|searchparams|query|formdata|cookies|kv|redis|router|routes|route|app|server|express|fastify|hono|koa|registry|emitter|events|listeners|subscribers|queue|seen|visited|pending|state|data|items|list|index|tree|graph)$/i;
 /** A POST that only asks a question — GraphQL, a search endpoint. Read only from the URL argument. */
 const READ_ONLY_POST = /graphql|search|query|lookup/i;
+/**
+ * …or one whose last path segment is a read verb under a resource —
+ * `/jobs/list`, `/attempt/get_for_job`, `/v1/describeStacks` — or that names an
+ * Ethereum getter as its `method=` query parameter. Case-sensitive: `/getaway`
+ * is not `get`. The segment before the verb must be a path segment, not the
+ * host (`https://collector.example.net/get` asks nothing), and whatever follows
+ * the verb must not name a write (`/get_or_create`, `/listAndDelete`).
+ */
+const READ_PATH =
+  /(?<=[^/:]\/[A-Za-z_$][\w$-]{0,60})\/(?:get|list|read|search|query|describe)((?:[A-Z_.-][\w.-]{0,80})?)\/?(?=[?#'"`]|$)|[?&]method=eth_get[A-Z]/;
+/** A word that makes a read-verb path or method name a write: `get_or_create`, `listAndDelete`, `read_and_update`. */
+const WRITE_WORD =
+  /^(?:create|update|delete|remove|destroy|set|put|write|send|save|insert|upsert|post|patch|modify|edit|exec|execute|run|transfer|mint|burn|approve|sign|submit|add|clear|reset|drop|purge|or|and)$/;
+/** Does a name tail (`_or_create`, `AndDelete`, `ForJob`) carry a write word? */
+function namesWrite(tail: string): boolean {
+  return tail
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .some((w) => WRITE_WORD.test(w));
+}
+/** JSON-RPC methods that only read: Ethereum's getters and calls… */
+const READ_ETH_METHOD = /^(?:eth_(?:get[A-Z]\w*|call|blockNumber|chainId|estimateGas|gasPrice|feeHistory|maxPriorityFeePerGas|syncing|accounts|protocolVersion)|net_\w+|web3_clientVersion)$/;
+/** …and, in a request that is JSON-RPC by its URL or body, any `get…`/`list…` method (`getBalance`) that names no write (`getOrCreateAccount`). */
+const READ_RPC_METHOD = /^(?:get|list|read|search|query|describe)([A-Z_]\w*)$/;
+const HTTP_VERB = /^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/i;
+/**
+ * A body that carries the environment, a file read or a secret is a delivery,
+ * whatever the endpoint is called: `axios.post('…/get', { env: process.env })`.
+ */
+const CARRIES_SECRET =
+  /\bprocess\.env\b|\bos\.environ\b|\bgetenv\s*\(|\breadFile(?:Sync)?\s*\(|\bsecret|\bpassword|\bpasswd|\bprivate_?key|\bcredential/i;
+/** A value read from the filesystem, the environment, the OS or a command's output. */
+const LOCAL_DATA =
+  /\bprocess\.env\b|\bos\.environ\b|\bgetenv\s*\(|\b(?:readFile(?:Sync)?|createReadStream|readdirSync|execSync|execFileSync|spawnSync|check_output|getoutput)\s*\(|\bos\.(?:userInfo|hostname|networkInterfaces)\s*\(|\bopen\s*\([^()\n]{0,200}\)\s*\.\s*read(?:lines)?\s*\(|\.\s*read_(?:text|bytes)\s*\(/;
+/** …of which everything but the environment: a header may carry an API key from the environment, never a file. */
+const FILE_DATA =
+  /\b(?:readFile(?:Sync)?|createReadStream|readdirSync|execSync|execFileSync|spawnSync|check_output|getoutput)\s*\(|\bos\.(?:userInfo|hostname|networkInterfaces)\s*\(|\bopen\s*\([^()\n]{0,200}\)\s*\.\s*read(?:lines)?\s*\(|\.\s*read_(?:text|bytes)\s*\(/;
+/**
+ * The whole environment rather than one variable of it — `JSON.stringify(process.env)`,
+ * `{ ...process.env }`, `os.environ.copy()`. No header carries that to authenticate.
+ */
+const WHOLE_ENV = /\bprocess\s*(?:\.\s*env|\[\s*['"]env['"]\s*\])(?!\s*(?:\??\.\s*[A-Za-z_$]|\[))|\bos\s*\.\s*environ(?!\s*(?:\[|\.\s*get\s*\())/;
+/** Request options that configure the transport, not what is sent: timeouts, TLS, redirects. */
+const TRANSPORT_KEY =
+  /^(?:cert|verify|timeout|allow_redirects|follow_redirects|stream|signal|httpsAgent|httpAgent|agent|withCredentials|responseType|validateStatus|maxRedirects|retry|throwHttpErrors|credentials|mode|cache|redirect|keepalive)$/;
+/**
+ * The options that authenticate the request or route it: `auth=(user, pw)`,
+ * axios `{ auth: { username, password } }`, `{ proxy: { host, auth } }`. They
+ * leave the machine with the request, so they are read like the headers: the
+ * API's (or the proxy's) own credentials from the environment, never a file, a
+ * command's output or the whole environment.
+ */
+const CREDENTIAL_KEY = /^(?:auth|proxy|proxies)$/;
+/** The option keys and keywords that carry the payload: `body:`, `data:`, `json=`, `files=`. */
+const BODY_KEY = /^(?:body|data|json|json_body|content|files|form|formData)$/;
+/** A header that authenticates the request: the API key read from the environment for the API being asked. */
+const AUTH_HEADER = /auth|token|api[-_]?key|apikey|secret|cookie|session|bearer|signature|subscription|^x-key$/i;
+/** A name in a value: not a property (`x.toString`), not a key (`c:`), not inside a string. */
+const VALUE_NAME = /(?<![\w$.'"`])[A-Za-z_$][\w$]*(?![\w$]|\s*:(?!:)|['"`])/g;
+/** One assignment: `name = …`, `const name: T = …` (a chain `a = b = c` is read link by link). */
+const ASSIGNMENT = /(?:^|[^\w$.])([A-Za-z_$][\w$]*)\s*(?::[^=\n;{}()]{1,80})?=(?![=>])\s*([^;\n]{0,400})/g;
+const DESTRUCTURE = /[{[]([^{}[\]=\n]{0,400})[}\]]\s*=\s*([^;\n]{0,400})/g;
+/** A name bound to a file by the language: `with open(p) as f`, `fs.readFile(p, (err, data) => …)`, `readFile(p).then((data) => …)`. */
+const FILE_BINDING =
+  /\bwith\s+open\s*\([^()\n]{0,200}\)\s+as\s+([A-Za-z_]\w*)|\b(?:readFile|createReadStream|readdir|exec|execFile)\s*\([^()\n]{0,200}?,\s*(?:async\s*)?(?:function\s*[\w$]*\s*)?\(\s*[A-Za-z_$][\w$]*\s*,\s*([A-Za-z_$][\w$]*)|\breadFile\s*\([^()\n]{0,200}\)\s*\.\s*then\s*\(\s*(?:async\s*)?\(?\s*([A-Za-z_$][\w$]*)/g;
+/**
+ * A write INTO a name after it was assigned — `p.env = …`, `p['k'] = …`,
+ * `parts.push(…)`, `payload.update(…)`, `Object.assign(p, …)`: its initializer
+ * no longer says all it holds, so what is written in is judged too. The name
+ * starts at a boundary, so a long identifier is read once.
+ */
+const MUTATION =
+  /(?<![\w$.])([A-Za-z_$][\w$]*)\s*(?:\??\.\s*[A-Za-z_$][\w$]*|\[[^\]\n]{0,80}\]){0,3}\s*(?:(?:\??\.\s*[A-Za-z_$][\w$]*|\[[^\]\n]{0,80}\])\s*=(?![=>])|\??\.\s*(?:push|unshift|splice|set|append|extend|insert|update|setdefault|add|put|fill)\s*\()|\bObject\s*\.\s*assign\s*\(\s*([A-Za-z_$][\w$]*)/g;
+/** …and an augmented assignment, which adds to what the name held: `query += JSON.stringify(process.env)`, `name += open(p).read()`, `args.note += secret`. */
+const AUGMENTED =
+  /(?<![\w$.])([A-Za-z_$][\w$]*)(?:\s*(?:\??\.\s*[A-Za-z_$][\w$]*|\[[^\]\n]{0,80}\])){0,4}\s*(?:\*\*|\/\/|<<|>>>?|\|\||&&|\?\?|[-+*/%&|^@])=(?![=>])/g;
+
+interface Assigned {
+  at: number;
+  rhs: string;
+  /** Where the right-hand side starts in the file. */
+  rhsAt: number;
+  /** Bound to a file by the language itself (see `FILE_BINDING`). */
+  file?: boolean;
+}
+const bodyIndexMemo = new WeakMap<Reader, Map<number, Map<string, Assigned[]>>>();
+const MAX_ASSIGNMENTS = 50_000;
+
+/**
+ * Every assignment in the function body [from, to), by name, in source order —
+ * read once per body. A body padded with thousands of requests is still read
+ * whole: the variable a sink sends may be set anywhere before it, not only in
+ * the few kilobytes next to the call.
+ */
+function bodyIndex(r: Reader, from: number, to: number): Map<string, Assigned[]> {
+  let memo = bodyIndexMemo.get(r);
+  if (!memo) bodyIndexMemo.set(r, (memo = new Map()));
+  const hit = memo.get(from);
+  if (hit) return hit;
+  const index = new Map<string, Assigned[]>();
+  let count = 0;
+  const add = (name: string, at: number, rhs: string, rhsAt: number, file?: boolean): void => {
+    if (++count > MAX_ASSIGNMENTS) return;
+    const list = index.get(name) ?? [];
+    list.push({ at, rhs, rhsAt, ...(file ? { file } : {}) });
+    index.set(name, list);
+  };
+  const src = r.src.slice(from, to);
+  const re = new RegExp(ASSIGNMENT.source, 'g');
+  let m: RegExpExecArray | null;
+  // Only code assigns: `params = { "job_id": 1 }` in a docstring's example
+  // does not change what `params` holds.
+  while ((m = re.exec(src)) && count <= MAX_ASSIGNMENTS) {
+    const rhsAt = m.index + m[0].length - m[2]!.length;
+    if (r.ctx.isCode(from + m.index + m[0].indexOf(m[1]!))) add(m[1]!, from + m.index, m[2]!, from + rhsAt);
+    // Continue at the right-hand side, so `a = b = c` also records `b`.
+    re.lastIndex = rhsAt > m.index ? rhsAt : m.index + 1;
+  }
+  for (const d of src.matchAll(DESTRUCTURE)) {
+    if (count > MAX_ASSIGNMENTS) break;
+    if (!r.ctx.isCode(from + d.index!)) continue;
+    const rhsAt = from + d.index! + d[0].length - d[2]!.length;
+    // The name follows a boundary directly (a lookbehind, not a consumed `\s*`), so a run of spaces is read once.
+    for (const n of d[1]!.matchAll(/(?<=^|[,{\s])(?:\.\.\.)?([A-Za-z_$][\w$]*)\s*(?=[,}\]=]|$)/g)) add(n[1]!, from + d.index!, d[2]!, rhsAt);
+  }
+  for (const f of src.matchAll(FILE_BINDING)) {
+    if (count > MAX_ASSIGNMENTS) break;
+    if (!r.ctx.isCode(from + f.index!)) continue;
+    add((f[1] ?? f[2] ?? f[3])!, from + f.index!, f[0], from + f.index!, true);
+  }
+  for (const list of index.values()) list.sort((x, y) => x.at - y.at);
+  memo.set(from, index);
+  return index;
+}
+
+/** The last assignment of `name` before `at`. */
+function assignedBefore(index: Map<string, Assigned[]>, name: string, at: number): Assigned | undefined {
+  const list = index.get(name);
+  if (!list) return undefined;
+  let lo = 0;
+  let hi = list.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (list[mid]!.at < at) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo > 0 ? list[lo - 1] : undefined;
+}
+
+/**
+ * Does `text` carry a value of `kind` (local data, file data, or the whole
+ * environment) — written in it, or through the names it uses, and the names
+ * those were computed from, two links deep: `const raw = fs.readFileSync(p);
+ * const enc = Buffer.from(raw).toString('base64'); post(…, { enc })`. Bounded:
+ * 24 names per link.
+ */
+function carries(index: Map<string, Assigned[]>, text: string, kind: RegExp, at: number, depth: number): boolean {
+  if (kind.test(text)) return true;
+  if (depth === 0) return false;
+  let n = 0;
+  for (const m of text.matchAll(VALUE_NAME)) {
+    if (++n > 24) break;
+    const a = assignedBefore(index, m[0], at);
+    if (a && assignmentCarries(index, a, kind, depth - 1)) return true;
+  }
+  return false;
+}
+
+const carryMemo = new WeakMap<Assigned, Map<string, boolean>>();
+
+/**
+ * Does one assignment's value carry `kind`, `depth` links further? Memoised per
+ * assignment: two thousand requests sending the same thirty names follow each
+ * name once, not once per request.
+ */
+function assignmentCarries(index: Map<string, Assigned[]>, a: Assigned, kind: RegExp, depth: number): boolean {
+  if (a.file) return true;
+  const key = `${kind === FILE_DATA ? 'f' : kind === WHOLE_ENV ? 'w' : 'l'}${depth}`;
+  let memo = carryMemo.get(a);
+  if (!memo) carryMemo.set(a, (memo = new Map()));
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  memo.set(key, false); // a name defined through itself carries nothing new
+  const v = carries(index, a.rhs, kind, a.at, depth);
+  memo.set(key, v);
+  return v;
+}
+
+// --- positive evidence: a payload known to carry nothing local ----------------------
+// A POST to a read-looking endpoint (`/jobs/list`, a JSON-RPC getter, a SELECT)
+// is a read only when what it sends is PROVEN harmless: nothing, literals, the
+// tool's own arguments (`args.id`, a destructured parameter, a Python
+// parameter) and pure conversions of them, followed through local names two
+// links deep. An unknown name, a file or environment read, a derived value
+// more than two links away, a spread, an object written into after it was
+// built — none of that is known to be harmless, and the POST stays a sink.
+
+/** What a payload may name and still carry nothing the tool did not receive: literals, keywords, pure conversions. */
+const PURE_NAME = new Set([
+  'true', 'false', 'null', 'undefined', 'NaN', 'Infinity', 'None', 'True', 'False',
+  'JSON', 'String', 'Number', 'Boolean', 'BigInt', 'Math', 'Date', 'Array', 'Object', 'parseInt', 'parseFloat',
+  'encodeURIComponent', 'encodeURI', 'URL', 'URLSearchParams', 'str', 'int', 'float', 'bool', 'len', 'list', 'dict', 'tuple', 'json',
+  'await', 'new', 'typeof', 'void', 'in', 'of', 'instanceof', 'as', 'satisfies', 'and', 'or', 'not', 'is', 'if', 'else', 'for',
+  'lambda', 'async',
+]);
+/** A schema validating the tool's arguments returns them: `Input.parse(args)`, `Model.model_validate(args)`. */
+const VALIDATES = /^\s*\??\.\s*(?:parse|safeParse|parseAsync|safeParseAsync|validate|validateSync|cast|model_validate|parse_obj)\s*\(/;
+/** Callback and comprehension variables: they range over a value that is judged on its own. */
+const BOUND_NAMES =
+  /\(\s*([A-Za-z_$][\w$]*(?:\s*,\s*[A-Za-z_$][\w$]*){0,5})\s*\)\s*=>|(?<![\w$.])([A-Za-z_$][\w$]*)\s*=>|\bfor\s+([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*){0,5})\s+in\b|\blambda\s+([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*){0,5})\s*:/g;
+
+/** A write into a name: where it is, and where the value written starts (or the `(` of the call that writes it). */
+interface Write {
+  at: number;
+  value: number;
+  call: boolean;
+  /** `Object.assign(p, …)`: the first argument is the target, not a value. */
+  target?: boolean;
+}
+interface Proof {
+  r: Reader;
+  index: Map<string, Assigned[]>;
+  /** Where each name is written into (see `MUTATION`), in source order. */
+  mutations: Map<string, Write[]>;
+  /** The function's own parameters and the keys destructured from them. */
+  inputs: Set<string>;
+  /** The default each of them takes when the caller passes nothing (`{ name = process.env.SECRET }`). */
+  defaults: Map<string, [number, number]>;
+  /** Whether that default is harmless, once judged. */
+  defaultOk: Map<string, boolean>;
+}
+const proofMemo = new WeakMap<Reader, Map<number, Proof>>();
+
+/** The evidence for the function whose body is [from, to) — built once per body. */
+function proofOf(r: Reader, from: number, to: number): Proof {
+  let memo = proofMemo.get(r);
+  if (!memo) proofMemo.set(r, (memo = new Map()));
+  const hit = memo.get(from);
+  if (hit) return hit;
+  const inputs = new Set<string>();
+  const defaults = new Map<string, [number, number]>();
+  const fn = r.ctx.functions().find((f) => f.bodyStart === from);
+  for (const p of fn ? r.params(fn) : []) {
+    if (p.name) inputs.add(p.name);
+    if (p.name && p.dflt) defaults.set(p.name, p.dflt);
+    for (const k of p.keys ?? []) {
+      inputs.add(k.local);
+      if (k.dflt) defaults.set(k.local, k.dflt);
+    }
+    if (p.restKey) inputs.add(p.restKey);
+    for (const it of p.items ?? []) if (it) inputs.add(it);
+  }
+  const mutations = new Map<string, Write[]>();
+  const body = r.src.slice(from, to);
+  let n = 0;
+  const add = (name: string, write: Write): void => {
+    const list = mutations.get(name) ?? [];
+    list.push(write);
+    mutations.set(name, list);
+  };
+  for (const m of body.matchAll(MUTATION)) {
+    if (++n > MAX_ASSIGNMENTS) break;
+    const at = from + m.index!;
+    if (!r.ctx.isCode(at)) continue;
+    const end = at + m[0].length;
+    add((m[1] ?? m[2])!, m[0].endsWith('=') ? { at, value: end, call: false } : m[2] ? { at, value: at + m[0].indexOf('('), call: true, target: true } : { at, value: end - 1, call: true });
+  }
+  for (const m of body.matchAll(AUGMENTED)) {
+    if (++n > MAX_ASSIGNMENTS) break;
+    if (!r.ctx.isCode(from + m.index!)) continue;
+    add(m[1]!, { at: from + m.index!, value: from + m.index! + m[0].length, call: false });
+  }
+  for (const list of mutations.values()) list.sort((x, y) => x.at - y.at);
+  // One hop of aliasing: a local assigned an argument itself (`const a = args`)
+  // writes into the argument when it is written into — `a.name = …`,
+  // `Object.assign(a, …)`, `a.note += …` — from that assignment to its next.
+  // An alias of an alias is not followed. Both lists are in source order, so
+  // each write is looked at once.
+  const index = bodyIndex(r, from, to);
+  let aliased = false;
+  for (const [alias, writes] of [...mutations]) {
+    const list = inputs.has(alias) ? undefined : index.get(alias);
+    if (!list) continue;
+    let w = 0;
+    for (let k = 0; k < list.length; k++) {
+      const a = list[k]!;
+      const until = list[k + 1]?.at ?? Infinity;
+      const opener = r.src[a.at];
+      // A destructuring (`const { a } = args`) copies a key; it is no alias.
+      const target = a.file || opener === '{' || opener === '[' ? undefined : /^\s*([A-Za-z_$][\w$]*)\s*$/.exec(a.rhs)?.[1];
+      while (w < writes.length && writes[w]!.at <= a.at) w++;
+      for (; w < writes.length && writes[w]!.at < until; w++) {
+        if (target && target !== alias && inputs.has(target)) {
+          add(target, writes[w]!);
+          aliased = true;
+        }
+      }
+    }
+  }
+  if (aliased) for (const list of mutations.values()) list.sort((x, y) => x.at - y.at);
+  const proof: Proof = { r, index, mutations, inputs, defaults, defaultOk: new Map() };
+  memo.set(from, proof);
+  return proof;
+}
+
+/**
+ * Is `name` written into somewhere in (after, before) with a value not known to
+ * be harmless? `body["statuses"] = [params.status]` keeps a payload harmless;
+ * `p.env = process.env` does not.
+ */
+function writtenBetween(p: Proof, name: string, after: number, before: number, depth: number): boolean {
+  const list = p.mutations.get(name);
+  if (!list) return false;
+  let lo = 0;
+  let hi = list.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (list[mid]!.at <= after) lo = mid + 1;
+    else hi = mid;
+  }
+  for (let k = lo, seen = 0; k < list.length && list[k]!.at < before; k++) {
+    // Past the last link, a write is not known to be harmless.
+    if (++seen > 16 || depth <= 0) return true;
+    if (!writeHarmless(p, list[k]!, depth)) return true;
+  }
+  return false;
+}
+
+const writeMemo = new WeakMap<Write, Map<number, boolean>>();
+
+/** Is the value written by `w` harmless, `depth` links deep? Memoised per write: every later read of the name asks again. */
+function writeHarmless(p: Proof, w: Write, depth: number): boolean {
+  let memo = writeMemo.get(w);
+  if (!memo) writeMemo.set(w, (memo = new Map()));
+  const hit = memo.get(depth);
+  if (hit !== undefined) return hit;
+  memo.set(depth, false); // a write through itself proves nothing
+  let value: string | null;
+  if (w.call) {
+    const close = p.r.close(w.value);
+    const args = close > w.value ? splitTop(p.r.src.slice(w.value + 1, Math.min(close, w.value + 8000))) : null;
+    value = args ? (w.target ? args.slice(1) : args).join(', ') : null;
+  } else {
+    value = exprAt(p.r, w.value);
+  }
+  const v = value !== null && harmless(value, p, w.at, depth - 1);
+  memo.set(depth, v);
+  return v;
+}
+
+/**
+ * Is the tool's own argument `name` still what the caller passed when it is
+ * read at `at`? Not when the function reassigned it (`name =
+ * fs.readFileSync(…)`, `name = os.environ[…]`), added to it (`query +=
+ * JSON.stringify(process.env)`), wrote into it (`args.extra = process.env`,
+ * `Object.assign(args, …)`), or gave it a default that is not harmless (`{ name
+ * = process.env.SECRET }`): then it is judged by what was put in it.
+ */
+function inputHarmless(p: Proof, name: string, at: number, depth: number): boolean {
+  if (assignedBefore(p.index, name, at)) return nameHarmless(p, name, at, depth);
+  if (writtenBetween(p, name, -1, at, depth)) return false;
+  const d = p.defaults.get(name);
+  if (!d) return true;
+  let ok = p.defaultOk.get(name);
+  if (ok === undefined) {
+    p.defaultOk.set(name, false); // a default naming itself proves nothing
+    ok = harmless(p.r.src.slice(d[0], d[1]), p, d[0], depth);
+    p.defaultOk.set(name, ok);
+  }
+  return ok;
+}
+
+const helperMemo = new WeakMap<Reader, Map<string, boolean>>();
+/**
+ * A function of the same file that reads nothing local — no file, no
+ * environment, no command (`_resolve_latest_job_id(connection_id)` asks the API
+ * for an id): what it returns is computed from its arguments, which are judged
+ * where it is called.
+ */
+function readsNothingLocal(r: Reader, name: string): boolean {
+  let memo = helperMemo.get(r);
+  if (!memo) helperMemo.set(r, (memo = new Map()));
+  const hit = memo.get(name);
+  if (hit !== undefined) return hit;
+  const f = r.fnNamed(name);
+  const body = f && f.kind !== 'method' && f.bodyEnd - f.bodyStart <= 50_000 ? r.src.slice(f.bodyStart, f.bodyEnd) : null;
+  const v = body !== null && !LOCAL_DATA.test(body) && !CARRIES_SECRET.test(body) && !new RegExp(FILE_BINDING.source).test(body);
+  memo.set(name, v);
+  return v;
+}
+
+/**
+ * The whole expression starting at `start`: an object or a call spread over
+ * several lines is read to its closing bracket. Ends at `;`, at a line break or
+ * at the enclosing bracket; null when it is empty or runs off the end.
+ */
+function exprAt(r: Reader, start: number): string | null {
+  const { src } = r;
+  let i = start;
+  while (i < src.length && /\s/.test(src[i]!)) i++;
+  const begin = i;
+  const end = Math.min(src.length, begin + 20_000);
+  for (; i < end; i++) {
+    if (!r.ctx.isCode(i)) continue;
+    const c = src[i]!;
+    if (c === '(' || c === '[' || c === '{') {
+      const e = r.close(i);
+      if (e < 0 || e >= end) return null;
+      i = e;
+    } else if (c === ';' || c === '\n' || c === ')' || c === ']' || c === '}' || c === ',') {
+      break;
+    }
+  }
+  return i > begin && i < end ? src.slice(begin, i) : null;
+}
+
+const harmlessMemo = new WeakMap<Assigned, Map<number, boolean>>();
+const constMemo = new WeakMap<Proof, Map<string, Map<number, boolean>>>();
+/** How many names one function body may prove harmless through the file's constants. */
+const MAX_CONST_NAMES = 64;
+
+/** A constant of the file: where its name and its initializer are, and the `{` of the block it lives in (-1 at the top level). */
+interface FileConst {
+  at: number;
+  init: number;
+  block: number;
+}
+const fileConstsMemo = new WeakMap<Reader, Map<string, FileConst | null>>();
+
+/** The identifiers in a binding list: `{ a, b: c }`, `[x, , y]`, `k, v`. */
+const IDENTS = /[A-Za-z_$][\w$]*/g;
+const JS_DECL = /\b(const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]{1,200}?)?=(?![=>])/g;
+/** Every other way a JavaScript name is bound: a loop head, a catch clause, a destructuring, a bare `let`, an assignment, `++`. */
+const JS_BINDINGS: RegExp[] = [
+  /\bfor\s*\(\s*(?:const|let|var)?\s*([^;)]{1,200}?)\s+(?:of|in)\b/g,
+  /\bcatch\s*\(\s*([^)]{1,200})\)/g,
+  /\b(?:const|let|var)\s*([{[][^=;]{0,400}[}\]])\s*=/g,
+  /[[{]([^=;[\]{}()]{0,200})[\]}]\s*=(?![=>])/g,
+  /\b(?:let|var)\s+([A-Za-z_$][\w$]*)\s*[;,\n]/g,
+  /(?:\+\+|--)\s*([A-Za-z_$][\w$]*)|(?<![\w$.])([A-Za-z_$][\w$]*)\s*(?:\+\+|--)/g,
+];
+const JS_ASSIGNED = /(?<![\w$.])([A-Za-z_$][\w$]*)\s*(?:\*\*|<<|>>>?|\|\||&&|\?\?|[-+*/%&|^])?=(?![=>])/g;
+const PY_DECL = /^([A-Za-z_]\w*)\s*(?::[^=\n]{1,80})?=(?!=)/gm;
+/**
+ * …and a Python one: inside a function, by a loop, `as`, `global`, a lambda, a
+ * walrus, a tuple target, an augmented assignment. Every name starts at a
+ * boundary: the walrus pattern had none, and restarted at each position of a
+ * long name or hex literal — a 495 KB server.py took 104 s on Node 20.
+ */
+const PY_BINDINGS: RegExp[] = [
+  /^[ \t]+([A-Za-z_]\w*)\s*(?::[^=\n]{1,80})?=(?!=)/gm,
+  /^[ \t]*([A-Za-z_]\w*(?:[ \t]*,[ \t]*[A-Za-z_]\w*)+)[ \t]*=(?!=)/gm,
+  /\bfor\s+([^\n:]{1,200}?)\s+in\b/g,
+  /\bas\s+([A-Za-z_]\w*)/g,
+  /\b(?:global|nonlocal)\s+([^\n]{1,200})/g,
+  /\blambda\s+([^:\n]{1,100}):/g,
+  /(?<!\w)([A-Za-z_]\w*)\s*:=/g,
+  /(?<![\w.])([A-Za-z_]\w*)\s*(?:\*\*|\/\/|<<|>>|[-+*/%&|^@])=/g,
+];
+
+/**
+ * The file's constants by name, found in one pass over it: a `const` (or, in
+ * Python, a top-level assignment) declared once, and bound nowhere else in the
+ * file — not as a parameter, a loop variable, a destructured name or an
+ * assignment target. Which value a name has where it is used is then known
+ * without reading the file again: a body sending a thousand constants looks each
+ * one up here. A name declared twice or bound elsewhere is null.
+ */
+function fileConsts(r: Reader): Map<string, FileConst | null> {
+  const hit = fileConstsMemo.get(r);
+  if (hit) return hit;
+  const { src, ctx } = r;
+  const out = new Map<string, FileConst | null>();
+  const decls: { name: string; at: number; init: number; ok: boolean }[] = [];
+  const bound = new Set<string>();
+  const bindAll = (text: string): void => {
+    for (const n of text.matchAll(IDENTS)) bound.add(n[0]);
+  };
+  if (r.py) {
+    for (const m of src.matchAll(PY_DECL)) if (ctx.isCode(m.index!)) decls.push({ name: m[1]!, at: m.index!, init: m.index! + m[0].length, ok: true });
+    for (const re of PY_BINDINGS) for (const m of src.matchAll(re)) if (ctx.isCode(m.index!)) bindAll(m[1]!);
+  } else {
+    const re = new RegExp(JS_DECL.source, 'g');
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(src))) {
+      const nameAt = m.index + m[0].indexOf(m[2]!, m[1]!.length);
+      if (ctx.isCode(m.index)) decls.push({ name: m[2]!, at: nameAt, init: m.index + m[0].length, ok: m[1] === 'const' });
+      re.lastIndex = nameAt + 1; // a declaration inside another one's type annotation is read too
+    }
+    for (const b of JS_BINDINGS) for (const x of src.matchAll(b)) if (ctx.isCode(x.index!)) bindAll(x[1] ?? x[2] ?? '');
+    const own = new Set(decls.map((d) => d.at));
+    for (const x of src.matchAll(JS_ASSIGNED)) {
+      const at = x.index! + x[0].indexOf(x[1]!);
+      if (ctx.isCode(at) && !own.has(at)) bound.add(x[1]!);
+    }
+  }
+  for (const fn of ctx.functions()) {
+    for (const p of fn.params) {
+      bound.add(p.name);
+      for (const local of p.keys?.values() ?? []) bound.add(local);
+    }
+  }
+  // The block each declaration lives in: the innermost `{` open at it, in one pass.
+  const stack: number[] = [];
+  let k = 0;
+  const blocks = new Map<number, number>();
+  for (let i = 0; i <= src.length && k < decls.length; i++) {
+    while (k < decls.length && decls[k]!.at === i) blocks.set(decls[k++]!.at, r.py ? -1 : (stack[stack.length - 1] ?? -1));
+    if (r.py || i === src.length || !ctx.isCode(i)) continue;
+    if (src[i] === '{') stack.push(i);
+    else if (src[i] === '}') stack.pop();
+  }
+  for (const d of decls) {
+    const ok = d.ok && !out.has(d.name) && !bound.has(d.name);
+    out.set(d.name, ok ? { at: d.at, init: d.init, block: blocks.get(d.at) ?? -1 } : null);
+  }
+  fileConstsMemo.set(r, out);
+  return out;
+}
+
+/** Is the local (or file constant) `name`, as it stands at `at`, harmless `depth` links deep? */
+function nameHarmless(p: Proof, name: string, at: number, depth: number): boolean {
+  if (depth <= 0) return false;
+  const a = assignedBefore(p.index, name, at);
+  if (a) {
+    if (a.file || writtenBetween(p, name, a.at, at, depth)) return false;
+    let memo = harmlessMemo.get(a);
+    if (!memo) harmlessMemo.set(a, (memo = new Map()));
+    const hit = memo.get(depth);
+    if (hit !== undefined) return hit;
+    memo.set(depth, false); // a name defined through itself proves nothing
+    const rhs = exprAt(p.r, a.rhsAt);
+    const v = rhs !== null && harmless(rhs, p, a.at, depth - 1);
+    memo.set(depth, v);
+    return v;
+  }
+  // A constant of the file (`const API_VERSION = '2024-01'`), never an import.
+  if (p.r.imported(name)) return false;
+  let names = constMemo.get(p);
+  if (!names) constMemo.set(p, (names = new Map()));
+  let memo = names.get(name);
+  if (!memo) {
+    // A payload naming more constants than any client does proves nothing.
+    if (names.size >= MAX_CONST_NAMES) return false;
+    names.set(name, (memo = new Map()));
+  }
+  const hit = memo.get(depth);
+  if (hit !== undefined) return hit;
+  memo.set(depth, false);
+  const c = fileConsts(p.r).get(name);
+  const visible = c && (c.block < 0 || (at > c.block && at < p.r.close(c.block)));
+  const init = visible ? exprAt(p.r, c.init) : null;
+  const v = init !== null && harmless(init, p, c!.at, depth - 1);
+  memo.set(depth, v);
+  return v;
+}
+
+/**
+ * The end of the string literal opening at `q`, or -1. A template's `${…}` and
+ * an f-string's `{…}` are handed to `inner`, which judges what they interpolate.
+ */
+function stringEnd(s: string, q: number, to: number, fstring: boolean, inner: (a: number, b: number) => boolean, nest = 0): number {
+  if (nest > 16) return -1;
+  const quote = s[q]!;
+  const triple = quote !== '`' && s.startsWith(quote.repeat(3), q);
+  for (let j = q + (triple ? 3 : 1); j < to; j++) {
+    const c = s[j]!;
+    if (c === '\\') {
+      j++;
+      continue;
+    }
+    const tpl = quote === '`' && c === '$' && s[j + 1] === '{';
+    if (tpl || (fstring && c === '{')) {
+      if (!tpl && s[j + 1] === '{') {
+        j++; // `{{` is a literal brace
+        continue;
+      }
+      const open = tpl ? j + 1 : j;
+      const close = braceEnd(s, open, to, nest + 1);
+      if (close < 0 || !inner(open + 1, close)) return -1;
+      j = close;
+      continue;
+    }
+    if (triple ? s.startsWith(quote.repeat(3), j) : c === quote) return j + (triple ? 3 : 1);
+    if (c === '\n' && quote !== '`' && !triple) return -1;
+  }
+  return -1;
+}
+
+/** The `}` that closes the `{` at `open` within [open, to), strings skipped; -1 when there is none. */
+function braceEnd(s: string, open: number, to: number, nest: number): number {
+  if (nest > 16) return -1;
+  let depth = 0;
+  for (let j = open; j < to; j++) {
+    const c = s[j]!;
+    if (c === '"' || c === "'" || c === '`') {
+      const e = stringEnd(s, j, to, false, () => true, nest + 1);
+      if (e < 0) return -1;
+      j = e - 1;
+    } else if (c === '{') {
+      depth++;
+    } else if (c === '}' && --depth === 0) {
+      return j;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Is `expr` built only from literals, the function's own arguments, pure
+ * conversions of them and locals that are themselves harmless (`depth` links)?
+ */
+function harmless(expr: string, p: Proof, at: number, depth: number): boolean {
+  if (expr.length > 8000) return false;
+  const bound = new Set<string>();
+  let k = 0;
+  for (const m of expr.matchAll(BOUND_NAMES)) {
+    if (++k > 32) return false;
+    for (const n of (m[1] ?? m[2] ?? m[3] ?? m[4] ?? '').split(',')) bound.add(n.trim());
+  }
+  return harmlessIn(expr, 0, expr.length, p, at, depth, bound, 0);
+}
+
+function harmlessIn(s: string, from: number, to: number, p: Proof, at: number, depth: number, bound: Set<string>, nest: number): boolean {
+  if (nest > 16) return false;
+  const inner = (a: number, b: number): boolean => harmlessIn(s, a, b, p, at, depth, bound, nest + 1);
+  let prev = ''; // the last significant character
+  let prevWord = '';
+  for (let i = from; i < to; ) {
+    const c = s[i]!;
+    if (/\s/.test(c)) {
+      i++;
+      continue;
+    }
+    // A string — with its Python prefix (`f"…{x}…"`, `rb'…'`) — or a template.
+    let q = c === '"' || c === "'" || c === '`' ? i : -1;
+    let fstring = false;
+    if (q < 0 && /[rRbBuUfF]/.test(c) && !/[\w$]/.test(s[i - 1] ?? '')) {
+      const pre = /^[rRbBuUfF]{1,2}(?=["'])/.exec(s.slice(i, i + 3));
+      if (pre) {
+        q = i + pre[0].length;
+        fstring = /f/i.test(pre[0]);
+      }
+    }
+    if (q >= 0) {
+      const end = stringEnd(s, q, to, fstring, inner);
+      if (end < 0) return false;
+      i = end;
+      prev = 'v';
+      prevWord = '';
+      continue;
+    }
+    if (c === '.' && s.startsWith('...', i)) return false; // a spread: of what, is not known
+    if (c === '*' && s[i + 1] === '*' && (prev === '' || prev === '(' || prev === ',' || prev === '{')) return false; // `**kwargs`
+    if (/[0-9]/.test(c)) {
+      while (i < to && /[\w.]/.test(s[i]!)) i++;
+      prev = 'v';
+      prevWord = '';
+      continue;
+    }
+    if (/[A-Za-z_$]/.test(c)) {
+      let j = i + 1;
+      while (j < to && /[\w$]/.test(s[j]!)) j++;
+      const name = s.slice(i, j);
+      const after = s.slice(j, Math.min(to, j + 40));
+      const ok =
+        prev === '.' || // a property
+        ((prev === '{' || prev === ',') && /^\s*:(?!:)/.test(after)) || // an object key
+        ((prev === '(' || prev === ',') && /^\s*=(?![=>])/.test(after)) || // a keyword argument
+        prevWord === 'as' ||
+        prevWord === 'satisfies' || // a type
+        PURE_NAME.has(name) ||
+        (p.inputs.has(name) && inputHarmless(p, name, at, depth)) ||
+        bound.has(name) ||
+        VALIDATES.test(after) ||
+        (/^\s*\(/.test(after) && readsNothingLocal(p.r, name)) ||
+        nameHarmless(p, name, at, depth);
+      if (!ok) return false;
+      i = j;
+      prev = 'v';
+      prevWord = name;
+      continue;
+    }
+    prev = c;
+    prevWord = '';
+    i++;
+  }
+  return true;
+}
+
+/**
+ * The URL less a leading base taken from configuration — `base + '/v1/…'`,
+ * `${API}/v1/…`, f"{BASE}/…", or a URL that is only a name (`RPC_URL`). The
+ * rest (a path, a query string) is what the request carries.
+ */
+function urlTail(url: string): string {
+  const t = url.trim();
+  if (/^[A-Za-z_$][\w$.]*$/.test(t)) return '';
+  const plus = /^[A-Za-z_$][\w$.]*(?:\(\s*\))?\s*\+\s*/.exec(t);
+  if (plus) return t.slice(plus[0].length);
+  const tpl = /^`\$\{[^{}`\n]{1,200}\}/.exec(t);
+  if (tpl) return '`' + t.slice(tpl[0].length);
+  const f = /^([fF][rR]?|[rR][fF])(["'])\{[^{}"'\n]{1,200}\}/.exec(t);
+  if (f) return f[1]! + f[2]! + t.slice(f[0].length);
+  return t;
+}
+
+/**
+ * The top-level comma-separated parts of `s`, outside strings and brackets;
+ * null when `s` is too long or its brackets do not balance.
+ */
+function splitTop(s: string): string[] | null {
+  if (s.length > 20_000) return null;
+  const out: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]!;
+    if (c === '"' || c === "'" || c === '`') {
+      const e = stringEnd(s, i, s.length, false, () => true);
+      if (e < 0) return null;
+      i = e - 1;
+    } else if (c === '(' || c === '[' || c === '{') {
+      depth++;
+    } else if (c === ')' || c === ']' || c === '}') {
+      if (--depth < 0) return null;
+    } else if (c === ',' && depth === 0) {
+      out.push(s.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  if (depth !== 0) return null;
+  out.push(s.slice(start).trim());
+  return out.filter(Boolean);
+}
+
+/** The entries of an object or dict literal: `key: value`, a shorthand `name`, a spread `...x` / `**x`. */
+function objectEntries(text: string): { key: string; value: string; spread?: boolean }[] | null {
+  const t = text.trim();
+  if (!t.startsWith('{') || !t.endsWith('}')) return null;
+  const parts = splitTop(t.slice(1, -1));
+  if (!parts) return null;
+  return parts.map((e) => {
+    if (e.startsWith('...') || e.startsWith('**')) return { key: '', value: e, spread: true };
+    const m = /^(?:(["'`])([^"'`\\\n]{0,80})\1|([A-Za-z_$][\w$-]*)|\[([^\]\n]{1,80})\])\s*:(?!:)\s*/.exec(e);
+    if (m) return { key: m[2] ?? m[3] ?? m[4] ?? '', value: e.slice(m[0].length) };
+    return { key: /^[A-Za-z_$][\w$]*/.exec(e)?.[0] ?? '', value: e };
+  });
+}
+
+/** One request, split by what each part does: where it goes, what it sends, how it authenticates, and the rest. */
+interface RequestParts {
+  url: string;
+  body: string[];
+  headers: string[];
+  /** `auth`, `proxy` (see `CREDENTIAL_KEY`). */
+  credentials: string[];
+  extra: string[];
+}
+
+/** File one option or keyword of a request: `data:` / `json=` is the payload, `headers` the headers, a transport option nothing. */
+function fileOption(req: RequestParts, key: string, value: string): void {
+  if (BODY_KEY.test(key)) req.body.push(value);
+  else if (key === 'headers') req.headers.push(value);
+  else if (key === 'url' || key === 'uri') req.url ||= value;
+  else if (CREDENTIAL_KEY.test(key)) req.credentials.push(value);
+  else if (key !== 'method' && !TRANSPORT_KEY.test(key)) req.extra.push(value);
+}
+
+/**
+ * File an options object — inline, or a local name bound to one (`const opts =
+ * { method: 'POST', body }`). Options that cannot be read go to `unknown`: the
+ * payload where the options carry it (`fetch(url, opts)`), the rest where the
+ * payload is an argument of its own (an axios config).
+ */
+function fileOptions(r: Reader, req: RequestParts, text: string, index: Map<string, Assigned[]>, at: number, unknown: 'body' | 'extra'): void {
+  let t = text.trim();
+  if (/^[A-Za-z_$][\w$]*$/.test(t)) {
+    const a = assignedBefore(index, t, at);
+    t = (a && !a.file && exprAt(r, a.rhsAt)) || t;
+  }
+  const entries = objectEntries(t);
+  if (!entries) {
+    req[unknown].push(text);
+    return;
+  }
+  for (const e of entries) {
+    if (e.spread) req.body.push(e.value);
+    else fileOption(req, e.key, e.value);
+  }
+}
+
+/**
+ * The parts of `client.post(url, …args)`: Python keywords by name, the first
+ * positional argument as the payload — or, for got / ky, as the options — and
+ * any later one as an options object (an axios config).
+ */
+function postParts(r: Reader, url: string, args: string[], recv: string, index: Map<string, Assigned[]>, at: number): RequestParts {
+  const req: RequestParts = { url, body: [], headers: [], credentials: [], extra: [] };
+  const optionsFirst = /^(?:got|ky|ofetch|\$fetch)$/i.test(recv);
+  let positional = 0;
+  for (const a of args) {
+    const kw = /^([A-Za-z_]\w*)\s*=(?![=>])\s*/.exec(a);
+    if (kw) fileOption(req, kw[1]!, a.slice(kw[0].length));
+    else if (positional++ === 0 && !optionsFirst) req.body.push(a);
+    else fileOptions(r, req, a, index, at, optionsFirst ? 'body' : 'extra');
+  }
+  return req;
+}
+
+/** A spread (`...defaults`, `**extra`) read as the name it spreads. */
+const named = (s: string): string => s.replace(/(?:\.\.\.|\*\*)(?=[A-Za-z_$])/g, ' ');
+/** A query parameter that authenticates the request (`?api_key=${…}`, `&token={…}`): the API's own key. */
+const AUTH_QUERY = /[?&][\w-]{0,30}(?:key|token|auth|secret|signature|sig)[\w-]{0,30}=(?:\$\{[^{}\n]{1,200}\}|\{[^{}\n]{1,200}\})/gi;
+
+/**
+ * Do the headers carry data? Never a file, never the whole environment; one
+ * environment variable only under an auth-like name (`Authorization: \`Bearer
+ * ${process.env.API_TOKEN}\``, f"Bearer {os.environ['T']}").
+ */
+function headersCarry(r: Reader, p: Proof, headers: string[], at: number): boolean {
+  for (const h of headers.slice(0, 8)) {
+    let t = h.trim();
+    if (/^[A-Za-z_$][\w$]*$/.test(t)) {
+      const a = assignedBefore(p.index, t, at);
+      if (a?.file) return true;
+      t = (a && exprAt(r, a.rhsAt)) || t;
+    }
+    const entries = objectEntries(t) ?? [{ key: '', value: t }];
+    for (const e of entries.slice(0, 32)) {
+      const v = named(e.value);
+      if (carries(p.index, v, FILE_DATA, at, 2) || carries(p.index, v, WHOLE_ENV, at, 2)) return true;
+      if ((e.spread || !AUTH_HEADER.test(e.key)) && carries(p.index, v, LOCAL_DATA, at, 2)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * A literal SELECT is a read only when it is the whole question: the SQL key is
+ * the only key besides parameters, and the statement is one plain SELECT — no
+ * `;` (a second statement), no `INTO`, no `FOR UPDATE`, no interpolation.
+ */
+const SELECT_BODY =
+  /^\s*(?:\{\s*["']?(?:sql|query|statement|q)["']?\s*[:=]\s*)?(['"`])\s*(SELECT\b(?:(?!\1)[^\\\n]){0,2000})\1\s*(?:,\s*["']?(?:params|parameters|args|bindings|values|limit|offset|timeout)["']?\s*[:=]\s*[^,{}[\]]{0,200})*\s*(?:\}\s*)?$/i;
+const SELECT_WRITES = /;|\bINTO\b|\bFOR\s+UPDATE\b|\$\{|\b(?:INSERT|UPDATE|DELETE|MERGE|DROP|ALTER|CREATE|TRUNCATE|GRANT)\b/i;
+
+/**
+ * Does this POST only ask a question? Its headers and other options are read
+ * for what they carry. A search / GraphQL endpoint (1.16.0's reads) stays a read
+ * unless it carries a file or the whole environment. The read-looking requests
+ * of 1.16.1 — a read verb as the last path segment, a JSON-RPC request whose
+ * every `method` is a read, a SELECT (literal, or one the function refuses to
+ * send otherwise: `if (!q.startsWith('SELECT')) throw`) — read only on POSITIVE
+ * evidence: a payload proven harmless (see `harmless`) and nothing but a base
+ * URL from configuration ahead of the path. `byName`: the URL may be a name
+ * (`SEARCH_URL`) for the search test. `from`..`to` is the function body; `at`
+ * the call.
+ */
+function requestReads(r: Reader, req: RequestParts, from: number, to: number, at: number, byName: boolean): boolean {
+  const p = proofOf(r, from, to);
+  const u = req.url.trim().slice(0, 400);
+  const tail = urlTail(u).replace(AUTH_QUERY, '');
+  if (READ_ONLY_POST.test(u) && (byName || /^(?:[`'"]|[fFrRbBuU]{1,2}['"])/.test(u))) {
+    // A search / GraphQL endpoint asks a question, unless a file or the whole
+    // environment rides along, or the query string carries a local value.
+    const heavy = (x: string): boolean => carries(p.index, named(x), FILE_DATA, at, 2) || carries(p.index, named(x), WHOLE_ENV, at, 2);
+    return ![...req.body, ...req.headers, ...req.credentials, ...req.extra].some(heavy) && !carries(p.index, tail, LOCAL_DATA, at, 2);
+  }
+  if (headersCarry(r, p, req.headers, at)) return false;
+  if (req.credentials.some((x) => carries(p.index, named(x), FILE_DATA, at, 2) || carries(p.index, named(x), WHOLE_ENV, at, 2))) return false;
+  if (req.extra.some((x) => carries(p.index, named(x), LOCAL_DATA, at, 2))) return false;
+  const proven = (): boolean => (tail === '' || harmless(tail, p, at, 2)) && req.body.every((b) => harmless(b, p, at, 2));
+  const path = READ_PATH.exec(u);
+  if (path && !namesWrite(path[1] ?? '')) return proven();
+  const { text: b, mutated } = requestBody(r, req.body.join(',\n'), from, at);
+  if (mutated) return false; // `payload.method = args.method` after a read literal
+  const methods = [...b.matchAll(/\bmethod["']?\s*[:=]\s*(['"`])([\w./-]{1,64})\1/g)].map((m) => m[2]!).filter((m) => !HTTP_VERB.test(m));
+  const rpc = /rpc/i.test(u) || /jsonrpc/i.test(b);
+  const readMethod = (m: string): boolean => {
+    if (READ_ETH_METHOD.test(m)) return true;
+    const g = rpc ? READ_RPC_METHOD.exec(m) : null;
+    return g !== null && !namesWrite(g[1]!);
+  };
+  // Every method key has to be a literal read: a batch that names one by a
+  // variable (`method: SEND`) is not known to read.
+  const methodKeys = (b.match(/\bmethod["']?\s*[:=](?!\s*(['"`])(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\1)/gi) ?? []).length;
+  if (methods.length && methods.length === methodKeys && methods.every(readMethod)) return proven();
+  const select = SELECT_BODY.exec(b);
+  if (select && !SELECT_WRITES.test(select[2]!.slice(6))) return proven();
+  // A guarded SELECT is the guarded argument itself, sent on: it carries
+  // nothing local, and nothing else rides along.
+  return (
+    /sql|query/i.test(u + ' ' + b.slice(0, 400)) &&
+    selectOnlyGuard(r, Math.max(from, at - NEAR_CALL), at, b) &&
+    (tail === '' || harmless(tail, p, at, 2)) &&
+    !req.body.some((x) => CARRIES_SECRET.test(x) || carries(p.index, named(x), LOCAL_DATA, at, 2))
+  );
+}
+
+/** How far before a request its body's assignment or its guard is looked for. */
+const NEAR_CALL = 8000;
+
+/**
+ * `if (!q.trim().toUpperCase().startsWith('SELECT')) throw …` / `if not
+ * q.startswith("select"): raise …` — in code (not a comment or a string), on the
+ * same variable the request sends, and unconditional: a guard with `&&` / `||`
+ * (`!ALLOW_WRITE && !q.startsWith('SELECT')`) lets writes through.
+ */
+function selectOnlyGuard(r: Reader, base: number, at: number, sent: string): boolean {
+  const text = r.src.slice(base, at);
+  let seen = 0;
+  for (const m of text.matchAll(/\.\s*(?:startsWith|startswith)\s*\(\s*['"`](?:SELECT|select|Select)\b/g)) {
+    if (++seen > 16) break;
+    const pos = m.index!;
+    if (!r.ctx.isCode(base + pos)) continue;
+    // The guard's own line, at most 200 characters back, and the line after it.
+    const head = text.slice(Math.max(0, pos - 200), pos);
+    const before = head.slice(head.lastIndexOf('\n') + 1);
+    const tail = text.slice(pos, pos + 300).split('\n', 2).join('\n');
+    if (!/\bif\b/.test(before) || !/!|\bnot\s/.test(before) || !/\b(?:throw|raise|return)\b/.test(tail)) continue;
+    if (/&&|\|\||\band\b|\bor\b/.test(before + tail.split(/\b(?:throw|raise|return)\b/, 1)[0])) continue;
+    const recv =
+      /(?<![\w$])([A-Za-z_$][\w$]*)\s*(?:\??\.\s*(?:trim|trimStart|trimEnd|toUpperCase|toLowerCase|toLocaleUpperCase|upper|lower|strip|lstrip)\s*\(\s*\)\s*)*$/.exec(before)?.[1];
+    if (recv && new RegExp(`(?<![\\w$.])${recv.replace(/\$/g, '\\$')}(?![\\w$])`).test(sent)) return true;
+  }
+  return false;
+}
+
+/**
+ * The body an argument names, with one assignment in the same function followed:
+ * `json=payload`, `JSON.stringify(payload)`, `{ method: 'POST', body: JSON.stringify(rpc) }`.
+ * `mutated` reports a later assignment into that object (`payload.method = …`),
+ * which makes its literal fields no evidence of what is sent.
+ */
+function requestBody(r: Reader, arg: string, from: number, at: number): { text: string; mutated: boolean } {
+  const t = arg.trim().replace(/^(?:json|data|json_body|body|content)\s*=\s*/, '').slice(0, 2000);
+  const ident =
+    /^(?:JSON\.stringify\(\s*)?([A-Za-z_$][\w$]*)\s*\)?$/.exec(t)?.[1] ??
+    /\bbody\s*:\s*(?:JSON\.stringify\(\s*)?([A-Za-z_$][\w$]*)\s*\)?\s*[,}]/.exec(t)?.[1];
+  if (!ident) return { text: t, mutated: false };
+  const base = Math.max(from, at - NEAR_CALL);
+  const src = r.src.slice(base, at);
+  const esc = ident.replace(/\$/g, '\\$');
+  let last: RegExpMatchArray | undefined;
+  for (const m of src.matchAll(new RegExp(`(?:^|[\\s;(])(?:const\\s+|let\\s+|var\\s+)?${esc}\\s*(?::[^=\\n]{1,80})?=\\s*\\{`, 'g'))) last = m;
+  if (!last) return { text: t, mutated: false };
+  const open = base + last.index! + last[0].length - 1;
+  const close = r.close(open);
+  if (!(close > open && close < at)) return { text: t, mutated: false };
+  const mutated = new RegExp(`(?<![\\w$.])${esc}\\s*(?:\\.\\s*[\\w$]+|\\[[^\\]\\n]{1,40}\\])\\s*=(?!=)`).test(r.src.slice(close, at));
+  return { text: `${t}\n${r.src.slice(open, Math.min(close + 1, open + NEAR_CALL))}`, mutated };
+}
 
 const evidenceMemo = new WeakMap<Reader, Map<string, HandlerEvidence[]>>();
 
@@ -1344,6 +2330,9 @@ function handlerEvidenceUncached(r: Reader, handler: Thunk, env: Env | null): Ha
   };
   visit(handler, 0);
   const out: HandlerEvidence[] = [];
+  const v = r.ev(handler);
+  const read = v.k === 'fn' ? inputFetch(r, v.fn) : undefined;
+  if (read) out.push(read);
   for (const [from, to] of bodies) {
     for (const ev of writesIn(r, from, to)) {
       if (!out.some((o) => o.why === ev.why)) out.push(ev);
@@ -1351,6 +2340,48 @@ function handlerEvidenceUncached(r: Reader, handler: Thunk, env: Env | null): Ha
     }
   }
   return out;
+}
+
+/**
+ * A GET-shaped request: `fetch(…)`, `got(…)`, `urlopen(…)`, or `<client>.get(…)` / `.head(…)`.
+ * The receiver starts at a word boundary: unanchored, every position inside a
+ * long identifier or hex literal restarted the scan of its tail, and a 500 KB
+ * handler took minutes.
+ */
+const GET_REQUEST = /(?<![\w$.])(?:fetch|\$fetch|ofetch|got|ky|urlopen)\s*\(|(?<![\w$])([A-Za-z_$][\w$]*)\s*\.\s*(?:get|head|urlopen)\s*\(/g;
+
+/**
+ * Does the handler `fn` fetch a URL that IS one of its inputs — `fetch(url)`,
+ * `axios.get(args.url)`, `requests.get(url)`, `fetch(new URL(input.href))`? Then
+ * it takes in whatever the caller points it at: untrusted input, read from the
+ * handler rather than the prose. A URL built on a fixed base (`${API}/items/${id}`)
+ * is an API read, not this.
+ */
+function inputFetch(r: Reader, fn: FnInfo): HandlerEvidence | undefined {
+  const inputs = new Set<string>();
+  for (const p of r.params(fn)) {
+    if (p.name) inputs.add(p.name);
+    for (const k of p.keys ?? []) inputs.add(k.local);
+  }
+  if (!inputs.size) return undefined;
+  const names = [...inputs].map((n) => n.replace(/[$]/g, '\\$')).join('|');
+  const isInput = new RegExp(
+    `^(?:await\\s+)?(?:(?:new\\s+URL|String|str|encodeURI)\\s*\\(\\s*)?(?:${names})(?:\\s*\\??\\.\\s*[A-Za-z_$][\\w$]*|\\[\\s*['"][\\w-]{1,40}['"]\\s*\\]){0,2}\\s*\\)?$|^\`\\$\\{\\s*(?:${names})(?:\\s*\\??\\.\\s*[A-Za-z_$][\\w$]*){0,2}\\s*\\}\`$`,
+  );
+  const body = r.src.slice(fn.bodyStart, fn.bodyEnd);
+  let seen = 0;
+  for (const m of body.matchAll(GET_REQUEST)) {
+    if (++seen > 64) break;
+    const at = fn.bodyStart + m.index!;
+    if (!r.ctx.isCode(at)) continue;
+    if (m[1] !== undefined && !HTTP_CLIENT.test(m[1])) continue;
+    const args = r.parts(at + m[0].length - 1) ?? [];
+    const first = args[0] ? r.src.slice(args[0][0], args[0][1]).trim() : '';
+    if (first && isInput.test(first.slice(0, 200))) {
+      return { tag: 'untrusted-input', why: `handler fetches a URL taken from its input (${clip(m[0] + first)})`, line: r.ctx.line(at) };
+    }
+  }
+  return undefined;
 }
 
 const writesMemo = new WeakMap<Reader, Map<string, HandlerEvidence[]>>();
@@ -1366,6 +2397,14 @@ function writesIn(r: Reader, from: number, to: number): HandlerEvidence[] {
   m.set(key, v);
   return v;
 }
+
+/**
+ * How many POSTs sent with a `method:` options object are read for positive
+ * evidence (see `requestReads`) in one function body. The rest are judged as
+ * 1.16.0 judged them: a read only at a literal search / GraphQL URL, a sink
+ * otherwise. A body of thousands of options objects is padding, not a client.
+ */
+const MAX_OPTIONS_READ = 64;
 
 function writesInUncached(r: Reader, from: number, to: number): HandlerEvidence[] {
   const { src, ctx } = r;
@@ -1392,29 +2431,56 @@ function writesInUncached(r: Reader, from: number, to: number): HandlerEvidence[
     const target = urlLike || /^[A-Za-z_$][\w$.]*$/.test(first) && /url|uri|path|endpoint|href|route|link/i.test(first) || /^[A-Za-z_$][\w$.]*\s*\(/.test(first) && /url|path|endpoint|route/i.test(first.split('(')[0]!);
     const http = HTTP_CLIENT.test(recv) && target;
     if (!http && !(urlLike && method !== 'DELETE')) continue;
-    if (method === 'POST' && READ_ONLY_POST.test(first)) continue;
+    if (method === 'POST') {
+      // The payload is the second argument (the options, for got / ky) or a
+      // Python `json=` / `data=` keyword; an axios config and `headers=` are
+      // read for what they carry (see `postParts`, `requestReads`).
+      const req = postParts(r, first, args.slice(1).map(([a, b]) => src.slice(a, b).trim()), recv, bodyIndex(r, from, to), at);
+      if (requestReads(r, req, from, to, at, true)) continue;
+    }
     out.push({ tag: 'external-sink', why: `handler sends an HTTP ${method} (${clip(src.slice(at - chain.length - 1, open + 1) + first)})`, line: ctx.line(at) });
   }
 
   // `fetch(url, { method: 'POST' })`, `axios({ method: 'put' })` — the method key
   // must sit in an object passed to a request function, and only that call's URL
   // decides whether it is a read-only query.
+  let optionsRead = 0;
   for (const mm of body.matchAll(/\bmethod\s*:\s*(['"`])(POST|PUT|PATCH|DELETE)\1/gi)) {
     const at = from + mm.index!;
     if (!ctx.isCode(at)) continue;
-    const call = enclosingCall(r, at, from);
-    if (!call || !/(?:^|\.)(?:fetch|\$fetch|ofetch|axios|request|got|ky|undici|fetchJson|apiFetch|http|https)$/i.test(call.callee)) continue;
-    const url = call.args[0] ? src.slice(call.args[0][0], call.args[0][1]) : '';
+    // The options object sits in the call, or is built first and passed by name: `const opts = { method: 'POST', body }; fetch(url, opts)`.
+    const call = [enclosingCall(r, at, from), optionsSentByName(r, at, from, to)].find((c) => c && REQUEST_FN.test(c.callee));
+    if (!call) continue;
+    const a0 = call.args[0] ? src.slice(call.args[0][0], call.args[0][1]).trim() : '';
+    // `axios({ method, url, data })` holds its URL in the config; `fetch(url, { method, body })` takes it first.
+    const config = a0.startsWith('{') || (call.args.length === 1 && /^[A-Za-z_$][\w$]*$/.test(a0) && !/url|uri|endpoint|href/i.test(a0));
+    const url = config ? '' : a0;
     const method = mm[2]!.toUpperCase();
-    if (method === 'POST' && READ_ONLY_POST.test(url) && /^[`'"]/.test(url.trim())) continue;
-    out.push({ tag: 'external-sink', why: `handler sends an HTTP ${method} (${clip(call.callee + '(' + url.trim())})`, line: ctx.line(at) });
+    if (method === 'POST') {
+      if (++optionsRead > MAX_OPTIONS_READ) {
+        if (READ_ONLY_POST.test(a0) && /^[`'"]/.test(a0)) continue;
+      } else {
+        const req: RequestParts = { url, body: [], headers: [], credentials: [], extra: [] };
+        for (const [a, b] of config ? call.args : call.args.slice(1)) fileOptions(r, req, src.slice(a, b), bodyIndex(r, from, to), at, 'body');
+        if (requestReads(r, req, from, to, at, false)) continue;
+      }
+    }
+    out.push({ tag: 'external-sink', why: `handler sends an HTTP ${method} (${clip(call.callee + '(' + (url || a0).trim())})`, line: ctx.line(at) });
   }
 
-  // Python: `requests.request("DELETE", url)`, `session.request('post', …)`.
+  // Python: `requests.request("DELETE", url)`, `session.request('post', …)`. A
+  // POST is read by its URL argument as the `.post(…)` form is (`/jobs/list`).
   for (const mm of body.matchAll(/\.\s*request\s*\(\s*(['"])(POST|PUT|PATCH|DELETE)\1/gi)) {
     const at = from + mm.index!;
     if (!ctx.isCode(at)) continue;
-    out.push({ tag: 'external-sink', why: `handler sends an HTTP ${mm[2]!.toUpperCase()} (request("${mm[2]}", …))`, line: ctx.line(at) });
+    const method = mm[2]!.toUpperCase();
+    if (method === 'POST') {
+      const args = r.parts(at + mm[0].indexOf('(')) ?? [];
+      const url = args[1] ? src.slice(args[1][0], args[1][1]).trim() : '';
+      const req = postParts(r, url, args.slice(2).map(([a, b]) => src.slice(a, b).trim()), 'requests', bodyIndex(r, from, to), at);
+      if (requestReads(r, req, from, to, at, false)) continue;
+    }
+    out.push({ tag: 'external-sink', why: `handler sends an HTTP ${method} (request("${mm[2]}", …))`, line: ctx.line(at) });
   }
 
   // Database writes: an ORM mutation, a Mongo write, a write statement in SQL.
@@ -1459,6 +2525,84 @@ function enclosingCall(r: Reader, at: number, floor: number): { callee: string; 
       const args = r.parts(i) ?? [];
       return { callee, args };
     }
+  }
+  return undefined;
+}
+
+/** A function that sends a request when called with an options object. */
+const REQUEST_FN = /(?:^|\.)(?:fetch|\$fetch|ofetch|axios|request|got|ky|undici|fetchJson|apiFetch|http|https)$/i;
+
+/** A call of a request function, by name: `fetch(`, `api.request(`, `this.client.fetchJson(`. */
+const REQUEST_CALL = /(?<![\w$])((?:[A-Za-z_$][\w$]*\s*\.\s*)?(?:fetch|\$fetch|ofetch|axios|request|got|ky|fetchJson|apiFetch))\s*\(/g;
+
+interface RequestCall {
+  at: number;
+  callee: string;
+  /** The `(` of the call. */
+  open: number;
+  /** Its arguments, split on first use. */
+  args?: [number, number][];
+}
+const requestCallsMemo = new WeakMap<Reader, Map<string, RequestCall[]>>();
+
+/**
+ * Every request call in the function body [from, to), in source order — found
+ * once per body. A body of fifty thousand options objects looks each one's
+ * request up here instead of scanning the rest of the body again.
+ */
+function requestCalls(r: Reader, from: number, to: number): RequestCall[] {
+  let memo = requestCallsMemo.get(r);
+  if (!memo) requestCallsMemo.set(r, (memo = new Map()));
+  const key = `${from}:${to}`;
+  const hit = memo.get(key);
+  if (hit) return hit;
+  const out: RequestCall[] = [];
+  for (const m of r.src.slice(from, to).matchAll(REQUEST_CALL)) {
+    out.push({ at: from + m.index!, callee: m[1]!.replace(/\s+/g, ''), open: from + m.index! + m[0].length - 1 });
+  }
+  memo.set(key, out);
+  return out;
+}
+
+/**
+ * `const opts = { method: 'POST', body }; await fetch(url, opts)` — the request
+ * the options object holding `at` is passed to by name, among the first sixteen
+ * request calls after it in [floor, to).
+ */
+function optionsSentByName(r: Reader, at: number, floor: number, to: number): { callee: string; args: [number, number][] } | undefined {
+  const { src } = r;
+  let depth = 0;
+  let open = -1;
+  for (let i = at - 1, steps = 0; i >= floor && steps < 3000; i--, steps++) {
+    if (!r.ctx.isCode(i)) continue;
+    const c = src[i]!;
+    if (c === ')' || c === ']' || c === '}') depth++;
+    else if (c === '(' || c === '[' || c === '{') {
+      if (depth > 0) {
+        depth--;
+        continue;
+      }
+      if (c === '{') open = i;
+      break;
+    }
+  }
+  if (open < 0) return undefined;
+  const name = /(?:^|[\s;(])(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=\n]{1,80})?=\s*$/.exec(src.slice(Math.max(floor, open - 160), open))?.[1];
+  const close = r.close(open);
+  if (!name || close < 0) return undefined;
+  const calls = requestCalls(r, floor, to);
+  let lo = 0;
+  let hi = calls.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (calls[mid]!.at < close) lo = mid + 1;
+    else hi = mid;
+  }
+  for (let k = lo; k < calls.length && k < lo + 16; k++) {
+    const call = calls[k]!;
+    if (!r.ctx.isCode(call.at)) continue;
+    call.args ??= r.parts(call.open) ?? [];
+    if (call.args.some(([a, b]) => src.slice(a, b).trim() === name)) return { callee: call.callee, args: call.args };
   }
   return undefined;
 }
@@ -2163,7 +3307,8 @@ function pyRegistrations(r: Reader, file: string): FoundRegistration[] {
     const condition = conditionAt(r, d.at);
     // The decorated function IS the handler: read what its body sends or writes.
     const def = d.defAt !== undefined ? r.ctx.functions().find((f) => f.headerStart < d.defAt! && d.defAt! - f.headerStart < 160 && f.bodyStart > d.defAt!) : undefined;
-    const behavior = def ? writesIn(r, def.bodyStart, def.bodyEnd).slice(0, 3) : [];
+    const fetched = def ? inputFetch(r, def) : undefined;
+    const behavior = def ? [...(fetched ? [fetched] : []), ...writesIn(r, def.bodyStart, def.bodyEnd)].slice(0, 3) : [];
     out.push({
       name, file, line: r.ctx.line(d.at), via, ...(helpers ? { helpers } : {}),
       ...(title ? { title } : {}), ...(description ? { description } : {}),
@@ -2404,10 +3549,13 @@ function readAll(file: SourceFile): FoundRegistration[] {
     r.begin(own);
     const h = r.hints(annotationsOf(r, obj));
     const description = r.str(fieldOf(obj, 'description'), true);
+    // The table's own schema: a tool whose line-matcher read found none still has parameters.
+    const params = schemaParams(r, fieldOf(obj, 'inputSchema'));
     const condition = conditionAt(r, at);
     out.push({
       name, file: file.path, line: ctx.line(at), via: 'direct',
       ...(description ? { description } : {}),
+      ...(params ? { params } : {}),
       ...(h.hints ? { hints: h.hints } : {}), hintSource: h.source,
       ...(condition ? { condition } : {}),
     });

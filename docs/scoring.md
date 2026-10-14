@@ -5,7 +5,7 @@
 MCP Trust Checker scores two independent things, because "powerful" and "malicious" are different questions:
 
 - **Trust (the A–F grade / 0–100 Trust Score)** — driven by *threat* findings only: prompt-injection with concealment/override/sensitive-target, embedded secrets, Unicode smuggling, typosquatting, known CVEs, rug-pull drift, annotation lies (readOnly claim on a state-mutating tool), a single tool built as an exfiltration primitive (`MTC-FLOW-001`), plaintext/stdio-RCE posture. Answers *"any sign this server is malicious or negligent?"*
-- **Capability (`minimal | moderate | high | critical`)** — driven by *capability* findings: code execution, filesystem writes, network egress, unconstrained command/URL/path params, and the cross-tool toxic-flow surface (`MTC-FLOW-002/003/004/005`, `MTC-CAP-001/002/004…`). Answers *"how much damage if the model driving it is manipulated?"* It is context for sizing access, **not** a penalty on the grade.
+- **Capability (`minimal | moderate | high | critical`)** — driven by *capability* findings: code execution, filesystem writes, network egress, unconstrained command/URL/path params, and the cross-tool toxic-flow surface (`MTC-FLOW-002/003/004/005`, `MTC-CAP-001/002/004…`). Answers *"how much damage if the model driving it is manipulated?"* It is context for sizing access, **not** a penalty on the grade. Ingesting untrusted external content (a web search, a page fetch, an inbox) is an *entry point*, not damage: on its own it is recorded in `capabilityProfile.observations` and moves neither the level nor the score. It raises the level to `moderate` only when the model chooses where the request goes — a `url`/`uri`/`host`/`hostname` parameter that no `enum`, `const` or whole-value `pattern` pins down (`^https?://` pins nothing), or a handler that fetches a URL taken from its input — because that is SSRF and egress through the URL. The combinations that make outside content harmful (the trifecta, untrusted input linked to code execution) are priced exactly as before (changed in `mcptrustchecker-1.16.1`).
 
 The rules that count as *capability* (and therefore never lower the grade) are listed in [`src/scoring/model.ts`](../src/scoring/model.ts) (`CAPABILITY_RULES`). Capability findings are still shown in the report — under "Capability observations" — and raise the capability level via [`src/scoring/capability.ts`](../src/scoring/capability.ts). Keeping the axes separate is what stops a legitimate-but-powerful server (a scraper, a browser driver, a filesystem tool) from collapsing to "F". Popularity is never an input.
 
@@ -58,7 +58,7 @@ Higher score = safer. A clean, fully-inspected, minimal-capability surface score
 
 | Term | What it prices | Values |
 | --- | --- | ---: |
-| `E_cap` | blast radius if the model driving the server is manipulated | minimal 0 · moderate 3 · high 6 · critical 10 — a fixed program spawned without a shell (`process-spawn`) and a tool that declares it changes the state it holds (`state-write`) reach moderate at most; only a runtime-chosen command or program is `code-exec` (high). A tool's own annotations can raise its roles, never lower them |
+| `E_cap` | blast radius if the model driving the server is manipulated | minimal 0 · moderate 3 · high 6 · critical 10 — a fixed program spawned without a shell (`process-spawn`) and a tool that declares it changes the state it holds (`state-write`) reach moderate at most; only a runtime-chosen command or program is `code-exec` (high). Reading untrusted content alone is 0 (an observation, not a term); it is moderate only when the model chooses the destination (an unpinned URL/host parameter, or a handler fetching a URL from its input). A tool's own annotations can raise its roles, never lower them |
 | `E_ver` | how verifiable the artifact's origin is | vendor scope 0 · build provenance 0 · public repo 1 · unlocatable 5 |
 | `E_cov` | how much of the target the scan could actually read | live/source 0 · manifest 4 · metadata 8 · **empty 25** |
 
@@ -151,7 +151,7 @@ All gates except the any-critical floor fire only on `confirmed` findings, so a 
 
 Every report ships everything needed to recompute the score:
 
-1. `score.methodologyVersion` (`mcptrustchecker-1.12`).
+1. `score.methodologyVersion` (`mcptrustchecker-1.16.1`).
 2. `score.threatScore` — the pure threat number, preserved before the client terms.
 3. `score.vector` — one line per step, of two kinds:
    - `{ kind: "threat", ruleId, category, severity, confidence, rawWeight, confidenceMult, diminishingFactor, appliedPenalty }`

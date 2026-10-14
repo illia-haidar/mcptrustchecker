@@ -274,7 +274,15 @@ export function hasBase64Blob(text: string): boolean {
   // same defect that hid `note=<payload>` from the decode ladder.
   for (const m of t.matchAll(/(?<![A-Za-z0-9+/])([A-Za-z0-9+/]{24,4096}={0,2})(?![A-Za-z0-9+/=])/g)) {
     const blob = m[1]!;
-    if (/^[0-9a-f]+$/i.test(blob)) continue; // pure hex → an ID, not base64
+    // Pure hex → an ID, not base64. A `0x` prefix is part of how hex is written
+    // (a checksummed EVM address, 0x833589fCD6…), not a sign of base64.
+    if (/^(?:0x)?[0-9a-f]+$/i.test(blob)) continue;
+    // A '/'-separated run of identifiers ("frameSec/filePath/base64") is a list
+    // of field names. Each segment reads as a word or a camelCase identifier,
+    // optionally ending in digits — the shape random base64 almost never has.
+    if (blob.includes('/') && !/[+=]/.test(blob) && blob.split('/').every((s) => s === '' || /^[A-Za-z][a-z]+(?:[A-Z][a-z]+)*[0-9]*$/.test(s))) {
+      continue;
+    }
     // `+` and `=` are prose-rare and a strong base64 signal. `/` alone is NOT —
     // it is common in prose ("and/or", paths, slash-separated word lists like
     // "methodology/results/structure"), so it must not qualify on its own.
@@ -287,7 +295,11 @@ export function hasBase64Blob(text: string): boolean {
   return false;
 }
 
-/** Re-export the compiled injection patterns as case-insensitive/global regexes. */
+/**
+ * Re-export the compiled injection patterns as case-insensitive/global regexes.
+ * A pattern's own class is kept: SECRECY-1 checks the clause after its match in
+ * code (see data/secrecyClause.ts).
+ */
 export function compiledInjectionPatterns(): {
   id: string;
   kind: string;
@@ -297,7 +309,7 @@ export function compiledInjectionPatterns(): {
   return INJECTION_PATTERNS.map((p) => ({
     id: p.id,
     kind: p.kind,
-    regex: new RegExp(p.pattern.source, 'gi'),
+    regex: new (p.pattern.constructor as RegExpConstructor)(p.pattern, 'gi'),
     meta: p,
   }));
 }

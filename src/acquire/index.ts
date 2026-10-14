@@ -19,7 +19,7 @@ import {
   redactSensitiveArgs,
   type ConfigServerSpec,
 } from './clientConfig.js';
-import { fetchNpmMeta, fetchPypiMeta } from './npm.js';
+import { fetchNpmMeta, fetchPypiMeta, RegistryUnavailableError } from './npm.js';
 import { fetchPackageSource, surfaceFromArchiveFile, PackageSourceError } from './packageSource.js';
 import { extractToolsFromSource } from './toolExtract.js';
 
@@ -95,12 +95,19 @@ function packageSurface(name: string, meta: PackageMeta, origin: string): Server
  * Fetch + verify the package's published artifact and attach its real source to
  * the surface (the deep half of an `--online` package scan).
  *
- * Failure handling is fail-CLOSED for tampering and fail-OPEN for outages, but
- * NEVER silent: a hash mismatch or an off-allowlist redirect (hard tamper
- * evidence) is recorded on the surface so a detector raises a finding — it must
- * not degrade to a clean grade. A transient network failure is recorded too, so
- * a machine consumer can see the byte-level check did not run rather than
- * mistaking an unverified scan for a verified one.
+ * Failure handling is fail-CLOSED for tampering and NEVER silent: a hash
+ * mismatch or an off-allowlist redirect (hard tamper evidence) is recorded on the
+ * surface so a detector raises a finding — it must not degrade to a clean grade.
+ * What the artifact itself is — gone (404 / 410), over the size cap — is
+ * recorded too, so a machine consumer can see the byte-level check did not run.
+ *
+ * A host that could not hand the bytes over is NOT recorded: it says nothing
+ * about the package. Before 1.16.1 a 503, a timeout or a dropped connection
+ * became `artifactError: network`, the scan fell back to metadata coverage, and
+ * a passing outage was graded as a property of the package (nodemw-mcp read C 75
+ * on a hiccup, A 96 once the artifact was readable). Such a failure now throws
+ * {@link RegistryUnavailableError} — `retryable` for the transient kinds, not
+ * for any other refusal (401, 403, …) — exactly as the metadata fetch does.
  */
 async function attachPublishedSource(surface: ServerSurface, opts: ResolveOptions): Promise<void> {
   const meta = surface.packageMeta;
@@ -113,6 +120,20 @@ async function attachPublishedSource(surface: ServerSurface, opts: ResolveOption
     surface.packageLayout = src.layout;
     if (src.sourceMaps.length) surface.sourceMaps = src.sourceMaps;
   } catch (err) {
+    if (err instanceof PackageSourceError && err.transient) {
+      throw new RegistryUnavailableError(meta.tarballUrl, err.registryStatus ?? null, err.message, true);
+    }
+    // The "artifact download failed: HTTP N" prefix is what a scan queue keys on
+    // ("…: HTTP 422" is a verdict, "…: HTTP 403" a hiccup to retry), so a
+    // refusal keeps it.
+    if (err instanceof PackageSourceError && typeof err.registryStatus === 'number' && err.registryStatus !== 404 && err.registryStatus !== 410) {
+      throw new RegistryUnavailableError(
+        meta.tarballUrl,
+        err.registryStatus,
+        `artifact download failed: HTTP ${err.registryStatus} — the registry refused the artifact download`,
+        false,
+      );
+    }
     const kind = err instanceof PackageSourceError ? err.kind : 'other';
     const detail = (err as Error).message;
     meta.artifactError = { kind, detail };
@@ -193,7 +214,11 @@ function staticConfigSurface(spec: ConfigServerSpec, origin: string): ServerSurf
   };
 }
 
-/** Resolve a target into scannable surfaces. */
+/**
+ * Resolve a target into scannable surfaces. With `online`, throws
+ * {@link RegistryUnavailableError} when the registry or its artifact host could
+ * not answer — `retryable` says whether trying again later can help.
+ */
 export async function resolveTargets(target: string | undefined, opts: ResolveOptions = {}): Promise<ResolvedTarget[]> {
   // 1) Explicit live specs win.
   if (opts.command) {
@@ -207,7 +232,17 @@ export async function resolveTargets(target: string | undefined, opts: ResolveOp
   if (target && !opts.url) {
     const repoRef = parseRepoTarget(target);
     if (repoRef) {
-      const surface = await surfaceFromGithubRepo(repoRef, { token: opts.githubToken });
+      let surface: ServerSurface;
+      try {
+        surface = await surfaceFromGithubRepo(repoRef, { token: opts.githubToken });
+      } catch (err) {
+        // A 5xx / 429, a dropped connection or the download timer says nothing
+        // about the repository: retryable, exactly as on the registry path.
+        if (err instanceof PackageSourceError && err.transient) {
+          throw new RegistryUnavailableError(`https://github.com/${repoRef.owner}/${repoRef.repo}`, err.registryStatus ?? null, err.message, true);
+        }
+        throw err;
+      }
       attachStaticTools(surface);
       return [{ label: repoLabel(repoRef), surface }];
     }
@@ -292,7 +327,12 @@ export async function resolveTargets(target: string | undefined, opts: ResolveOp
           }
           continue;
         }
-        // Static: posture + supply-chain only, no process spawned.
+        // Static: posture + supply-chain only, no process spawned. A registry
+        // that cannot answer for one entry (RegistryUnavailableError, from the
+        // metadata or the artifact) fails the whole config, deliberately: the
+        // entry has no honest surface to fall back to — without its package it
+        // would be graded on posture alone, the very "outage as a property" this
+        // error exists to prevent — and a retry rescans every entry anyway.
         const surface = staticConfigSurface(spec, target);
         if (spec.transport === 'stdio' && spec.command) {
           const pkgSpec = packageSpecFromStdio(spec.command, spec.args ?? []);

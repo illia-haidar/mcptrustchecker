@@ -24,7 +24,7 @@ import { createHash } from 'node:crypto';
 import type { ServerSurface, SkippedFile } from '../types.js';
 import { SIDECAR_MANIFESTS, packageMetaFromJson } from './source.js';
 import { surfaceFromManifest } from './manifest.js';
-import { assertTrustedTarballUrl, downloadCapped, classifyArchiveEntries, extractPackageArchive } from './packageSource.js';
+import { assertTrustedTarballUrl, downloadCapped, classifyArchiveEntries, extractPackageArchive, PackageSourceError, unreachable } from './packageSource.js';
 
 /** A resolved repository target. `ref` is a branch, tag or commit-ish. */
 export interface RepoRef {
@@ -106,7 +106,14 @@ export async function surfaceFromGithubRepo(
   const target = `https://api.github.com/repos/${ref.owner}/${ref.repo}/tarball${ref.ref ? `/${ref.ref}` : ''}`;
   const url = assertTrustedTarballUrl(target, 'github');
 
-  const buf = await downloadCapped(url, 'github', authedFetch(fetchImpl, opts.token));
+  // A request that got no complete answer is reported as one (transient), as on
+  // the registry path, rather than as the runtime's bare "fetch failed".
+  let buf: Buffer;
+  try {
+    buf = await downloadCapped(url, 'github', authedFetch(fetchImpl, opts.token));
+  } catch (err) {
+    throw err instanceof PackageSourceError ? err : unreachable(err);
+  }
   const skipped: SkippedFile[] = [];
   const { entries, maps } = extractPackageArchive(buf, 'repo.tar.gz', skipped);
   const { sourceFiles, sidecars, layout, sourceMaps } = classifyArchiveEntries(entries, skipped, maps);

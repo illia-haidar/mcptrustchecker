@@ -144,6 +144,14 @@ export interface PackageMeta {
    * NOT applied in that case, and a coverage caveat records the omission.
    */
   verification?: Verification;
+  /**
+   * PyPI only: the repository the PEP 740 attestation of the scanned file names
+   * (PyPI's integrity API, `--online`), whether or not it counted toward
+   * `verification`. Absent when the file has none.
+   */
+  attestedRepositoryUrl?: string;
+  /** PyPI only: that repository differs from `repositoryUrl`, so the attestation was not counted (MTC-SUP-016). */
+  attestationRepoMismatch?: boolean;
   /** URL of the published artifact (npm dist.tarball / PyPI sdist or wheel). */
   tarballUrl?: string | null;
   /** Registry-declared artifact hash: SRI (`sha512-<b64>`) or `<algo>:<hex>`. */
@@ -337,11 +345,20 @@ export type CapabilityTag =
    */
   | 'state-write';
 
+/** Where a capability tag's evidence was found. */
+export type CapabilitySource = 'name' | 'description' | 'param' | 'hint' | 'handler';
+
 export interface ToolCapability {
   tool: string;
   tags: CapabilityTag[];
   /** Why each tag was assigned (keyword/schema evidence), for explainability. */
   reasons: Partial<Record<CapabilityTag, string[]>>;
+  /**
+   * Where each tag's evidence sits: the tool's name, its description prose, a
+   * parameter name, a declared hint, or what its handler does. A role that only
+   * prose gives cannot complete a single-tool primitive (MTC-FLOW-001).
+   */
+  sources?: Partial<Record<CapabilityTag, CapabilitySource[]>>;
   /**
    * The behaviour hints the tool declares, as read (explicit booleans only).
    * They can add tags, never remove one.
@@ -360,6 +377,12 @@ export interface CapabilityProfile {
   reasons: string[];
   /** The union of capability tags observed across the server's tools. */
   tags: CapabilityTag[];
+  /**
+   * What the server does that the level does not price: a tool that only brings
+   * outside content in (a prompt-injection entry point) when the model cannot
+   * choose where it comes from. Informational — never a finding, never points.
+   */
+  observations: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -579,6 +602,33 @@ export interface ScanReport {
     resources: number;
     findingsBySeverity: Record<Severity, number>;
   };
+  /** The scanned surface itself — present only when asked for (`--surface`, `scanSurface(s, { surface: true })`). */
+  surface?: ReportSurface;
+}
+
+/** A tool as {@link ReportSurface} lists it: the definition as read, and where a recovered tool is registered. */
+export interface ReportSurfaceTool extends ToolDef {
+  /** For a `static` surface: the file and line of the registration, and its shape (see {@link StaticToolOrigin.via}). */
+  origin?: { file: string; line: number; shape: StaticToolOrigin['via'] };
+}
+
+/**
+ * The surface a report was computed on — after normalization, before analysis
+ * — attached on request so a consumer can show the tools the grade is about.
+ * Tools are in the canonical order behind `surfaceDigest` (code-unit by name);
+ * text is as read with line endings normalized. Bounded: at most 500 tools,
+ * prompts and resources, 8,000 characters per description or title, 64 KB of
+ * JSON per schema or annotations object; every cut is listed in `truncated`.
+ */
+export interface ReportSurface {
+  /** `live` — a running server's answer; `manifest` — a declared list; `static` — recovered from source. */
+  provenance: 'live' | 'manifest' | 'static';
+  /** What was cut or left out, and why — including files where static tool recovery hit a cap. */
+  truncated: string[];
+  server: { name?: string; version?: string; title?: string };
+  tools: ReportSurfaceTool[];
+  prompts: PromptDef[];
+  resources: ResourceDef[];
 }
 
 // ---------------------------------------------------------------------------

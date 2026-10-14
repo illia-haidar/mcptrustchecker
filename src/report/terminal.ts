@@ -131,6 +131,8 @@ export function renderTerminal(report: ScanReport, opts: { details?: boolean } =
   } else {
     out.push(`   ${c.gray('methodology ' + score.methodologyVersion)}`);
   }
+  // What the level does not price (no points, not a finding) gets its own line.
+  for (const o of cap.observations ?? []) out.push(`   ${c.gray(`observed: ${clean(o)}`)}`);
   out.push('');
 
   // Threat severity counts (what drives the grade) + capability count.

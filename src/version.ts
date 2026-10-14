@@ -1,6 +1,6 @@
 /*! MCP Trust Checker · https://mcptrustchecker.com · support@mcptrustchecker.com · © 2026 Illia Haidar · MIT */
 /** Package version. Keep in sync with package.json. */
-export const TOOL_VERSION = '1.16.0';
+export const TOOL_VERSION = '1.16.1';
 
 /**
  * Methodology version. Bump this whenever scoring weights, gates, rule
@@ -8,7 +8,7 @@ export const TOOL_VERSION = '1.16.0';
  * The reproducibility contract is: same methodology version + same target ⇒
  * identical Trust Score.
  */
-export const METHODOLOGY_VERSION = 'mcptrustchecker-1.16';
+export const METHODOLOGY_VERSION = 'mcptrustchecker-1.16.1';
 
 /** Version of the bundled Unicode/confusables tables. */
 export const UNICODE_DATA_VERSION = '17.0.0';

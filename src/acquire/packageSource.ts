@@ -69,11 +69,56 @@ export type PackageSourceErrorKind = 'integrity' | 'untrusted-redirect' | 'netwo
 
 export class PackageSourceError extends Error {
   readonly kind: PackageSourceErrorKind;
-  constructor(kind: PackageSourceErrorKind, message: string) {
+  /**
+   * The registry's final HTTP status for a refused download; null when no
+   * complete answer arrived. Not `status`: a web framework reads that as its
+   * own response status (see RegistryUnavailableError).
+   */
+  readonly registryStatus?: number | null;
+  /**
+   * The host could not hand the bytes over THIS time — 408, 425, 429, 5xx, a
+   * network error, the download timer, a body cut short of its declared length.
+   * It says nothing about the package, so a registry scan rethrows it as a
+   * retryable error instead of recording it (see attachPublishedSource).
+   */
+  readonly transient: boolean;
+  constructor(kind: PackageSourceErrorKind, message: string, opts: { status?: number | null; transient?: boolean } = {}) {
     super(message);
     this.name = 'PackageSourceError';
     this.kind = kind;
+    if (opts.status !== undefined) this.registryStatus = opts.status;
+    this.transient = opts.transient ?? false;
   }
+}
+
+/** Statuses that mean "try again later", not "no such artifact" (same set as npm.ts). */
+function isTransientStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+/**
+ * A download that never got a complete answer — a network error, or the
+ * download timer firing before or during the body. Worded for a scan queue that
+ * reads the CLI's stderr: "could not be reached" is a hiccup to retry, while
+ * "timed out", "aborted" and "terminated" read there as the artifact's own
+ * ceiling and spend one of its tries — so those words, which the runtime's own
+ * messages carry, are never passed through.
+ */
+export function unreachable(err: unknown): PackageSourceError {
+  const e = err as { name?: unknown; message?: unknown; cause?: { code?: unknown } } | null;
+  let why: string;
+  if (e?.name === 'AbortError' || e?.name === 'TimeoutError') {
+    why = `no complete answer within ${DOWNLOAD_TIMEOUT_MS} ms`;
+  } else {
+    const code = typeof e?.cause?.code === 'string' ? ` (${e.cause.code.slice(0, 40)})` : '';
+    const text = String(e?.message ?? err ?? 'network error').slice(0, 120) + code;
+    // undici says "terminated" for a socket closed mid-body, "UND_ERR_ABORTED" …
+    why = /timed out|aborted|terminated/i.test(text) ? 'the connection closed early' : text;
+  }
+  return new PackageSourceError('network', `artifact download failed: the registry could not be reached (${why})`, {
+    status: null,
+    transient: true,
+  });
 }
 
 /** Validate that an artifact URL is https on the registry's own artifact host. */
@@ -168,7 +213,12 @@ export async function downloadCapped(
     }
     if (!res) throw new PackageSourceError('network', 'artifact download produced no response');
     if (res.status >= 300 && res.status < 400) throw new PackageSourceError('network', 'too many artifact redirects');
-    if (!res.ok) throw new PackageSourceError('network', `artifact download failed: HTTP ${res.status}`);
+    if (!res.ok) {
+      throw new PackageSourceError('network', `artifact download failed: HTTP ${res.status}`, {
+        status: res.status,
+        transient: isTransientStatus(res.status),
+      });
+    }
     const declared = Number(res.headers.get('content-length') ?? 0);
     if (declared > MAX_DOWNLOAD_BYTES) {
       throw new PackageSourceError(
@@ -189,6 +239,18 @@ export async function downloadCapped(
         throw new PackageSourceError('network', `artifact exceeded the ${MAX_DOWNLOAD_BYTES / 1024 / 1024} MB download cap`);
       }
       chunks.push(Buffer.from(value));
+    }
+    // A body that ends short of its declared length is a dropped connection, not
+    // the artifact: hashed, it would read as an integrity failure (tamper
+    // evidence), and unpacked, as a corrupt archive. Only an identity-encoded
+    // body is compared — a content-encoded one declares its compressed length.
+    const encoding = (res.headers.get('content-encoding') ?? 'identity').trim().toLowerCase();
+    if (declared > 0 && total < declared && encoding === 'identity') {
+      throw new PackageSourceError(
+        'network',
+        `artifact download failed: the registry could not be reached to finish the body (${total} of ${declared} bytes arrived)`,
+        { status: res.status, transient: true },
+      );
     }
     return Buffer.concat(chunks);
   } finally {
@@ -305,6 +367,8 @@ export function extractPackageArchive(
  * Fetch, verify and extract the published source of a registry package.
  * Throws a descriptive error on any trust failure (bad host, over-cap, hash
  * mismatch); returns `null` when the metadata has no artifact URL to read.
+ * Every download failure arrives as a {@link PackageSourceError}: one that got
+ * no complete answer (network error, the download timer) is `transient`.
  */
 export async function fetchPackageSource(
   meta: PackageMeta,
@@ -313,7 +377,12 @@ export async function fetchPackageSource(
   if (!meta.tarballUrl) return null;
   const registry = meta.registry === 'pypi' ? 'pypi' : 'npm';
   const url = assertTrustedTarballUrl(meta.tarballUrl, registry);
-  const buf = await downloadCapped(url, registry, fetchImpl);
+  let buf: Buffer;
+  try {
+    buf = await downloadCapped(url, registry, fetchImpl);
+  } catch (err) {
+    throw err instanceof PackageSourceError ? err : unreachable(err);
+  }
   verifyTarballIntegrity(buf, meta.tarballIntegrity);
   const tarballSha256 = createHash('sha256').update(buf).digest('hex');
   const skipped: SkippedFile[] = [];

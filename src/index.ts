@@ -33,7 +33,9 @@ export { surfaceFromPackageDir, readSourceFiles } from './acquire/source.js';
 export { acquireStdio, acquireHttp, ALLOWED_COMMANDS, type StdioSpec, type LiveOptions } from './acquire/live.js';
 export { parseRepoTarget, surfaceFromGithubRepo, repoLabel, repoHomeUrl, type RepoRef } from './acquire/repo.js';
 export { parseClientConfig, isClientConfig, packageFromStdio } from './acquire/clientConfig.js';
-export { fetchNpmMeta, fetchPypiMeta } from './acquire/npm.js';
+// A registry that could not answer — thrown, never recorded as a property of the
+// package. `retryable` / `code` ('MTC_REGISTRY_UNAVAILABLE') tell a queue to rescan later.
+export { fetchNpmMeta, fetchPypiMeta, RegistryUnavailableError } from './acquire/npm.js';
 
 // Registry publishing (opt-in; sends an application, never a verdict)
 export {
@@ -81,6 +83,8 @@ export { scanProcessCalls, type CallShape, type ProcessCall } from './analysis/c
 // Reporters
 export { renderTerminal } from './report/terminal.js';
 export { renderJson } from './report/json.js';
+// The scanned surface a report carries on request (`scanSurface(s, { surface: true })`).
+export { buildReportSurface, SURFACE_LIMITS } from './report/surface.js';
 export { renderSarif } from './report/sarif.js';
 export { renderMarkdown } from './report/markdown.js';
 export { renderBadge } from './report/badge.js';

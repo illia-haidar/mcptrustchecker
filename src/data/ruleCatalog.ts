@@ -52,6 +52,7 @@ export const RULE_CATALOG: RuleDoc[] = [
   { id: 'MTC-INJ-URL-1', title: 'Suspicious external URL in tool metadata', category: 'exfiltration', severity: 'medium', summary: 'A hardcoded webhook/paste/exfil endpoint or raw IP in a tool description — a data-exfiltration channel.' },
   { id: 'MTC-INJ-SEM-1', title: 'Concealment directive (language-agnostic)', category: 'injection', severity: 'medium', summary: 'A negation/stealth marker, a disclosure verb and a user referent co-occur — "keep this from the person" detected as a shape, so paraphrase and non-English wording are still caught.' },
   { id: 'MTC-INJ-SCHEMA-1', title: 'Description names an unreachable credential store', category: 'injection', severity: 'medium', summary: 'Tool prose references SSH keys, cloud credentials or a keychain that nothing in its input schema can address — the interface contradicts the description.' },
+  { id: 'MTC-INJ-ESCALATE-1', title: 'Permission self-escalation directive', category: 'injection', severity: 'high', summary: 'Metadata tells the model to grant itself destructive permission (allowDestructive*: true) and/or to empty the confirmation list (requireConfirmation*: []) — both together, or as the reaction to the guard refusing.' },
 
   // Stage 3 — Capability
   { id: 'MTC-CAP-001', title: 'Command/code execution capability', category: 'permissions', severity: 'high', summary: 'Tool runs shell commands or evaluates code.' },
@@ -86,6 +87,7 @@ export const RULE_CATALOG: RuleDoc[] = [
   { id: 'MTC-SUP-013', title: 'Package not version-pinned', category: 'supply-chain', severity: 'low', summary: 'Installed with @latest/floating spec — the rug-pull enabler; pinning is the recommended control.' },
   { id: 'MTC-SUP-014', title: 'Dependency squat / advisory match', category: 'supply-chain', severity: 'medium', summary: 'A declared dependency resembles a protected package or matches a known advisory by name.' },
   { id: 'MTC-SUP-015', title: 'Pinned version is not published in the registry', category: 'supply-chain', severity: 'medium', summary: 'An exact pinned version is not listed by the registry; the scanner refuses to substitute latest and flags the gap.' },
+  { id: 'MTC-SUP-016', title: 'Attestation repository differs from the declared repository', category: 'supply-chain', severity: 'info', summary: 'The PyPI (PEP 740) attestation of the scanned file names a different repository than the package\'s project_urls (compared case-insensitively), so it is not counted as publisher verification. Recorded, never scored.' },
 
   // Stage 6 — Posture / CVE
   { id: 'MTC-NET-001', title: 'Known-vulnerable version', category: 'supply-chain', severity: 'critical', summary: 'Installed version is in a known-CVE range. Severity and confidence come from the advisory itself — a critical CVE is reported confirmed-critical and gates the grade at F.' },

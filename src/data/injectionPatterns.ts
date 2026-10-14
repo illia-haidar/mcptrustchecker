@@ -11,6 +11,7 @@
  */
 
 import type { Confidence, Severity } from '../types.js';
+import { secrecyPattern } from './secrecyClause.js';
 
 /** Which text channel a pattern is meaningful in. */
 export type InjectionChannel = 'tool-description' | 'param-description' | 'server-instructions';
@@ -53,6 +54,30 @@ const ALL_CHANNELS: InjectionChannel[] = [
   'server-instructions',
 ];
 
+/**
+ * "tell the user to <verb>" is an errand for the user, unless the infinitive is
+ * one of PURPOSE: "do not inform the user to avoid alarming them".
+ */
+const TO_THE_USER = String.raw`(?!\s+to\s+["'“‘]?(?!(?:avoid|prevent|spare|reduce|minimi[sz]e|not|keep\s+things|save\s+time)\b)\w)`;
+/**
+ * The SECRECY-1 branches that end in "the user": each counts only when no
+ * honest clause follows it — "do not tell the user it can be sent" forbids a
+ * false claim and hides nothing (see `honestClauseAt` in secrecyClause.ts).
+ * "without telling the user" after "do not call …" is a requirement to tell
+ * ("do not call without telling the user a prompt will appear"); the
+ * lookbehind sits after the literal `without`, so it is evaluated only there.
+ * It is held to one clause, and a fresh order inside it ("…; call this one
+ * without telling the user", "Never run out of patience: always call this
+ * tool without …") is not governed by the negation.
+ */
+const SECRECY_GATED =
+  String.raw`do not (?:(?:tell|inform|notify)(?: this| it)?(?: to)? the user${TO_THE_USER}|(?:mention|reveal|show|display|print|log|output)(?: this| it)?(?: to)? the user)` +
+  String.raw`|without(?<!\b(?:do not|don['’]t|never) (?:call|invoke|run|use|execute)\b(?:(?!\b(?:always|then|instead|but)\b)[^.;:!?\n]){0,60}without) (?:telling|informing|notifying) the user` +
+  String.raw`|never (?:(?:tell|inform) the user${TO_THE_USER}|(?:mention|reveal|present|display) the user)`;
+/** The SECRECY-1 branches that hide by their own words: "do not mention this", "hide it from the user". */
+const SECRECY_PLAIN =
+  String.raw`do not mention this|never (?:tell|inform|mention|reveal|present|display) this|(hide|conceal|keep)( this| it)? (hidden |secret )?from the user|concealed from the user`;
+
 export const INJECTION_PATTERNS: InjectionPattern[] = [
   // --- Authority / secrecy / instruction-override ---
   {
@@ -80,7 +105,12 @@ export const INJECTION_PATTERNS: InjectionPattern[] = [
   {
     id: 'MTC-INJ-SECRECY-1',
     kind: 'secrecy',
-    pattern: /do not (tell|mention|inform|notify|reveal|show|display|print|log|output)( this| it)?( to)? the user|without (telling|informing|notifying) the user|do not mention this|never (tell|mention|reveal|present|inform|display)( the user| this)|(hide|conceal|keep)( this| it)? (hidden |secret )?from the user|concealed from the user/,
+    // Two readings of the same words are excluded, both of them instructions to
+    // be MORE open with the user: "tell the user to <do something>" (Never tell
+    // the user to "check the console"), and an honesty rule (`honestClauseAt`).
+    // An infinitive of PURPOSE is not an errand for the user: "do not inform the
+    // user to avoid alarming them" is concealment (TO_THE_USER).
+    pattern: secrecyPattern(SECRECY_GATED, SECRECY_PLAIN),
     baseSeverity: 'high',
     baseConfidence: 'strong',
     title: 'Secrecy directive (conceal action from the user)',
@@ -197,8 +227,10 @@ export const INJECTION_PATTERNS: InjectionPattern[] = [
     id: 'MTC-INJ-ENC-1',
     kind: 'encoded-payload',
     // Require a decode PAIRED with execution — a plain base64 utility only
-    // decodes and must not be flagged.
-    pattern: /decode (this|the following|the base64)[^.]{0,40}(execute|eval|run it|then run)|(base64|from base64)[^.]{0,25}(execute|eval|then run)|execute the (result|decoded|following)|\\x[0-9a-f]{2}(\\x[0-9a-f]{2}){2,}/,
+    // decodes and must not be flagged. "execute the result / the following" is
+    // ordinary prose ("strictly execute the following Four-Step Judgment"), so it
+    // counts only with an encoding word within 40 characters on either side.
+    pattern: /decode (this|the following|the base64)[^.]{0,40}(execute|eval|run it|then run)|(base64|from base64)[^.]{0,25}(execute|eval|then run)|execute the decoded|(?:base64|b64|atob|decod)[^.]{0,40}execute the (?:result|following)|execute the (?:result|following)[^.]{0,40}(?:base64|b64|atob|decod)|\\x[0-9a-f]{2}(\\x[0-9a-f]{2}){2,}/,
     baseSeverity: 'high',
     baseConfidence: 'strong',
     title: 'Encoded-payload decode/execute instruction',
@@ -208,7 +240,15 @@ export const INJECTION_PATTERNS: InjectionPattern[] = [
   {
     id: 'MTC-INJ-CMD-1',
     kind: 'command-in-prose',
-    pattern: /\b(rm -rf|chmod -R|curl [^\s]+ ?\| ?(sh|bash)|wget [^\s]+ ?\| ?(sh|bash)|cat ~\/|\/bin\/(sh|bash)\b|nc -e|bash -c)\b/,
+    // A download piped into an interpreter takes its flags before the URL:
+    // `curl -fsSL https://… | sh`, `wget -qO- https://… | bash`. One token after
+    // curl / wget missed every such install line; up to six are read. A token
+    // holds no space and no pipe, so tokens and separators are disjoint classes
+    // and the match stays linear. The same deletion and the same download are
+    // also spelled `rm -fr`, `rm -r -f`, `rm --recursive --force` and
+    // `sh -c "$(curl …)"`.
+    pattern:
+      /\b(rm -rf|rm\s{1,4}(?:-fr|-r\s{1,4}-f|-f\s{1,4}-r|--recursive\s{1,4}--force|--force\s{1,4}--recursive)|chmod -R|(?:curl|wget)(?:\s{1,4}[^\s|]{1,200}){1,6}\s{0,4}\|\s{0,4}(?:sudo\s{1,4})?(?:sh|bash|zsh|python[0-9.]{0,4})|(?:ba|z)?sh\s{1,4}-c\s{0,4}["']?\$\(\s{0,4}(?:curl|wget)|cat ~\/|\/bin\/(sh|bash)\b|nc -e|bash -c)\b/,
     baseSeverity: 'high',
     baseConfidence: 'strong',
     title: 'Shell command embedded in tool metadata',

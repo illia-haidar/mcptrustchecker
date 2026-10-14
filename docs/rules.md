@@ -1,6 +1,6 @@
 # Rule catalogue
 
-Every rule MCP Trust Checker can emit (84 total). Run `mcptrustchecker rules` for the same list, or `mcptrustchecker explain <id>` for one rule.
+Every rule MCP Trust Checker can emit (86 total). Run `mcptrustchecker rules` for the same list, or `mcptrustchecker explain <id>` for one rule.
 
 Rules marked **[capability]** describe blast-radius and raise the Capability level; they do **not** lower the Trust grade. Rules of severity `info` carry weight 0 and are filtered out before any penalty — they report a coverage or hygiene fact the reader needs, and deliberately move no points. Everything else is a scored trust threat.
 
@@ -41,6 +41,7 @@ Rules marked **[capability]** describe blast-radius and raise the Capability lev
 | `MTC-INJ-SHADOW-4` | low | Assertive tool self-preference | Comparative self-promotion ("only correct tool", "use this instead of the X tool") — common in legit docs; a confidence-axis nudge that escalates only with secrecy/override. |
 | `MTC-INJ-SEM-1` | medium | Concealment directive (language-agnostic) | A negation/stealth marker, a disclosure verb and a user referent co-occur — "keep this from the person" detected as a shape, so paraphrase and non-English wording are still caught. |
 | `MTC-INJ-SCHEMA-1` | medium | Description names an unreachable credential store | Tool prose references SSH keys, cloud credentials or a keychain that nothing in its input schema can address — the interface contradicts the description. |
+| `MTC-INJ-ESCALATE-1` | high | Permission self-escalation directive | Metadata tells the model to grant itself destructive permission (allowDestructive*: true) and/or to empty the confirmation list (requireConfirmation*: []) — both together, or as the reaction to the guard refusing. |
 | `MTC-SRC-004` | high | Obfuscated / encoded payload in server code | Decode-and-execute of an encoded blob, or \x-escaped / fromCharCode runs hiding logic from review. |
 | `MTC-SRC-009` | medium | Untrusted input concatenated into a command sink | A shell/process command assembled by concatenation or interpolation — the command-injection flow, not mere presence of a sink. |
 | `MTC-SRC-010` | high | Dynamic evaluation of a non-literal value | eval / new Function applied to a variable or expression rather than a fixed literal — a direct RCE primitive. **[capability]** |
@@ -94,6 +95,7 @@ Rules marked **[capability]** describe blast-radius and raise the Capability lev
 | `MTC-SUP-013` | low | Package not version-pinned | Installed with @latest/floating spec — the rug-pull enabler; pinning is the recommended control. |
 | `MTC-SUP-014` | medium | Dependency squat / advisory match | A declared dependency resembles a protected package or matches a known advisory by name. |
 | `MTC-SUP-015` | medium | Pinned version is not published in the registry | An exact pinned version is not listed by the registry; the scanner refuses to substitute latest and flags the gap. |
+| `MTC-SUP-016` | info | Attestation repository differs from the declared repository | The PyPI (PEP 740) attestation of the scanned file names a different repository than the package's project_urls (compared case-insensitively), so it is not counted as publisher verification. Recorded, never scored. |
 | `MTC-NET-001` | critical | Known-vulnerable version | Installed version is in a known-CVE range. Severity and confidence come from the advisory itself — a critical CVE is reported confirmed-critical and gates the grade at F. |
 | `MTC-TOFU-001` | high | Surface drift since pin (rug pull) | Canonical fingerprint no longer matches the pinned value. |
 | `MTC-TOFU-002` | critical | Package republished with different content at the same version | The verified artifact hash for the pinned version changed — same version, different published bytes (byte-level rug pull). |

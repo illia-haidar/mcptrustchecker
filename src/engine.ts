@@ -26,6 +26,7 @@ import { CAPABILITY_NOTE, isCapabilityRule } from './scoring/model.js';
 import { createHash } from 'node:crypto';
 import { computeCapabilityProfile } from './scoring/capability.js';
 import { computeCoverage } from './scoring/coverage.js';
+import { buildReportSurface } from './report/surface.js';
 import { METHODOLOGY_VERSION, TOOL_NAME, TOOL_VERSION } from './version.js';
 
 export interface ScanOptions {
@@ -39,6 +40,13 @@ export interface ScanOptions {
   scannedAt?: string;
   /** Tool names from other servers in the same scan (cross-server collision). */
   siblingTools?: { server: string; name: string }[];
+  /**
+   * `true` attaches the scanned surface to the report (`report.surface`, the
+   * CLI's `--surface`): the tools, prompts and resources the score was computed
+   * on, bounded by `SURFACE_LIMITS`. Off by default, and a report without it is
+   * exactly what it was before the option existed.
+   */
+  surface?: boolean;
 }
 
 const SEVERITIES: Severity[] = ['critical', 'high', 'medium', 'low', 'info'];
@@ -88,6 +96,9 @@ function sanitizeSurface(s: ServerSurface): ServerSurface {
 /** Run the full pipeline over a normalized surface. */
 export async function scanSurface(rawSurface: ServerSurface, options: ScanOptions = {}): Promise<ScanReport> {
   const surface = sanitizeSurface(rawSurface);
+  // Taken here, after normalization and before any stage runs: the surface the
+  // score is computed on, as it was read.
+  const reportSurface = options.surface === true ? buildReportSurface(surface) : undefined;
   const config = resolveConfig(options.config);
   const capabilities = extractCapabilities(surface, config);
   const ctx = { surface, config, capabilities, siblingTools: options.siblingTools ?? [] };
@@ -240,7 +251,7 @@ export async function scanSurface(rawSurface: ServerSurface, options: ScanOption
   // The three client-adoption-risk inputs are all known here, so the final
   // score assembly lives at the point where capability, coverage and
   // verification are settled — the score EVOLVES the threat score with them.
-  const capabilityProfile = computeCapabilityProfile(capabilities, flows, findings);
+  const capabilityProfile = computeCapabilityProfile(capabilities, flows, findings, surface);
   const verification = resolveVerification(surface);
   const coverage = computeCoverage(surface, verification);
   const score = computeScore(findings, {
@@ -274,6 +285,7 @@ export async function scanSurface(rawSurface: ServerSurface, options: ScanOption
       resources: surface.resources.length,
       findingsBySeverity,
     },
+    ...(reportSurface ? { surface: reportSurface } : {}),
   };
 }
 

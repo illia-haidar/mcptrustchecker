@@ -50,6 +50,33 @@ function fail(msg: string, code = 2): never {
   process.exit(code);
 }
 
+/**
+ * The registry, or its artifact host, did not answer THIS time — a 429 / 5xx, a
+ * timeout, a dropped connection (`RegistryUnavailableError` with `retryable`).
+ * That is not a usage error (exit 2 means "fix the pipeline"), and it is not a
+ * bug either, so it exits 3 — the code the top-level catch documents for "retry
+ * on a transient fetch" — without the "internal error … This is a bug" lines.
+ * The message is the error's own: a scan queue reading stderr matches "the
+ * registry answered HTTP 503", "could not be reached", "artifact download
+ * failed: HTTP 503" and "retry shortly" to reschedule rather than give up.
+ *
+ * A NON-retryable refusal (401, 403, …) keeps exit 2 by way of fail(): retrying
+ * will not change the answer, and what has to change — a token, a proxy, the
+ * name — is on the caller's side.
+ *
+ * Recognised by its `code` + `retryable` contract rather than the class, so an
+ * error that crossed a module boundary still counts.
+ */
+function isRetryableUnavailable(err: unknown): boolean {
+  const e = err as { code?: unknown; retryable?: unknown } | null;
+  return e !== null && typeof e === 'object' && e.code === 'MTC_REGISTRY_UNAVAILABLE' && e.retryable === true;
+}
+
+function failRetryable(msg: string): never {
+  process.stderr.write(`${c.yellow('mcptrustchecker: temporary failure')} ${msg}\n`);
+  process.exit(3);
+}
+
 function printHelp(): void {
   process.stdout.write(
     `${c.bold('MCP Trust Checker')} ${TOOL_VERSION} — local-first MCP security scanner (methodology ${METHODOLOGY_VERSION})
@@ -80,6 +107,8 @@ ${c.bold('Output')}
   --sarif                          SARIF 2.1.0 (GitHub code scanning)
   --md, --markdown                 Markdown (PR comments / summaries)
   --badge                          shields.io endpoint JSON
+  --surface                        with --json: add the scanned tools, prompts and resources
+                                   (descriptions, schemas, where each tool is registered)
   -o, --output <file>              write output to a file
 
 ${c.bold('CI gates')}
@@ -126,6 +155,7 @@ async function main(): Promise<number | void> {
         md: { type: 'boolean' },
         markdown: { type: 'boolean' },
         badge: { type: 'boolean' },
+        surface: { type: 'boolean' },
         output: { type: 'string', short: 'o' },
         'fail-under': { type: 'string' },
         'min-grade': { type: 'string' },
@@ -247,6 +277,8 @@ async function main(): Promise<number | void> {
   }
 
   let resolved: ResolvedTarget[] = [];
+  /** Set when auto-discovery skipped a config on a retryable registry failure. */
+  let partialRetry: string | undefined;
   if (autoDiscover) {
     // Zero-config: find and scan every installed MCP client config.
     const configs = discoverClientConfigs();
@@ -266,18 +298,31 @@ async function main(): Promise<number | void> {
       `${c.gray('Discovered')} ${configs.length} MCP config(s): ${configs.map((x) => x.client).join(', ')}\n` +
         (values.run ? '' : `${c.gray('(static scan; add')} ${c.bold('--run')}${c.gray(' to spawn servers and analyze tool descriptions)')}\n`),
     );
+    // One config failing does not stop the others. But when NOTHING resolved and
+    // a registry hiccup is among the reasons, "no MCP servers found" (exit 2)
+    // would be false: a retry can find them, so say that and exit 3. When some
+    // did resolve, they are scanned and printed, and the run still exits 3: a
+    // gate (--min-grade, --fail-under, a policy) judged on a partial set would
+    // pass a CI job whose failing server was the one the outage hid.
+    let retryableSkip: string | undefined;
     for (const cfg of configs) {
       try {
         resolved.push(...(await resolveTargets(cfg.path, resolveOpts)));
       } catch (err) {
+        if (isRetryableUnavailable(err)) retryableSkip ??= (err as Error).message;
         process.stderr.write(`${c.yellow('!')} skipped ${cfg.path}: ${(err as Error).message}\n`);
       }
     }
+    if (resolved.length === 0 && retryableSkip !== undefined) {
+      failRetryable(`no discovered config could be scanned — ${retryableSkip}`);
+    }
     if (resolved.length === 0) fail('no MCP servers found in the discovered configs.');
+    partialRetry = retryableSkip;
   } else {
     try {
       resolved = await resolveTargets(scanTarget, resolveOpts);
     } catch (err) {
+      if (isRetryableUnavailable(err)) failRetryable((err as Error).message);
       fail((err as Error).message);
     }
   }
@@ -313,6 +358,7 @@ async function main(): Promise<number | void> {
       lockfile: values['no-lock'] ? undefined : lock,
       scannedAt: new Date().toISOString(),
       siblingTools,
+      ...(values.surface ? { surface: true } : {}),
     });
     reports.push(report);
   }
@@ -351,6 +397,13 @@ async function main(): Promise<number | void> {
   // Return the exit code instead of process.exit() — exit() can truncate a large
   // stdout write to a pipe before it flushes (invalid JSON/SARIF). Letting main
   // resolve lets Node flush stdout, then the entrypoint sets process.exitCode.
+  if (partialRetry !== undefined) {
+    process.stderr.write(
+      `${c.yellow('mcptrustchecker: temporary failure')} some discovered configs could not be scanned, so no gate was ` +
+        `evaluated — ${partialRetry}\n`,
+    );
+    return 3;
+  }
   return computeExitCode(command, reports, values, fileConfig);
 }
 

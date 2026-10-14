@@ -33,6 +33,19 @@ function isSinkCap(c: ToolCapability): boolean {
   return c.tags.includes('external-sink') || c.tags.includes('code-exec');
 }
 
+/**
+ * The tool takes in untrusted input by something other than its prose: its
+ * name, a parameter, a declared hint, its handler. A description that mentions
+ * a download ("upload a small object, download it, and compare") names a step,
+ * not an entry point — on its own it does not complete a single-tool primitive.
+ * A capability without recorded sources (a live or hand-built one) counts as before.
+ */
+function ingestsOperatively(c: ToolCapability): boolean {
+  if (!c.tags.includes('untrusted-input')) return false;
+  const from = c.sources?.['untrusted-input'];
+  return !from || from.some((s) => s !== 'description');
+}
+
 export function analyzeToxicFlows(ctx: DetectorContext): FlowAnalysis {
   const caps: ToolCapability[] = [...ctx.capabilities];
   if (ctx.config.includeBuiltins) {
@@ -44,15 +57,17 @@ export function analyzeToxicFlows(ctx: DetectorContext): FlowAnalysis {
   const sinks = caps.filter(isSinkCap).map((c) => c.tool);
 
   const selfTrifecta = caps.filter(
-    (c) => c.tags.includes('untrusted-input') && c.tags.includes('sensitive-source') && isSinkCap(c),
+    (c) => ingestsOperatively(c) && c.tags.includes('sensitive-source') && isSinkCap(c),
   );
   const selfTrifectaNames = new Set(selfTrifecta.map((c) => c.tool));
+  // A tool whose only untrusted leg is prose still reads and sends: that is
+  // read-and-egress (a capability), not the self-contained primitive.
   const selfExfil = caps.filter(
     (c) =>
       !selfTrifectaNames.has(c.tool) &&
       c.tags.includes('sensitive-source') &&
       isSinkCap(c) &&
-      !c.tags.includes('untrusted-input'),
+      !ingestsOperatively(c),
   );
 
   const fullTrifectaPresent = untrusted.length > 0 && sources.length > 0 && sinks.length > 0;

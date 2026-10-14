@@ -9,7 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-3c873a.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/package.json)
 [![Methodology](https://img.shields.io/badge/methodology-mcptrustchecker--1.15-6f42c1.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/docs/methodology.md)
-[![Tests](https://img.shields.io/badge/tests-666%20passing-brightgreen.svg)](https://github.com/illia-haidar/mcptrustchecker/tree/main/test)
+[![Tests](https://img.shields.io/badge/tests-939%20passing-brightgreen.svg)](https://github.com/illia-haidar/mcptrustchecker/tree/main/test)
 [![Rules](https://img.shields.io/badge/rules-84-orange.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/docs/rules.md)
 [![No account](https://img.shields.io/badge/account-not%20required-brightgreen.svg)](#why-this-is-different)
 [![Offline](https://img.shields.io/badge/runs-100%25%20offline-brightgreen.svg)](#why-this-is-different)
@@ -37,7 +37,7 @@ npx mcptrustchecker                # 🔍 scan every MCP server you already have
 
 ## What makes the algorithm unique
 
-The **Capability-Flow Trust Model** (methodology `mcptrustchecker-1.16`) is an **original algorithm designed from scratch for this project** by [Illia Haidar](https://mcptrustchecker.com) — it is not a wrapper around, or derivative of, any existing scanner or methodology. It is named, versioned, fully specified in docs/methodology.md, and citable via [CITATION.cff](CITATION.cff).
+The **Capability-Flow Trust Model** (methodology `mcptrustchecker-1.16.1`) is an **original algorithm designed from scratch for this project** by [Illia Haidar](https://mcptrustchecker.com) — it is not a wrapper around, or derivative of, any existing scanner or methodology. It is named, versioned, fully specified in docs/methodology.md, and citable via [CITATION.cff](CITATION.cff).
 
 **It is refined against 30,000+ real MCP servers — and still improving.** The model is not theoretical: it is calibrated on a continuously-scanned corpus of **30,000+ MCP servers** published on npm and PyPI. Each revision comes from a **full-population audit** of that corpus — every server in a grade band re-examined for *both* false positives (benign code graded down) and false negatives (real threats graded up), each change measured against the threats it must keep catching, and the whole corpus re-scanned before the version ships. That loop produced `mcptrustchecker-1.9`, which moved "evaluating a runtime value" off the threat axis after the data showed it was charging capability as malice. The corpus keeps growing and the audits keep running, so the methodology is expected to keep tightening — which is why every score carries the version that produced it.
 
@@ -68,7 +68,7 @@ Real output, `mcptrustchecker scan test/fixtures/poisoned-server.json`:
    │  GRADE  F  │   Trust Score 46/100   (client adoption risk · threat 50)
    ╰────────────╯   Capability MINIMAL   (blast radius)
                     Coverage MANIFEST   (static tool list only — no source)
-   methodology mcptrustchecker-1.16
+   methodology mcptrustchecker-1.16.1
 
 Threats    2 critical · 4 high · 2 medium
 
@@ -165,12 +165,15 @@ mcptrustchecker scan ./server-1.2.0.tgz                    # a packed release ar
 mcptrustchecker scan ./tools.json --sarif > mcptrustchecker.sarif   # GitHub code scanning
 mcptrustchecker scan ./tools.json --md    > report.md        # PR comment
 mcptrustchecker scan ./tools.json --json  > report.json      # machine-readable
+mcptrustchecker scan ./tools.json --json --surface > report.json   # + the scanned tools themselves
 mcptrustchecker scan ./tools.json --badge > badge.json       # shields.io endpoint
 mcptrustchecker scan ./tools.json --fail-under 80            # exit 1 below a threshold
 mcptrustchecker scan ./tools.json --min-grade B             # exit 1 below a grade
 ```
 
 The terminal report is **detailed by default** — every finding prints its full description (**what** the problem is and **why** it matters), the exact location, the offending **evidence**, a **fix**, and its OWASP mapping, grouped most-severe-first. Add `--details` for external references, or `--quiet` for just the grade line.
+
+`--surface` adds a `surface` field to the JSON report: the tools, prompts and resources the score was computed on — each tool's description, `inputSchema`, `outputSchema` and annotations as read, and, for tools recovered from source, the file and line that registers them — with `provenance` (`live` / `manifest` / `static`). It is capped at 500 tools, 8,000 characters per description and 64 KB per schema, and every cut is listed in `surface.truncated`. Without the flag the report is unchanged; in the library it is `scanSurface(surface, { surface: true })`.
 
 **No install? Scan it in the browser.** The **[online scanner](https://mcptrustchecker.com/scan)** runs this exact engine with no signup and no key. Paste an npm or PyPI package name, a GitHub repository, a live remote endpoint (OAuth sign-in supported), a `tools.json` manifest — or your whole client config (`claude_desktop_config.json`, `.cursor/mcp.json`), and every server in it is graded at once. Each result gets a shareable link and a live Trust Score badge for your README.
 
@@ -328,11 +331,11 @@ Three subtract-only terms, each **one itemized line** in `vector` — no black b
 
 | Term | Meaning (the client's risk in adopting) | Points |
 | --- | --- | --- |
-| **E_cap** — capability exposure | blast radius if the model driving the server is manipulated | minimal 0 · moderate 3 · high 6 · critical 10 |
+| **E_cap** — capability exposure | blast radius if the model driving the server is manipulated | minimal 0 · moderate 3 · high 6 · critical 10 — reading outside content alone (search, fetch from a fixed API) is minimal and listed as an observation; a destination the model chooses (an unpinned `url`/`host`) is moderate |
 | **E_ver** — verification discount | how verifiable the *source* is (build provenance / vendor scope / public repo) | vendor 0 · provenance 0 · public repo 1 · none 5 (**2** when the shipped source was fully read — the gap is a missing repo *link*, not the code) · **unknown → term skipped** |
 | **E_cov** — coverage honesty | how much of the target the scan could actually inspect | live 0 · source 0 · manifest 4 · metadata 8 · **empty 25** |
 
-- **Verification is an engine signal**, computed from the fetched npm/PyPI document (Sigstore/SLSA provenance + vendor-owned scope) on an `--online` scan — identical logic in the CLI, the registry and the hosted API, so every mode agrees. An **offline** scan cannot check provenance, so verification is `unknown`, the term is **skipped**, and a coverage caveat records the omission — an unchecked signal never reads as clean.
+- **Verification is an engine signal**, computed from the fetched npm/PyPI document (Sigstore/SLSA provenance + vendor-owned scope; for PyPI, the PEP 740 attestation of the scanned file from PyPI's integrity API, counted only when its repository matches the declared one) on an `--online` scan — identical logic in the CLI, the registry and the hosted API, so every mode agrees. An **offline** scan cannot check provenance, so verification is `unknown`, the term is **skipped**, and a coverage caveat records the omission — an unchecked signal never reads as clean.
 - The terms are **subtract-only**, and their total reach is enumerated rather than asserted: across all 70 reachable clean states (every combination of capability, verification and coverage that a threat-clean target can actually occupy) the grade lands **52 A · 13 B · 5 C**, floor **70**. Exposure alone never costs a threat-clean server more than one band — except where the scan inspected nothing, which is the one case that must not read as clean. A test walks the whole lattice, so the claim cannot drift from the constants. The confirmed-critical **F-gate holds** regardless.
 - **Bands:** A 90–100 · B 80–89 · C 70–79 · D 60–69 · F 0–59.
 
@@ -352,7 +355,7 @@ const report  = await scanSurface(surface);
 
 report.score.grade;              // 'A' … 'F'
 report.score.score;              // 0 … 100
-report.score.methodologyVersion; // 'mcptrustchecker-1.16'  ← pin & display this
+report.score.methodologyVersion; // 'mcptrustchecker-1.16.1'  ← pin & display this
 report.toxicFlows;               // enumerated exfiltration primitives
 renderBadge(report);             // shields.io endpoint JSON for a live trust badge
 ```
@@ -463,7 +466,7 @@ Connecting to an MCP config can run arbitrary commands. MCP Trust Checker's acqu
 `mcptrustchecker.config.json` (auto-discovered) overrides any default — see [examples/mcptrustchecker.config.json](examples/mcptrustchecker.config.json). Two adoption features worth calling out:
 
 - **Baseline / suppressions** — waive a specific finding on a specific tool with a justification (`suppress: [{ rule, tool?, field?, reason }]`), or drop a standalone `.mtcignore` JSON array in your repo. Location-scoped waivers keep CI green without silencing a rule everywhere.
-- **Policy-as-code** — declare what "acceptable" means once and gate every scan on it: `policy: { minGrade, maxCapability, denyRules, denyCapabilities }`. Violations print and fail the run.
+- **Policy-as-code** — declare what "acceptable" means once and gate every scan on it: `policy: { minGrade, maxCapability, denyRules, denyCapabilities }`. Violations print and fail the run. Since 1.16.1, `maxCapability: "minimal"` passes a server that only reads outside content from a destination it fixes (a search API, a feed); to keep such servers out, deny the role itself with `denyCapabilities: ["untrusted-input"]`, which works on tags and is unchanged.
 
 ---
 

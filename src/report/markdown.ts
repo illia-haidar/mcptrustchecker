@@ -33,6 +33,11 @@ export function renderMarkdown(report: ScanReport): string {
     md.push('>');
     md.push(`> Capability: ${report.capabilityProfile.reasons.join('; ')}.`);
   }
+  // What the level does not price (no points, not a finding) gets its own line.
+  for (const o of report.capabilityProfile.observations ?? []) {
+    md.push('>');
+    md.push(`> Observed: ${mdInline(o)}.`);
+  }
   md.push('');
   md.push(
     `**Target:** \`${mdInline(report.target.id)}\` (${report.target.source.kind}) · ` +

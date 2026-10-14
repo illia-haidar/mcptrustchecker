@@ -119,7 +119,7 @@ function primary(ctx: FileCtx, e: string, scope: FoldScope | undefined, depth: n
   if (str !== undefined) return { kind: 'literal', values: [str] };
   if (e.startsWith('`') && e.endsWith('`') && e.length >= 2) return foldTemplate(ctx, e.slice(1, -1), scope, depth, hops, '${', '}');
   const fstr = /^[fF][rR]?(['"])([\s\S]*)\1$/.exec(e) ?? /^[rR][fF](['"])([\s\S]*)\1$/.exec(e);
-  if (py && fstr) return foldTemplate(ctx, fstr[2]!, scope, depth, hops, '{', '}');
+  if (py && fstr) return foldTemplate(ctx, fstr[2]!, scope, depth, hops, '{', '}', /^(?:[fF][rR]|[rR][fF])/.test(e));
   if (/^-?\d+(?:\.\d+)?$/.test(e)) return { kind: 'literal', values: [e] };
   if (/^(?:true|false|null|undefined|None|True|False)$/.test(e)) return { kind: 'literal', values: [e] };
 
@@ -222,7 +222,7 @@ function primary(ctx: FileCtx, e: string, scope: FoldScope | undefined, depth: n
   return UNKNOWN;
 }
 
-function foldTemplate(ctx: FileCtx, body: string, scope: FoldScope | undefined, depth: number, hops: number, open: string, close: string): Folded {
+function foldTemplate(ctx: FileCtx, body: string, scope: FoldScope | undefined, depth: number, hops: number, open: string, close: string, raw = false): Folded {
   const parts: Folded[] = [];
   let i = 0;
   let text = '';
@@ -251,8 +251,10 @@ function foldTemplate(ctx: FileCtx, body: string, scope: FoldScope | undefined, 
       continue;
     }
     if (body[i] === '\\' && i + 1 < body.length) {
-      text += body[i + 1];
-      i += 2;
+      // A raw f-string keeps its backslashes; any other reads as the language reads it.
+      const [v, n] = raw ? [body.slice(i, i + 2), 2] : escapeAt(body, i, ctx.lang === 'py', false);
+      text += v;
+      i += n;
       continue;
     }
     text += body[i];
@@ -340,11 +342,15 @@ function joinPath(...segs: string[]): string {
 /** Read a plain (non-template) string literal that spans the whole expression. */
 function readStringLiteral(e: string, py: boolean): string | undefined {
   let s = e;
+  let raw = false;
   if (py) {
     const pre = /^[rRbBuU]{1,2}(?=['"])/.exec(s);
-    if (pre) s = s.slice(pre[0].length);
+    if (pre) {
+      s = s.slice(pre[0].length);
+      raw = /[rR]/.test(pre[0]);
+    }
     for (const q of ['"""', "'''"]) {
-      if (s.startsWith(q) && s.endsWith(q) && s.length >= 6) return s.slice(3, -3);
+      if (s.startsWith(q) && s.endsWith(q) && s.length >= 6) return raw ? s.slice(3, -3) : decodeEscapes(s.slice(3, -3), true);
     }
   }
   const q = s[0];
@@ -355,7 +361,129 @@ function readStringLiteral(e: string, py: boolean): string | undefined {
     if (body[i] === '\\') { i++; continue; }
     if (body[i] === q) return undefined;
   }
-  return body.replace(/\\(.)/g, (_m, c: string) => (c === 'n' ? '\n' : c === 't' ? '\t' : c));
+  return raw ? body : decodeEscapes(body, py);
+}
+
+/**
+ * Python's `\N{…}` names this decoder knows: the invisible and direction
+ * characters the Unicode rules look for, and the punctuation descriptions use.
+ * An unknown name is kept as written.
+ */
+const PY_CHAR_NAMES: Record<string, number> = {
+  'ZERO WIDTH SPACE': 0x200b, 'ZERO WIDTH NON-JOINER': 0x200c, 'ZERO WIDTH JOINER': 0x200d, 'WORD JOINER': 0x2060,
+  'ZERO WIDTH NO-BREAK SPACE': 0xfeff, 'BYTE ORDER MARK': 0xfeff, 'SOFT HYPHEN': 0x00ad, 'COMBINING GRAPHEME JOINER': 0x034f,
+  'MONGOLIAN VOWEL SEPARATOR': 0x180e, 'FUNCTION APPLICATION': 0x2061, 'INVISIBLE TIMES': 0x2062, 'INVISIBLE SEPARATOR': 0x2063,
+  'INVISIBLE PLUS': 0x2064, 'HANGUL FILLER': 0x3164, 'ARABIC LETTER MARK': 0x061c,
+  'LEFT-TO-RIGHT MARK': 0x200e, 'RIGHT-TO-LEFT MARK': 0x200f, 'LEFT-TO-RIGHT EMBEDDING': 0x202a, 'RIGHT-TO-LEFT EMBEDDING': 0x202b,
+  'POP DIRECTIONAL FORMATTING': 0x202c, 'LEFT-TO-RIGHT OVERRIDE': 0x202d, 'RIGHT-TO-LEFT OVERRIDE': 0x202e,
+  'LEFT-TO-RIGHT ISOLATE': 0x2066, 'RIGHT-TO-LEFT ISOLATE': 0x2067, 'FIRST STRONG ISOLATE': 0x2068, 'POP DIRECTIONAL ISOLATE': 0x2069,
+  'NO-BREAK SPACE': 0x00a0, 'EM DASH': 0x2014, 'EN DASH': 0x2013, 'BULLET': 0x2022, 'HORIZONTAL ELLIPSIS': 0x2026,
+  'LEFT SINGLE QUOTATION MARK': 0x2018, 'RIGHT SINGLE QUOTATION MARK': 0x2019, 'LEFT DOUBLE QUOTATION MARK': 0x201c,
+  'RIGHT DOUBLE QUOTATION MARK': 0x201d, 'RIGHTWARDS ARROW': 0x2192, 'MIDDLE DOT': 0x00b7, 'DEGREE SIGN': 0x00b0,
+  'MULTIPLICATION SIGN': 0x00d7, 'CHECK MARK': 0x2713, 'HEAVY CHECK MARK': 0x2714, 'WARNING SIGN': 0x26a0,
+};
+
+/** The printable ASCII names (U+0020–U+007E) as Unicode spells them; `TAG <name>` is the same character + U+E0000. */
+const ASCII_NAMES = [
+  'SPACE', 'EXCLAMATION MARK', 'QUOTATION MARK', 'NUMBER SIGN', 'DOLLAR SIGN', 'PERCENT SIGN', 'AMPERSAND', 'APOSTROPHE',
+  'LEFT PARENTHESIS', 'RIGHT PARENTHESIS', 'ASTERISK', 'PLUS SIGN', 'COMMA', 'HYPHEN-MINUS', 'FULL STOP', 'SOLIDUS',
+  'DIGIT ZERO', 'DIGIT ONE', 'DIGIT TWO', 'DIGIT THREE', 'DIGIT FOUR', 'DIGIT FIVE', 'DIGIT SIX', 'DIGIT SEVEN', 'DIGIT EIGHT', 'DIGIT NINE',
+  'COLON', 'SEMICOLON', 'LESS-THAN SIGN', 'EQUALS SIGN', 'GREATER-THAN SIGN', 'QUESTION MARK', 'COMMERCIAL AT',
+  ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map((c) => `LATIN CAPITAL LETTER ${c}`),
+  'LEFT SQUARE BRACKET', 'REVERSE SOLIDUS', 'RIGHT SQUARE BRACKET', 'CIRCUMFLEX ACCENT', 'LOW LINE', 'GRAVE ACCENT',
+  ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map((c) => `LATIN SMALL LETTER ${c}`),
+  'LEFT CURLY BRACKET', 'VERTICAL LINE', 'RIGHT CURLY BRACKET', 'TILDE',
+];
+const TAG_NAMES = new Map(ASCII_NAMES.map((n, i) => [`TAG ${n}`, 0xe0020 + i]));
+
+/**
+ * A Python `\N{…}` name: the table above, the systematic names of the Tags
+ * block (`TAG LATIN SMALL LETTER I`, `LANGUAGE TAG`, `CANCEL TAG`) and the
+ * variation selectors (`VARIATION SELECTOR-17`) — the invisible channels the
+ * Unicode rules decode. Python matches names case-insensitively.
+ */
+function pyNamedChar(raw: string): number | undefined {
+  const name = raw.toUpperCase().replace(/\s+/g, ' ').trim();
+  const known = PY_CHAR_NAMES[name] ?? TAG_NAMES.get(name);
+  if (known !== undefined) return known;
+  if (name === 'LANGUAGE TAG') return 0xe0001;
+  if (name === 'CANCEL TAG') return 0xe007f;
+  const vs = /^VARIATION SELECTOR-(\d{1,3})$/.exec(name);
+  if (vs) {
+    const n = Number(vs[1]);
+    if (n >= 1 && n <= 16) return 0xfe00 + n - 1;
+    if (n >= 17 && n <= 256) return 0xe0100 + n - 17;
+  }
+  return undefined;
+}
+
+const ESCAPE = /\\(?:u\{([0-9a-fA-F]{1,6})\}|u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|x([0-9a-fA-F]{2})|N\{([A-Za-z][A-Za-z0-9 -]{0,79})\}|([0-7]{1,3})|(\r\n|[\s\S]))/y;
+
+/**
+ * The escape sequence starting at `s[i]` (a backslash): its value and its
+ * length, as JavaScript (or Python, `py`) reads it — `\u4E0A`, `\u{1F600}`,
+ * `\x41`, Python's `\U0001F600` and `\N{ZERO WIDTH SPACE}`. Two deliberate
+ * departures: the letter controls `\b` `\f` `\v` `\0` (and Python's `\a`) stay as written —
+ * in prose they are a regex `\b` the author meant far more often than a control
+ * character, while a hex or Unicode escape is how one is encoded on purpose —
+ * and a code point out of range stays as written.
+ */
+export function escapeAt(s: string, i: number, py: boolean, octal = true): [string, number] {
+  ESCAPE.lastIndex = i;
+  const m = ESCAPE.exec(s);
+  if (!m) return ['\\', 1];
+  const len = m[0].length;
+  const asWritten: [string, number] = [m[0], len];
+  const cp = (hex: string): [string, number] => {
+    const n = parseInt(hex, 16);
+    return n <= 0x10ffff ? [String.fromCodePoint(n), len] : asWritten;
+  };
+  if (m[1] !== undefined) return py ? asWritten : cp(m[1]);
+  if (m[2] !== undefined) return cp(m[2]);
+  // `\U` and `\N{…}` are Python's; in JavaScript the backslash just drops.
+  if (m[3] !== undefined) return py ? cp(m[3]) : [m[0].slice(1), len];
+  if (m[4] !== undefined) return cp(m[4]);
+  if (m[5] !== undefined) {
+    if (!py) return [m[0].slice(1), len];
+    const n = pyNamedChar(m[5]);
+    return n === undefined ? asWritten : [String.fromCodePoint(n), len];
+  }
+  if (m[6] !== undefined) {
+    // Octal: `\255` is U+00AD in Python and in a (sloppy-mode) JavaScript string.
+    // A lone `\0` stays as written (see above); JavaScript stops at 0o377, so
+    // `\400` is `\40` + "0" there; a template literal has no octal escapes.
+    const digits = m[6];
+    if (digits === '0') return asWritten;
+    if (py) return [String.fromCodePoint(parseInt(digits, 8)), len];
+    if (!octal) return [digits[0]!, 2];
+    const take = parseInt(digits, 8) <= 0o377 ? digits : digits.slice(0, 2);
+    return [String.fromCodePoint(parseInt(take, 8)), take.length + 1];
+  }
+  const c = m[7]!;
+  if (c === '\n' || c === '\r\n') return ['', len]; // a line continuation
+  if (c === 'n') return ['\n', len];
+  if (c === 't') return ['\t', len];
+  if (c === 'r') return ['\r', len];
+  if ('bfv0'.includes(c) || (py && c === 'a')) return asWritten;
+  if (c === '\\' || c === "'" || c === '"') return [c, len];
+  // JavaScript drops the backslash of any other escape; Python keeps it.
+  return py ? asWritten : [c, len];
+}
+
+/**
+ * Decode every escape sequence in a string literal's body (see {@link escapeAt}).
+ * `octal: false` for a JavaScript template literal, where `\1`… are not escapes.
+ */
+export function decodeEscapes(s: string, py = false, octal = true): string {
+  if (!s.includes('\\')) return s;
+  let out = '';
+  let last = 0;
+  for (let i = s.indexOf('\\'); i >= 0; i = s.indexOf('\\', last)) {
+    const [v, n] = escapeAt(s, i, py, octal);
+    out += s.slice(last, i) + v;
+    last = i + n;
+  }
+  return out + s.slice(last);
 }
 
 function stripParens(e: string): string {

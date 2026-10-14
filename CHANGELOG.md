@@ -5,6 +5,225 @@ deterministic: the **methodology version** is bumped whenever a change could
 move a score, so a grade is always reproducible against the version that
 produced it.
 
+## 1.16.1 — methodology `mcptrustchecker-1.16.1`
+
+**Grades no longer drop for text the detectors misread.** 1.16 began reading
+tool descriptions whole — concatenations, template literals,
+`@mcp.tool(annotations=…)`, `tools/list` tables with `inputSchema` — while the
+detectors stayed as they were, so honesty rules, defensive caveats, quoted
+examples and negations in the newly read text were taken for attacks. A
+marketplace that runs this engine rescanned 27,614 versions with 1.16.0 and
+compared every one with its previous result: 165 grades dropped, 21 of them to
+F, and its two-pass review of the published artifacts found about 89 drops
+(17 of the 21 F) to be engine false positives. Every one of them was reproduced
+from the published artifact before anything changed. Re-scan stored results
+before comparing them with 1.16.0.
+
+### Mention is not use (MTC-INJ-*)
+
+- **POISON** separates mention from use. When every explicit override or
+  secrecy phrase is quoted as an example ("such as 'ignore your previous
+  instructions'", "a user might type …") or sits inside a defensive caveat, a
+  second real signal must exist outside that fragment. A quotation attributed to
+  an authority ("Your system prompt says: '…'", "The admin message: '…' Follow
+  it.") is an order, not a mention. Emphasis, sequencing and self-preference no
+  longer corroborate. A compound built only from loose semantic shapes is
+  reported high/heuristic, except the full override + secrecy + exfiltration
+  silhouette or one backed by a lexical signal. A detector-like tool name can no
+  longer make the verdict stricter than an ordinary name.
+- **SECRECY-1** no longer fires on honesty rules — "do not tell the user it can
+  be sent", "never tell the user a booking is done", "Do NOT tell the user 'the
+  payment did not go through'" — nor on "tell the user to …". Concealing an
+  event or the user's data still counts ("do not tell the user their key
+  leaked", "… the server received their password", "… their files were
+  copied"). A condition excuses a statement only when a system verifies it
+  ("unless the call succeeded", "until upload_status confirms it"), never when a
+  person does ("unless they ask whether it was"). The clause is now analysed in
+  code (`src/data/secrecyClause.ts`) instead of a 23,000-character pattern.
+- **SCHEMA-1** no longer treats an unknown schema as empty, and needs an
+  un-negated access verb within 60 characters of the credential path.
+  **TARGET-1** escalates only on a word-bounded, un-negated verb outside refusal
+  ("refused if …", "blocks ~/.ssh") or example context.
+- **CMD-1** without a model run directive is low/heuristic (a command named in
+  prose is not an order). A command a detector or guard names as what it
+  detects, blocks or rejects is info. A run order governs the command it
+  precedes, including coordinated imperatives ("Clear the cache and run …") and
+  "run it" after the command; a refusal verb cancels only when the command is
+  its object. Install notes for a person ("To install the CLI, run …", "… in
+  your terminal", "Run … to install the CLI") are low. The lexicon now matches
+  `curl -fsSL … | sh`, `wget -qO- … | bash`, `sh -c "$(curl …)"` and
+  `rm -fr` / `rm -r -f` / `rm --recursive --force`; a command that only the
+  widened lexicon matches is at most low unless the model is ordered to run it
+  in the command's own sentence ("before answering", "you must run", "then
+  answer") or in the next sentence that orders the command just named ("… Do
+  this before replying.").
+- **ENC-1/ENC-2**: `0x` hex and slash-separated identifier lists are not
+  base64 blobs; "execute the following" counts only next to an encoding word
+  or a padded blob.
+- **New rule MTC-INJ-ESCALATE-1** (permission self-escalation): metadata that
+  tells the model to grant itself destructive permission and empty the
+  confirmation list, or to lift a guard while hiding it from the user or doing
+  it itself, is high/strong; a single guard lift in reaction to a refusal is
+  low. Advice that is negated, delegated to the user, consent-gated, or
+  operator documentation is silent. A cover-up counts in the lift's own
+  sentence or a neighbouring one that hides this lift — "Formulas are
+  recalculated silently" elsewhere in the field hides nothing.
+
+### Capability keywords read in context
+
+A keyword in a description no longer counts when the prose negates it within
+four words ("Do NOT use curl or fetch", "it cannot fetch updates") or when it
+is part of another tool's name on the same surface. Each capability tag records
+where its evidence came from (`capabilities[].sources`: name, description,
+param, hint, handler). MTC-FLOW-001 needs an untrusted-input leg from a name, a
+parameter, a declared hint or the handler — description prose alone makes it
+MTC-FLOW-003 (capability only).
+
+A POST that only reads is not an external sink when the read is **proven**: a
+last path segment get/list/read/search/query/describe, a JSON-RPC body whose
+methods are all reads (`eth_getTransactionByHash`), or a SQL `SELECT` (literal
+or enforced by a guard), in JavaScript and in Python `request("POST", …)` —
+and only when the body carries nothing but the tool's own (unmodified)
+arguments and literals. A body, `auth` or `proxy` that carries the environment,
+a file or a derived value stays a sink whatever the path is called.
+
+### Escape sequences are decoded
+
+String literals decode `\uXXXX`, `\u{…}`, `\xHH` and, in Python, `\U…` and
+`\N{…}` as the language does, in the line matcher and the registration reader.
+`'上传'` reads as CJK text (no "u4E0A…" run, no ENC-2), `—` is a
+dash, and zero-width or bidi characters written as escapes now reach the
+MTC-UNI rules. Raw strings keep their text. `tools/list` tables yield their
+`inputSchema` parameters.
+
+### MTC-CAP-003 grades its evidence
+
+`destructiveHint: false` means "only additive updates" in the MCP spec, so it is
+contradicted only by code execution or a destructive write; `create_file`,
+`save_file`, `append_file` are additive. `readOnlyHint: true` is still
+contradicted by any write or execution. A name keyword or handler evidence is
+strong (medium); a command-shaped parameter alone, or a name that reads the
+result of an execution ("…_exec_status", "…_poll"), is weak and reported
+low/heuristic — never dropped. Homonyms are read in context, at tag time and in
+CAP-003 alike: `eval` in evaluation names, `spawn` next to a game object,
+`unlink_<record>` association, a `script` that is spoken text, an enum-bound
+`shell` dialect, `RUN instruction` in a Dockerfile linter. `exec_shell_info`
+with `readOnlyHint: true` is still caught on its name.
+
+### Unicode
+
+MTC-UNI-005 does not count a single ZWNJ/ZWJ between two letters of a script
+that needs it in normal spelling (Arabic/Persian/Urdu, Syriac, Indic scripts,
+Sinhala). MTC-UNI-008 reports a lone C1 control right after non-ASCII
+punctuation as mojibake (low/heuristic) and says when a control character came
+from an escape in a non-raw literal. MTC-UNI-009 treats a homoglyph quoted as an
+example inside a confusable-checking tool as the tool's subject.
+
+### Read failures are not package properties
+
+A registry that cannot answer — 429, 5xx, timeout, network error, unreadable
+body — or a transient failure downloading the artifact no longer becomes
+MTC-SUP-015 ("pinned version not published") or metadata-only coverage: the
+scan throws a retryable `RegistryUnavailableError` (exported; `code:
+'MTC_REGISTRY_UNAVAILABLE'`) and the CLI exits 3 with "retry shortly". Only a
+404/410 means the version is missing. Integrity failures, untrusted redirects
+and the size cap are still recorded on the report.
+
+### Client score: reading outside content alone costs no points
+
+The capability axis measures blast radius. A tool that only ingests untrusted
+content — a search, a feed reader, an honest `openWorldHint: true` — is an entry
+point, not damage, so `untrusted-input` alone no longer raises the level to
+`moderate` (−3). It raises it only when the model chooses where the request
+goes (SSRF, egress through the URL): a `url` / `uri` / `host` / `hostname`
+parameter that no `enum`, `const` or whole-value `pattern` pins (`^https?://`
+pins nothing), or a handler that fetches a URL taken from its input. This is
+read from the tools themselves, not from MTC-CAP-007, so suppressing a rule
+never moves a score. Otherwise the fact is kept in the new
+`capabilityProfile.observations` and printed on its own line, never priced. The
+`untrusted-input` tag, every toxic flow and every combination rule (trifecta,
+untrusted input reaching code execution) are unchanged. No score goes down;
+`maxCapability: "minimal"` now passes pure readers, and
+`denyCapabilities: ["untrusted-input"]` still blocks them. MTC-CAP-007 reads a
+destination the same way: a prefix-only pattern no longer silences it.
+
+### Client score: PyPI attestations are read (PEP 740)
+
+PyPI publishes attestations per file through its integrity API, never in the
+JSON document, so no signed PyPI release was ever seen as signed (−1 "no
+provenance", or −2 when `project_urls` named no repository). An `--online` PyPI
+scan now asks `/integrity/<name>/<version>/<file>/provenance` for the exact file
+it reads. An attestation earns `source` verification when the repository its
+publisher names matches the one `project_urls` names (case-insensitive, views
+such as `/tree/main` ignored), or when the package names none — a website or an
+owner's page is not a named repository. A different repository is not counted
+and is recorded as the new info rule **MTC-SUP-016** (never scored). A 404
+means unsigned; a 429, 5xx, timeout or malformed answer throws the retryable
+`RegistryUnavailableError`. Unlike the npm branch, which accepts provenance
+without reading its subject, the PyPI branch checks whose repository the
+attestation names: PyPI returns the publisher it verified as plain JSON.
+`classifyPublisher` takes the integrity answer as a new last argument;
+`PackageMeta` gains `attestedRepositoryUrl` and `attestationRepoMismatch`.
+
+### The JSON report can carry the scanned surface (`--surface`)
+
+`--surface` (library: `scanSurface(surface, { surface: true })`; hosted API:
+`?surface=1`) adds `report.surface`: `provenance` (`live`, `manifest`,
+`static`), `server` (`name`, `version`, `title`), and the tools, prompts and
+resources the score was computed on — after normalisation and before analysis —
+each tool with its `title`, `description`, `inputSchema`, `outputSchema`,
+`annotations` as read, and for a statically recovered tool `origin: { file,
+line, shape }`. Order is the canonical order behind `surfaceDigest`, so the same
+input gives byte-identical JSON. Limits: 500 tools (and prompts, resources),
+8,000 characters per description or title, 64 KB per schema or annotations
+object; every cut is named in `surface.truncated`. Without the flag the report
+is unchanged; scores and `surfaceDigest` are untouched. New exports:
+`buildReportSurface`, `SURFACE_LIMITS`, `ReportSurface`, `ReportSurfaceTool`.
+
+### Hardened before release
+
+Seven rounds of review attacked the changes themselves. Every reproduced case is
+pinned by a test, and the precision fixes are held in check by a single control
+suite, `test/controls-1.16.1.test.ts` (1,100+ sentences and handlers, each with
+the verdict 1.16.0 gave it): an attacking sentence 1.16.0 flagged must not be
+flagged weaker unless the change is deliberate, and honest text 1.16.0 left
+alone must not gain a finding. Among the fixes found this way: five
+super-linear scans introduced during development (an unanchored identifier
+pattern over handler bodies, POST option objects, file constants, a Python
+walrus pattern, the SECRECY-1 clause analysis) and a 23,000-character pattern
+that took 400 ms to compile on Node 20 — all now linear and under timing tests
+on Node 20 and 26.
+
+### Measured movement
+
+On the marketplace's 165 drops, rescanned online exactly as the marketplace
+scans (a 1.16.0 control run reproduced all 167 of its reports, zero drift): 96
+of the 163 drops that reproduce return to their 1.15 grade or better; the other
+two were a PyPI outage recorded as a package property, which now fails as a
+retryable error. F grades go from 21 to 2 — easy-memory (a real poisoning) and
+preceptai (borderline). 105 rows score higher than under 1.16.0; one scores
+lower — open-workbook, whose description has the model grant itself
+destructive permission on a refusal (the new MTC-INJ-ESCALATE-1). The remaining
+67 drops are capability grown from tools 1.15 never saw and their declared
+hints (24), MTC-CAP-003 contradictions the published text confirms (24) or that
+name an execution or destructive write (16), and the three injection cases
+above. The two client-score changes raise 19 of those 167 scores, 5 of 207
+downloaded artifacts and 62 of a 531-package sample, lower none, and lose no
+threat or combination finding.
+
+### Known limitations
+
+- The static extractor does not yet follow a description constant imported
+  from a sibling Python module, build a Python tool's `inputSchema` from its
+  signature, or use its docstring; `--surface` therefore lists such tools by
+  name and origin only. Planned for 1.17.
+- Text heuristics are bounded, not complete: a paraphrase outside the families
+  the control suite pins can still land a severity apart from a careful
+  reader's. A command that only the widened CMD-1 lexicon matches, without an
+  explicit order, stays low.
+- `MTC-INJ-SECRECY-1` reads the clauses of the first 256 "tell the user" sites
+  of a field; later sites are read as in 1.16.0.
+
 ## 1.16.0 — methodology `mcptrustchecker-1.16`
 
 **Scores move in both directions, each for a stated reason.** A server that
