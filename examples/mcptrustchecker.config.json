@@ -14,9 +14,6 @@
     { "rule": "MTC-INJ-CAPS", "tool": "search_docs", "reason": "the ALL-CAPS is a legit doc section header, reviewed 2026-01" }
   ],
 
-  "$publish": "Settings for the separate `publish` command. Nothing here can make a scan publish — only running `mcptrustchecker publish <package>` submits anything. Prefer MCPTRUSTCHECKER_TOKEN over committing publishToken.",
-  "publishCategory": "developer-tools",
-
   "$policy": "Policy-as-code — every scan is gated against this in CI, beyond a single grade/score threshold. maxCapability does not catch a server that only reads outside content from a destination it fixes (a search API: capability minimal since 1.16.1); add \"untrusted-input\" to denyCapabilities to block those too.",
   "policy": {
     "minGrade": "B",

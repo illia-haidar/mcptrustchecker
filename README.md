@@ -9,13 +9,12 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-3c873a.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/package.json)
 [![Methodology](https://img.shields.io/badge/methodology-mcptrustchecker--1.15-6f42c1.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/docs/methodology.md)
-[![Tests](https://img.shields.io/badge/tests-939%20passing-brightgreen.svg)](https://github.com/illia-haidar/mcptrustchecker/tree/main/test)
+[![Tests](https://img.shields.io/badge/tests-966%20passing-brightgreen.svg)](https://github.com/illia-haidar/mcptrustchecker/tree/main/test)
 [![Rules](https://img.shields.io/badge/rules-84-orange.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/docs/rules.md)
 [![No account](https://img.shields.io/badge/account-not%20required-brightgreen.svg)](#why-this-is-different)
 [![Offline](https://img.shields.io/badge/runs-100%25%20offline-brightgreen.svg)](#why-this-is-different)
 [![Online scanner](https://img.shields.io/badge/online%20scanner-free-c4f542.svg)](https://mcptrustchecker.com/scan)
 [![Free hosted API](https://img.shields.io/badge/hosted%20API-free-c4f542.svg)](https://mcptrustchecker.com/api)
-[![Trust Registry](https://img.shields.io/badge/trust%20registry-browse-8b87f7.svg)](https://mcptrustchecker.com/registry)
 
 <br/>
 
@@ -37,7 +36,7 @@ npx mcptrustchecker                # 🔍 scan every MCP server you already have
 
 ## What makes the algorithm unique
 
-The **Capability-Flow Trust Model** (methodology `mcptrustchecker-1.16.1`) is an **original algorithm designed from scratch for this project** by [Illia Haidar](https://mcptrustchecker.com) — it is not a wrapper around, or derivative of, any existing scanner or methodology. It is named, versioned, fully specified in docs/methodology.md, and citable via [CITATION.cff](CITATION.cff).
+The **Capability-Flow Trust Model** (methodology `mcptrustchecker-1.17`) is an **original algorithm designed from scratch for this project** by [Illia Haidar](https://mcptrustchecker.com) — it is not a wrapper around, or derivative of, any existing scanner or methodology. It is named, versioned, fully specified in docs/methodology.md, and citable via [CITATION.cff](CITATION.cff).
 
 **It is refined against 30,000+ real MCP servers — and still improving.** The model is not theoretical: it is calibrated on a continuously-scanned corpus of **30,000+ MCP servers** published on npm and PyPI. Each revision comes from a **full-population audit** of that corpus — every server in a grade band re-examined for *both* false positives (benign code graded down) and false negatives (real threats graded up), each change measured against the threats it must keep catching, and the whole corpus re-scanned before the version ships. That loop produced `mcptrustchecker-1.9`, which moved "evaluating a runtime value" off the threat axis after the data showed it was charging capability as malice. The corpus keeps growing and the audits keep running, so the methodology is expected to keep tightening — which is why every score carries the version that produced it.
 
@@ -68,7 +67,7 @@ Real output, `mcptrustchecker scan test/fixtures/poisoned-server.json`:
    │  GRADE  F  │   Trust Score 46/100   (client adoption risk · threat 50)
    ╰────────────╯   Capability MINIMAL   (blast radius)
                     Coverage MANIFEST   (static tool list only — no source)
-   methodology mcptrustchecker-1.16.1
+   methodology mcptrustchecker-1.17
 
 Threats    2 critical · 4 high · 2 medium
 
@@ -179,7 +178,6 @@ The terminal report is **detailed by default** — every finding prints its full
 
 **Or call it as an API.** A hosted version of the exact same deterministic engine runs at **[mcptrustchecker.com/api](https://mcptrustchecker.com/api)** — POST a `tools.json` manifest or a published npm/PyPI package name over a single HTTPS request and get the same auditable A–F Trust Score back as JSON. It is **completely free** (grab a key in seconds, no card, no account), and it's the quickest way to try the scanner without installing anything. The CLI and library stay 100% offline — the hosted API is an optional convenience.
 
-**Browse the MCP Trust Registry** — a growing, security-scanned catalog of MCP servers with an A–F Trust Score for each, all computed by this exact engine: **[mcptrustchecker.com/registry](https://mcptrustchecker.com/registry)**.
 
 ---
 
@@ -355,7 +353,7 @@ const report  = await scanSurface(surface);
 
 report.score.grade;              // 'A' … 'F'
 report.score.score;              // 0 … 100
-report.score.methodologyVersion; // 'mcptrustchecker-1.16.1'  ← pin & display this
+report.score.methodologyVersion; // 'mcptrustchecker-1.17'  ← pin & display this
 report.toxicFlows;               // enumerated exfiltration primitives
 renderBadge(report);             // shields.io endpoint JSON for a live trust badge
 ```
@@ -372,50 +370,6 @@ mcptrustchecker diff ./tools.json    # exits non-zero if the surface changed
 ```
 
 A tool that quietly rewrites its description after you approve it (the MCPoison / rug-pull class) shows up as **drift** with a human-readable diff, and re-approval is required.
-
----
-
-## Publish to the MCP Trust Registry (opt-in, off by default)
-
-Scanned a package worth listing? You can submit it to the public **[MCP Trust Registry](https://mcptrustchecker.com/registry)** so everyone else can look it up before installing it.
-
-```bash
-mcptrustchecker publish @scope/server --token <key>    # scan it, then submit it
-mcptrustchecker scan @scope/server --online            # just scan — never publishes, never asks
-```
-
-**Publishing is a separate command, never a side effect of scanning.** `scan` does not publish, does not ask, and does not change behaviour when a key happens to be in your environment — the only way anything is submitted is by typing `publish`, and typing it is the consent. There is no prompt to dismiss and no telemetry. **Only npm and PyPI packages can be submitted for now**; a target with no registry identity (a local directory, a `.tgz`, a manifest, a live URL, a spawned stdio command) is refused with an explanation rather than silently skipped.
-
-`publish` always reads the real published source — it implies `--online`, because submitting a package graded from its name alone would be worse than not grading it at all.
-
-**What is sent is an application, not a verdict.** The request carries the package identity (registry + name, optionally the version) and your explicit consent — no scan report, no findings, no source, nothing about your machine or your configs. **mcptrustchecker.com re-scans the package with its own copy of this engine**, and only that server-side scan is ever published. Your local grade travels along as `localGrade` for comparison only and can never become the listed grade — which is exactly what stops a key-holder from publishing "grade A" for a malicious package.
-
-A missing key or an unpublishable target fails fast, before the package is downloaded. A network failure while submitting warns on stderr and leaves stdout untouched.
-
-Publishing from CI is deliberately not something the GitHub Action does for you — a workflow that submits packages because a secret happens to exist is the same side effect this design removes. Write it as its own step when you want it:
-
-```yaml
-- name: Publish to the MCP Trust Registry
-  run: npx mcptrustchecker publish @scope/server --token "$MCPTRUSTCHECKER_TOKEN"
-  env:
-    MCPTRUSTCHECKER_TOKEN: ${{ secrets.MCPTRUSTCHECKER_TOKEN }}
-```
-
-**Getting a key.** Grab a free API key at **[mcptrustchecker.com/api](https://mcptrustchecker.com/api)** — the same key the hosted scan endpoints use, no card, no account. Store it in the environment rather than in a committed file:
-
-```bash
-export MCPTRUSTCHECKER_TOKEN=<key>          # the key, read automatically
-export MCPTRUSTCHECKER_PUBLISH_URL=https://mcp.internal   # self-hosted deployment (optional)
-```
-
-| Flag | What it does |
-| --- | --- |
-| `publish <package>` | the command — scan the package, then submit it |
-| `--category <slug>` | registry category to file it under (default `other`) |
-| `--token <key>` | API key (env: `MCPTRUSTCHECKER_TOKEN`) |
-| `--publish-url <origin>` | publish to a self-hosted deployment (env: `MCPTRUSTCHECKER_PUBLISH_URL`) |
-
-Credentials also live in `mcptrustchecker.config.json` as `publishToken`, `publishUrl` and `publishCategory`, resolved **flag → environment → config file**. There is deliberately no config key that turns publishing on: a file you inherited from someone else must never be able to submit your packages.
 
 ---
 

@@ -171,6 +171,9 @@ function attachStaticTools(surface: ServerSurface): ServerSurface {
       surface.staticTools = extracted.origins;
       if (extracted.truncated.length) surface.staticToolsTruncated = extracted.truncated;
     }
+    // Registrations whose names only exist at run time: said in the coverage
+    // caveat even when they are all the server has — never invented as names.
+    if (extracted.unnamed.length) surface.staticToolsUnnamed = extracted.unnamed;
   }
   return surface;
 }

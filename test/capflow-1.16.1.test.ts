@@ -124,7 +124,10 @@ test('tongateway: "call auth.get_token" in auth.request is the neighbouring tool
 const verifyStorage = {
   name: 'verify_storage',
   description: 'Verify the S3-compatible storage gateway by performing a round-trip test: create a test bucket, upload a small object, download it, and compare.',
-  inputSchema: { type: 'object' as const, properties: { secret_access_key: { type: 'string' }, relayer_ui_url: { type: 'string' } } },
+  // The package takes a `secret_access_key`: since 1.17 a credential passed in is
+  // no read (test/capability-1.17.test.ts), so the read leg here is an `sql`
+  // parameter, and what is tested stays the untrusted leg.
+  inputSchema: { type: 'object' as const, properties: { sql: { type: 'string' }, relayer_ui_url: { type: 'string' } } },
   annotations: { readOnlyHint: false, openWorldHint: true },
 };
 

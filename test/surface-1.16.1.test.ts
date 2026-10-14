@@ -160,14 +160,13 @@ test('static: a Staan-shaped package lists both tools, with where each is regist
   const addTool = (fn: string) => lines.findIndex((l, i) => /server\.add_tool\(/.test(l) && lines[i + 1]!.trim() === `${fn},`) + 1;
   for (const t of s.tools) {
     assert.deepEqual(t.origin, { file: 'src/staan_like/server.py', line: addTool(t.name), shape: 'direct' }, t.name);
-    // The title and description are constants from a SIBLING module, which the
-    // static reader does not follow (it folds names within one file), so today
-    // they are absent. Whatever it does recover must be the constant itself.
+    // The title and description are constants from a SIBLING module; since 1.17
+    // the static reader follows the import (one hop) and recovers the constant itself.
     const want = t.name === 'web_search'
       ? { title: 'Staan-like web search', description: 'Search the web and return ranked results.\n' }
       : { title: 'Staan-like answer', description: 'Answer a question from web sources, with citations.\n' };
-    if (t.title !== undefined) assert.equal(t.title, want.title);
-    if (t.description !== undefined) assert.equal(t.description, want.description);
+    assert.equal(t.title, want.title);
+    assert.equal(t.description, want.description);
   }
   // The tool registered in tests/ was dropped by the extractor (SKIP_PATH): it
   // is in neither the graded surface nor the listed one.

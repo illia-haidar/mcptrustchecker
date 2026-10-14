@@ -29,7 +29,10 @@
 
 import type { SourceFile, StaticToolOrigin, ToolDef, JsonSchema } from '../types.js';
 import { MAX_MERGED_DESC, mergeDescriptions, mergeHints, readRegistrationsWithStats } from '../analysis/toolRegistry.js';
+import { PyPackage } from '../analysis/pyModules.js';
+import { pyDefAt, pyDocstring } from '../analysis/pySignature.js';
 import { decodeEscapes } from '../util/constFold.js';
+import { type FileCtx, fileCtxOf } from '../util/fileCtx.js';
 
 export interface ToolExtractionResult {
   tools: ToolDef[];
@@ -41,6 +44,12 @@ export interface ToolExtractionResult {
   origins: Record<string, StaticToolOrigin>;
   /** Files where a reading cap was hit — some of their tools may be missing. */
   truncated: string[];
+  /**
+   * Registrations whose tool names cannot be read statically (a loop over a
+   * list built at run time, a name computed at run time): the server has more
+   * tools than the surface lists, and which is known only when it runs.
+   */
+  unnamed: { file: string; line: number }[];
 }
 
 // A source file is worth scanning only if it can contain a tool registration.
@@ -50,6 +59,12 @@ const SKIP_EXT = /\.(d\.ts|map)$/i;
 // Test / example / fixture code frequently defines throwaway "tools" that are NOT
 // the package's real surface — extracting them is a pure false-positive source.
 const SKIP_PATH = /(^|\/)(test|tests|__tests__|__mocks__|examples?|fixtures?|spec|specs|docs?|samples?)(\/|$)|\.(test|spec)\.[cm]?[jt]sx?$/i;
+// Python names its test modules `test_x.py` / `x_test.py`, with fixtures in
+// `conftest.py` — but a server's own `tools/tool_test.py` is a module like any
+// other. Such a file is skipped only when it is visibly a test: it defines
+// `test_…` functions or imports a test framework.
+const PY_TEST_NAME = /(^|\/)(test_[^/]*|[^/]*_test|conftest)\.py$/i;
+const PY_TEST_CODE = /^[ \t]*(?:async[ \t]+)?def[ \t]+test_\w*[ \t]*\(|^[ \t]*(?:import|from)[ \t]+(?:pytest|unittest)\b/m;
 // A byte ceiling per file — a legit server module is small; an enormous bundle is
 // both a DoS risk for the regexes and unlikely to be hand-written source.
 const MAX_FILE_BYTES = 512 * 1024;
@@ -58,6 +73,8 @@ const MAX_FILE_BYTES = 512 * 1024;
 const MAX_TOOLS = 200;
 const MAX_NAME_LEN = 128;
 const MAX_DESC_LEN = 8192;
+/** Unreadable registration names recorded for the coverage caveat, at most. */
+const MAX_UNNAMED = 50;
 
 /** A plausible MCP tool name: the SDK requires a non-empty, reasonably short id. */
 function looksLikeToolName(name: string): boolean {
@@ -165,7 +182,9 @@ function windowFrom(src: string, from: number, nextIdx: number): string {
 // the TS SDK exposes. Capture the name; the window after it yields desc + schema.
 const RE_REGISTER_TOOL = /\.(registerTool|tool)\s*\(\s*(['"`])([^'"`]{1,128})\2/g;
 // `name: "x"` paired with a nearby `description:` inside a ListTools handler array.
-const RE_TOOL_OBJECT = /\bname\s*:\s*(['"`])([^'"`]{1,128})\1/g;
+// The literal is the whole value: in `name: "name" in workspace ? … : ""` it is
+// an operand, and that object is no tool.
+const RE_TOOL_OBJECT = /\bname\s*:\s*(['"`])([^'"`]{1,128})\1(?=[ \t]*(?:[,;}\r\n]|\/[/*]|as\b))/g;
 
 // `registerTool(nameIdent, configIdent, …)` — the well-factored TS shape where a
 // module hoists `const name = "x"` and `const config = { description, inputSchema }`
@@ -227,17 +246,20 @@ function resolveConstObjectBodyUncached(src: string, ident: string): string | un
   return undefined;
 }
 
-function extractJsTools(src: string): ToolDef[] {
+function extractJsTools(ctx: FileCtx): ToolDef[] {
   memoKey = {};
+  const src = ctx.src;
   const out: ToolDef[] = [];
   const seen = new Set<string>();
 
-  // Collect registration offsets first so each window ends at the next one.
+  // Collect registration offsets first so each window ends at the next one. A
+  // registration in a comment or a string — a usage example in a JSDoc block, a
+  // template that prints sample code — registers nothing.
   const regs: { idx: number; end: number; name: string; kind: string }[] = [];
   let m: RegExpExecArray | null;
   RE_REGISTER_TOOL.lastIndex = 0;
   while ((m = RE_REGISTER_TOOL.exec(src))) {
-    if (!m[1] || !m[3]) continue;
+    if (!m[1] || !m[3] || !ctx.isCode(m.index)) continue;
     regs.push({ idx: m.index, end: RE_REGISTER_TOOL.lastIndex, name: m[3], kind: m[1] });
   }
 
@@ -268,7 +290,7 @@ function extractJsTools(src: string): ToolDef[] {
     if (out.length >= MAX_TOOLS) return out;
     const nameId = m[1];
     const configId = m[2];
-    if (!nameId || !configId) continue;
+    if (!nameId || !configId || !ctx.isCode(m.index)) continue;
     const name = resolveConstString(src, nameId);
     if (!name || !looksLikeToolName(name) || seen.has(name)) continue;
     const body = resolveConstObjectBody(src, configId);
@@ -291,7 +313,7 @@ function extractJsTools(src: string): ToolDef[] {
   if (hasListToolsHandler) {
     RE_TOOL_OBJECT.lastIndex = 0;
     const objs: { idx: number; end: number; name: string }[] = [];
-    while ((m = RE_TOOL_OBJECT.exec(src))) { if (m[2]) objs.push({ idx: m.index, end: RE_TOOL_OBJECT.lastIndex, name: m[2] }); }
+    while ((m = RE_TOOL_OBJECT.exec(src))) { if (m[2] && ctx.isCode(m.index)) objs.push({ idx: m.index, end: RE_TOOL_OBJECT.lastIndex, name: m[2] }); }
     for (let i = 0; i < objs.length; i++) {
       const o = objs[i]!;
       if (!looksLikeToolName(o.name) || seen.has(o.name)) continue;
@@ -324,38 +346,54 @@ function extractJsTools(src: string): ToolDef[] {
 
 // --- Python matchers -------------------------------------------------------
 
-// FastMCP: `@mcp.tool()` / `@app.tool(name="x", description="y")` on a `def`.
-const RE_PY_DECORATOR = /@(\w+)\.tool\s*(\([^)]*\))?\s*\r?\n\s*(?:async\s+)?def\s+(\w+)\s*\(/g;
+// FastMCP: `@mcp.tool()` / `@app.tool(name="x", description="y")` right above a
+// `def`. Found by its head, then read with the bracket table: a pattern spanning
+// the blank lines between decorator and `def` backtracked quadratically on a
+// file of newlines.
+const RE_PY_DECORATOR = /@(\w+)\.tool\b/g;
+const RE_PY_DECORATED_DEF = /[ \t]*\r?\n[ \t\r\n]*(?:async[ \t]+)?def[ \t]+(\w+)[ \t]*\(/y;
 // Low-level list_tools: `types.Tool(name="x", description="y", inputSchema={...})`.
 const RE_PY_TOOL_CTOR = /\bTool\s*\(\s*name\s*=\s*(['"])([^'"]{1,128})\1/g;
 
-function pyDocstring(src: string, defParenIdx: number): string | undefined {
-  // Find the ':' that ends the def signature, then the first triple-quoted string.
-  const colon = src.indexOf(':', defParenIdx);
-  if (colon < 0) return undefined;
-  const after = src.slice(colon, colon + 2000);
-  const m = /^[\s\S]{0,80}?("""|''')([\s\S]*?)\1/.exec(after);
-  if (!m) return undefined;
-  // `r"""…"""` keeps its backslashes.
-  const raw = /[rR]$/.test(after.slice(0, m[0].length - (m[2] ?? '').length - 6));
-  const body = (m[2] ?? '').trim();
-  return raw ? body.slice(0, MAX_DESC_LEN) : cleanString(body, MAX_DESC_LEN, true);
-}
-
-function extractPyTools(src: string): ToolDef[] {
+function extractPyTools(ctx: FileCtx): ToolDef[] {
+  const src = ctx.src;
   const out: ToolDef[] = [];
   const seen = new Set<string>();
   let m: RegExpExecArray | null;
 
+  // Code only: a decorator in a docstring's usage example, a comment or a code
+  // template inside a string registers nothing.
   RE_PY_DECORATOR.lastIndex = 0;
   while ((m = RE_PY_DECORATOR.exec(src)) && out.length < MAX_TOOLS) {
-    const decoratorArgs = m[2] ?? '';
-    const fnName = m[3];
-    if (!fnName) continue;
-    const explicitName = fieldString(decoratorArgs, 'name', true);
-    const name = explicitName ?? fnName;
-    if (!looksLikeToolName(name) || seen.has(name)) continue;
-    const description = fieldString(decoratorArgs, 'description', true) ?? pyDocstring(src, RE_PY_DECORATOR.lastIndex);
+    if (!ctx.isCode(m.index)) continue;
+    let i = RE_PY_DECORATOR.lastIndex;
+    while (src[i] === ' ' || src[i] === '\t') i++;
+    let decoratorArgs = '';
+    if (src[i] === '(') {
+      const close = ctx.closeOf(i);
+      // Nested calls in the arguments are the registration reader's to evaluate.
+      const inner = src.indexOf('(', i + 1);
+      if (close < 0 || (inner >= 0 && inner < close)) continue;
+      decoratorArgs = src.slice(i, close + 1);
+      i = close + 1;
+    }
+    RE_PY_DECORATED_DEF.lastIndex = i;
+    const def = RE_PY_DECORATED_DEF.exec(src);
+    const fnName = def?.[1];
+    if (!def || !fnName) continue;
+    const fn = pyDefAt(ctx, i + def[0].length - 1);
+    if (!fn || !ctx.isCode(fn.headerStart)) continue;
+    // The tool's name: `name=` or the first positional (`@mcp.tool("search")`),
+    // else the function's. One given but not as a literal (`name=spec.name`) is
+    // not the function's name — the registration reader reports it unnamed.
+    let name: string | undefined = fnName;
+    if (/\bname\s*=/.test(decoratorArgs)) name = fieldString(decoratorArgs, 'name', true);
+    else if (/^\(\s*[^\s)]/.test(decoratorArgs) && !/^\(\s*[A-Za-z_]\w*\s*=/.test(decoratorArgs)) {
+      name = /^\(\s*(['"])([^'"\\\n]{1,128})\1\s*[,)]/.exec(decoratorArgs)?.[2];
+    }
+    if (!name || !looksLikeToolName(name) || seen.has(name)) continue;
+    // FastMCP sends the docstring only when the registration gives no description.
+    const description = /\bdescription\s*=/.test(decoratorArgs) ? fieldString(decoratorArgs, 'description', true) : pyDocstring(ctx, fn);
     const tool: ToolDef = { name };
     if (description) tool.description = description;
     seen.add(name);
@@ -365,8 +403,14 @@ function extractPyTools(src: string): ToolDef[] {
   RE_PY_TOOL_CTOR.lastIndex = 0;
   while ((m = RE_PY_TOOL_CTOR.exec(src)) && out.length < MAX_TOOLS) {
     const name = m[2];
-    if (!name || !looksLikeToolName(name) || seen.has(name)) continue;
-    const win = windowFrom(src, RE_PY_TOOL_CTOR.lastIndex, -1);
+    if (!name || !looksLikeToolName(name) || seen.has(name) || !ctx.isCode(m.index)) continue;
+    // The MCP type carries an inputSchema; a framework's own `Tool(name=…)` model does not.
+    const open = src.indexOf('(', m.index);
+    const close = ctx.closeOf(open);
+    if (close < 0 || !/\b(?:inputSchema|input_schema)\s*=/.test(src.slice(open, close))) continue;
+    // The call's own arguments: a description that is not one literal must not
+    // be taken from the next tool in the list.
+    const win = src.slice(RE_PY_TOOL_CTOR.lastIndex, close);
     const description = fieldString(win, 'description', true);
     const params = schemaParamNames(win, 'inputSchema');
     const tool: ToolDef = { name };
@@ -389,21 +433,28 @@ function extractPyTools(src: string): ToolDef[] {
  */
 export function extractToolsFromSource(files: SourceFile[] | undefined): ToolExtractionResult {
   // A null-prototype record: a tool named `__proto__` is an own key like any other.
-  const empty: ToolExtractionResult = { tools: [], extracted: false, fromFiles: [], origins: Object.create(null), truncated: [] };
+  const empty: ToolExtractionResult = { tools: [], extracted: false, fromFiles: [], origins: Object.create(null), truncated: [], unnamed: [] };
   if (!Array.isArray(files) || !files.length) return empty;
 
   const byName = new Map<string, ToolDef>();
   const origins: Record<string, StaticToolOrigin> = Object.create(null);
   const fromFiles: string[] = [];
   const truncated: string[] = [];
+  const unnamed: ToolExtractionResult['unnamed'] = [];
+  const readable = (f: SourceFile | undefined): f is SourceFile =>
+    Boolean(f) && typeof f!.path === 'string' && typeof f!.content === 'string' &&
+    !SKIP_EXT.test(f!.path) && CODE_EXT.test(f!.path) && !SKIP_PATH.test(f!.path) && f!.content.length <= MAX_FILE_BYTES &&
+    !(PY_TEST_NAME.test(f!.path) && PY_TEST_CODE.test(f!.content));
+  // The Python files a registration may import its function or its description
+  // from: the ones this extractor reads itself.
+  const pkg = new PyPackage(files.filter((f) => readable(f) && /\.py$/i.test(f.path)));
 
   for (const f of files) {
-    if (!f || typeof f.path !== 'string' || typeof f.content !== 'string') continue;
-    if (SKIP_EXT.test(f.path) || !CODE_EXT.test(f.path) || SKIP_PATH.test(f.path)) continue;
-    if (f.content.length > MAX_FILE_BYTES) continue;
+    if (!readable(f)) continue;
 
     const isPy = /\.py$/i.test(f.path);
-    const found = isPy ? extractPyTools(f.content) : extractJsTools(f.content);
+    const ctx = fileCtxOf(f);
+    const found = isPy ? extractPyTools(ctx) : extractJsTools(ctx);
     const local = new Map<string, { tool: ToolDef; origin: StaticToolOrigin }>();
     for (const t of found) local.set(t.name, { tool: t, origin: { file: f.path, line: lineOf(f.content, t.name), via: 'direct', hintSource: 'none' } });
     // Registrations read the way the language runs them: helpers, loops, nested
@@ -414,9 +465,10 @@ export function extractToolsFromSource(files: SourceFile[] | undefined): ToolExt
     // keeps what the line matcher found, as in 1.15.
     let read: ReturnType<typeof readRegistrationsWithStats>['regs'] = [];
     try {
-      const got = readRegistrationsWithStats(f);
+      const got = readRegistrationsWithStats(f, isPy ? pkg : undefined);
       read = got.regs;
       if (got.truncated) truncated.push(f.path);
+      for (const line of got.unnamed) if (unnamed.length < MAX_UNNAMED) unnamed.push({ file: f.path, line });
     } catch {
       read = [];
     }
@@ -440,17 +492,19 @@ export function extractToolsFromSource(files: SourceFile[] | undefined): ToolExt
         if (merged) tool.description = merged;
       }
       // The line matcher saw the tool but not its schema (a `tools/list` table it
-      // does not read): the reader's parameters stand in.
-      if (hit && !tool.inputSchema) {
-        const schema = schemaFromParamNames(reg.params);
+      // does not read): the reader's parameters stand in. A Python function's
+      // signature is the schema FastMCP sends — richer than names alone.
+      if (hit && (!tool.inputSchema || reg.inputSchema)) {
+        const schema = reg.inputSchema ?? schemaFromParamNames(reg.params);
         if (schema) tool.inputSchema = schema;
       }
+      if (hit && reg.title && !tool.title) tool.title = reg.title;
       if (!hit) {
-        const description =
-          reg.description !== undefined ? reg.description.slice(0, MAX_MERGED_DESC) : reg.defAt !== undefined ? pyDocstring(f.content, reg.defAt) : undefined;
+        // A Python registration's description is already its docstring when it gives none.
+        const description = reg.description !== undefined ? reg.description.slice(0, MAX_MERGED_DESC) : undefined;
         if (description) tool.description = description;
         if (reg.title) tool.title = reg.title;
-        const schema = schemaFromParamNames(reg.params);
+        const schema = reg.inputSchema ?? schemaFromParamNames(reg.params);
         if (schema) tool.inputSchema = schema;
       }
       if (reg.hints) tool.annotations = { ...(tool.annotations ?? {}), ...(mergeHints(hintsOf(tool), reg.hints) ?? {}) };
@@ -464,6 +518,7 @@ export function extractToolsFromSource(files: SourceFile[] | undefined): ToolExt
           hintSource: reg.hintSource,
           ...(reg.condition ? { condition: reg.condition } : {}),
           ...(reg.behavior ? { behavior: reg.behavior } : {}),
+          ...(reg.pinned ? { pinned: reg.pinned } : {}),
         },
       });
     }
@@ -488,6 +543,10 @@ export function extractToolsFromSource(files: SourceFile[] | undefined): ToolExt
         const merged: StaticToolOrigin = { ...base, ...(behavior.length ? { behavior: behavior.slice(0, 3) } : {}) };
         // Registered unconditionally in either file: not conditional.
         if (!(prevOrigin?.condition && origin.condition)) delete merged.condition;
+        // A destination is pinned only where both handlers pin it.
+        const pinned = (prevOrigin?.pinned ?? []).filter((p) => origin.pinned?.includes(p));
+        if (pinned.length) merged.pinned = pinned;
+        else delete merged.pinned;
         byName.set(t.name, keep);
         origins[t.name] = merged;
         continue;
@@ -505,8 +564,8 @@ export function extractToolsFromSource(files: SourceFile[] | undefined): ToolExt
   }
 
   const tools = [...byName.values()];
-  if (!tools.length) return { ...empty, truncated };
-  return { tools, extracted: true, fromFiles, origins, truncated };
+  if (!tools.length) return { ...empty, truncated, unnamed };
+  return { tools, extracted: true, fromFiles, origins, truncated, unnamed };
 }
 
 /** The boolean hints a tool definition carries. */

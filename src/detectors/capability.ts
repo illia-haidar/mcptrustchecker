@@ -23,10 +23,14 @@ import {
 import {
   assertsExecution,
   boundsWholeValue,
-  execParamIsHomonym,
+  COMMAND_ACTIONS,
+  commandParamKind,
   execVerbAt,
+  keywordAt,
   MAX_PROSE,
   nameKeywordIsHomonym,
+  nameWords,
+  proseRunsCommand,
   proseSentences,
   restrictivePattern,
   schemaParamDescription,
@@ -107,21 +111,8 @@ interface MutationEvidence {
 const EXEC_PARAM_NAMES = new Set(PARAM_NAME_SIGNALS.filter((s) => s.tag === 'code-exec').flatMap((s) => s.names));
 /** What an interpreter named `eval` would take: not a `source` to parse, a value to evaluate. */
 const EVAL_INPUT_PARAMS = new Set(['input', 'inputs', 'expr', 'expression', 'formula', 'program', 'statement']);
-// The last word of a parameter name that makes it an identifier or a setting of
-// the command, not the command itself: `command_number`, `script_id`, `shell_dialect`.
-const NON_COMMAND_HEADS = new Set(['id', 'ids', 'uuid', 'guid', 'number', 'num', 'no', 'index', 'idx', 'count', 'key', 'keys', 'type', 'types', 'kind', 'status', 'version', 'ref', 'timeout', 'limit', 'level', 'mode', 'format', 'lang', 'language', 'dialect', 'style', 'tier', 'hash', 'size', 'length', 'offset', 'cursor', 'page', 'total', 'enabled']);
-// The first word of a parameter name that makes it a switch: `include_command`, `show_script`.
-const FLAG_LEADS = new Set(['include', 'with', 'show', 'use', 'enable', 'disable', 'allow', 'has', 'is', 'skip', 'no', 'hide', 'exclude', 'omit']);
-// Words of a description sentence that are about what a command parameter carries.
-const EXEC_OBJECT_MENTIONS = new Set(['command', 'commands', 'cmd', 'cmds', 'script', 'scripts', 'shell', 'shells', 'code', 'program', 'programs', 'process', 'processes', 'executable', 'binary', 'expression', 'expressions', 'snippet', 'snippets', 'cli']);
-// `build_command` on `verify_build`: the tool is named for what the command does.
-const COMMAND_ACTIONS = new Set(['build', 'test', 'tests', 'typecheck', 'lint', 'compile', 'install', 'start', 'run', 'launch', 'deploy', 'setup', 'init', 'bootstrap', 'format', 'migrate', 'seed', 'serve']);
 // Read verbs: before an execution word in a NAME they make it a noun (`get_run_status`).
 const READ_NAME_VERBS = new Set(['get', 'list', 'read', 'show', 'describe', 'fetch', 'poll', 'view', 'inspect', 'query', 'search', 'find']);
-
-/** A name's words, camelCase split too (`runScript` → run, script). */
-const nameWords = (name: string): string[] =>
-  name.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
 
 /** An enum, a const, a boolean / number type, or a short restrictive pattern. */
 function schemaConstrains(prop: JsonSchema | undefined): boolean {
@@ -135,8 +126,9 @@ function schemaConstrains(prop: JsonSchema | undefined): boolean {
 
 /**
  * Does command-shaped parameter `param` evidence execution strongly? Its value
- * must be a free-form string — no enum, const or restrictive pattern, and not an
- * identifier or a switch by its name — and an execution verb must say it is run:
+ * must be a free-form string — no enum, const or restrictive pattern (an
+ * identifier or a switch by its name never gets here: see `commandParamKind`) —
+ * and an execution verb must say it is run:
  * in the tool's name, in the parameter's own description, in a sentence of the
  * tool's description that is about the command, or in the tool's name as the
  * action the command does (`build_command` on `verify_build`). For a statically
@@ -145,7 +137,6 @@ function schemaConstrains(prop: JsonSchema | undefined): boolean {
  */
 function paramRunsCommand(tool: ToolDef, param: string, w: ToolWords, surface: ServerSurface): boolean {
   const toks = tokensOf(param);
-  if (NON_COMMAND_HEADS.has(toks[toks.length - 1]!) || (toks.length > 1 && FLAG_LEADS.has(toks[0]!))) return false;
   const prop = tool.inputSchema?.properties?.[param];
   let description = schemaParamDescription(tool, param);
   let constrained = schemaConstrains(prop);
@@ -160,13 +151,7 @@ function paramRunsCommand(tool: ToolDef, param: string, w: ToolWords, surface: S
 
   const name = nameWords(tool.name);
   if (name.some((_, i) => execVerbAt(name, i) && !name.slice(0, i).some((t) => READ_NAME_VERBS.has(t)))) return true;
-  if (assertsExecution(description) || w.description.length > MAX_PROSE) return true;
-  const mentions = new Set([...toks.filter((t) => t.length >= 3), ...EXEC_OBJECT_MENTIONS]);
-  for (const s of proseSentences(w.description)) {
-    if (!s.some((_, i) => execVerbAt(s, i))) continue;
-    // A start verb already stands next to a process word ("an MCP server starts").
-    if (s.some((t) => mentions.has(t)) || s.some((t, i) => (t.startsWith('start') || t.startsWith('launch')) && execVerbAt(s, i))) return true;
-  }
+  if (assertsExecution(description) || proseRunsCommand(w.description, toks)) return true;
   const action = toks.length > 1 ? toks[toks.length - 2]! : '';
   return COMMAND_ACTIONS.has(action) && w.nameSet.has(action);
 }
@@ -250,9 +235,11 @@ function mutationEvidence(tool: ToolDef, cap: ToolCapability, surface: ServerSur
   const disclaims = disclaimsExecution(description);
   const handsOn = disclaims && HANDS_ON_COMMAND.test(description.slice(0, MAX_PROSE));
   for (const pn of w.params) {
-    const toks = tokensOf(pn);
-    if ((disclaims && !handsOn) || !toks.some((t) => EXEC_PARAM_NAMES.has(t) && !execParamIsHomonym(pn, t, tool, w))) continue;
-    if (!handsOn && paramRunsCommand(tool, pn, w, surface)) ev.exec = 'strong';
+    if (disclaims && !handsOn) continue;
+    // `other`: another word (no evidence); `setting`: an id or a switch of a command (weak, untagged).
+    const kinds = tokensOf(pn).filter((t) => EXEC_PARAM_NAMES.has(t)).map((t) => commandParamKind(pn, t, tool, w));
+    if (kinds.every((k) => k === 'other')) continue;
+    if (!handsOn && kinds.includes('command') && paramRunsCommand(tool, pn, w, surface)) ev.exec = 'strong';
     else {
       ev.exec = stronger(ev.exec, 'weak');
       ev.weakParams.push(pn);
@@ -267,7 +254,7 @@ function mutationEvidence(tool: ToolDef, cap: ToolCapability, surface: ServerSur
     if (sig.tag !== 'code-exec' && sig.tag !== 'file-write') continue;
     for (const kw of sig.keywords) {
       const k = normalizeForMatch(kw);
-      if (!(k.includes(' ') ? nameNorm.includes(k) : w.nameSet.has(k))) continue;
+      if (!(k.includes(' ') ? keywordAt(nameNorm, k, 0) >= 0 : w.nameSet.has(k))) continue;
       if (nameKeywordIsHomonym(k, w)) {
         // `eval_run` that takes a free-form `input` / `expression` to evaluate
         // may well be an interpreter: an evaluation reading lowers it, no more.
@@ -393,7 +380,9 @@ export const capabilityDetector: Detector = {
       // Execution evidenced only weakly (a command-shaped parameter nothing says
       // is run, a status read of an earlier exec) is reported at low/heuristic.
       const ev = claimsReadOnly || claimsNonDestructive ? mutationEvidence(tool, cap, ctx.surface) : undefined;
-      const execs = !ev ? 'none' : has('code-exec') ? ev.exec : ev.untagged ? 'weak' : 'none';
+      // Weak evidence that gave no tag — `eval_run` over a free-form input, a
+      // `script_id` — is still reported, low.
+      const execs = !ev ? 'none' : has('code-exec') ? ev.exec : ev.untagged || ev.weakParams.length ? 'weak' : 'none';
       const writes = has('file-write') && ev !== undefined && ev.write !== 'none';
       const destroys = has('file-write') && ev?.write === 'destructive';
       const strong = claimsReadOnly ? execs === 'strong' || writes : claimsNonDestructive && (execs === 'strong' || destroys);
@@ -465,6 +454,13 @@ export const capabilityDetector: Detector = {
 
       // Schema-level injection preconditions (only on the relevant capability).
       const props = tool.inputSchema?.properties ?? {};
+      const words = toolWords(tool);
+      // A command word that is the command itself — not a `script_id`, a
+      // `language_code` or a validator's input (see `commandParamKind`).
+      const commandShaped = (pname: string): boolean =>
+        tokensOf(pname).some((t) => COMMAND_PARAM_NAMES.includes(t) && commandParamKind(pname, t, tool, words) === 'command');
+      // A URL the handler pins to a fixed host is not a destination the model chooses.
+      const origin = ctx.surface.toolProvenance === 'static' && ctx.surface.staticTools && Object.hasOwn(ctx.surface.staticTools, tool.name) ? ctx.surface.staticTools[tool.name] : undefined;
       for (const [pname, pschema] of Object.entries(props)) {
         const destination = nameMatches(pname, SSRF_PARAM_NAMES);
         if (!isUnconstrainedString(pschema) && !(destination && prefixOnlyPattern(pschema))) continue;
@@ -478,7 +474,7 @@ export const capabilityDetector: Detector = {
           if (facts?.constrained && !(destination && facts.pattern !== undefined && !boundsWholeValue(facts.pattern))) continue;
         }
         const field = `inputSchema.properties.${pname}`;
-        if (has('code-exec') && nameMatches(pname, COMMAND_PARAM_NAMES)) {
+        if (has('code-exec') && commandShaped(pname)) {
           findings.push({
             ruleId: 'MTC-CAP-006',
             title: `Unconstrained command parameter "${pname}" on "${tool.name}"`,
@@ -493,7 +489,7 @@ export const capabilityDetector: Detector = {
             owasp: 'LLM05:2025 Improper Output Handling',
             data: { param: pname },
           });
-        } else if ((has('external-sink') || has('untrusted-input')) && nameMatches(pname, SSRF_PARAM_NAMES)) {
+        } else if ((has('external-sink') || has('untrusted-input')) && destination && !origin?.pinned?.includes(pname)) {
           findings.push({
             ruleId: 'MTC-CAP-007',
             title: `Unconstrained URL/host parameter "${pname}" on "${tool.name}"`,

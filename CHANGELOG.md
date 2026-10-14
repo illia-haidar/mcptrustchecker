@@ -5,6 +5,37 @@ deterministic: the **methodology version** is bumped whenever a change could
 move a score, so a grade is always reproducible against the version that
 produced it.
 
+## 1.17.0 — methodology `mcptrustchecker-1.17`
+
+**Python tools are read the way FastMCP serves them, and placeholder names are gone.** Scores move for Python servers whose tools 1.16 saw by name only; re-scan stored results before comparing with 1.16.1.
+
+### Python tools: schemas, descriptions and real names
+
+- A Python tool's `inputSchema` is built from its function signature — parameter types, `Literal[…]` enums, `Annotated[…, Field(description=…)]`, defaults (not required); `self`, `ctx` and `Context` parameters are skipped.
+- The function docstring is the description when the registration gives none, as FastMCP does.
+- A description or title constant imported from a sibling module of the same package (`from pkg.contract import WEB_SEARCH_DESCRIPTION`, `X: Final = """…"""`) is resolved.
+- `add_tool(<identifier>)` names a tool only when the identifier is bound to a function — a `def` in scope or one imported from the same package. A loop over a literal list registers the functions in it (`for fn in (search, fetch): mcp.add_tool(fn)`). A loop variable, a parameter, a local, an unreadable `name=` or a loop over a call registers no invented name; the coverage caveat reports "registrations with unknown names" instead.
+- Code inside docstrings, comments, JSDoc blocks and string templates is never read as a registration. Placeholder tool names such as `my_tool`, `fn`, `tool`, `name`, `wrapper` and `handler` — 202 of 204 cases on a marketplace sample — no longer appear; the four that remain are real tools with those names.
+
+On a 207-artifact corpus, Python tools with a description went from 1,402 to 1,942 and with an `inputSchema` from 214 to 2,013. `--surface` therefore carries descriptions and parameters for FastMCP servers.
+
+### Capability heuristics read the new surface in context
+
+- A credential the caller passes in (`validate_jwt(token, secret)`, `verify_webhook(…, secret)`) is not a sensitive source; a tool that reads secrets (`get_secret`, a `secret_name` selector on a reading tool, a handler reading the environment or a credential file) still is.
+- A command-shaped parameter needs execution semantics: a validator, linter or checker handed a script does not run it, `output_script` and `language_code` are not commands, and `script_id`, `shell_type`, `include_command` give no tag (MTC-CAP-003 still reports them, low).
+- A URL or host parameter the handler builds on a fixed host (`f"{BASE}/{uri}"`, `` `${API}/…` ``) or reduces to an id first is not a destination the model chooses. A value concatenated after a caller-controlled host, resolved against one (`new URL(url, base)`, `urljoin`), or forwarded to a fetch proxy stays open.
+- Multi-word keywords match whole words — "read project" is not `read_pr`, `get_logsources` is not `get_logs` — while longer words keep their inflections (`get_environment_variables`, `export_database`). "curl" in prose counts only as a command.
+- MTC-INJ-URL-1 skips loopback and private addresses unless the text orders data sent there; link-local and cloud-metadata addresses are always reported. A URL in a docstring example is a low/heuristic mention unless the text orders data sent there.
+
+### Also
+
+- The `publish` command, its options (`--token`, `--category`, `--publish-url`), its configuration keys and the `publish*` library exports are removed.
+- Reading Python registrations stays linear on hostile files: identifiers, module assignments and `__name__` renames are indexed once per file, and loop elements and wrapper callers are read at most 400 per file (more is reported as truncated).
+
+### Measured movement
+
+On the 207-artifact corpus against 1.16.1: one grade drops — a computer-use server whose newly visible `mio_launch(command)` runs `subprocess.Popen` — and eleven rise as false keyword matches disappear. No real tool name is lost in any population checked (207 artifacts, 167 marketplace rows, 197 listings with placeholder names, a 531-package sample).
+
 ## 1.16.1 — methodology `mcptrustchecker-1.16.1`
 
 **Grades no longer drop for text the detectors misread.** 1.16 began reading

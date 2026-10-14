@@ -4,7 +4,6 @@
  * MCP Trust Checker command-line interface.
  *
  *   mcptrustchecker scan <target>       scan a manifest / URL / package / client config
- *   mcptrustchecker publish <package>   scan it, then submit it to the hosted registry
  *   mcptrustchecker pin <target>        scan and (re)pin the integrity lockfile
  *   mcptrustchecker diff <target>       fail if the surface drifted since the pin
  *   mcptrustchecker rules               list every rule
@@ -35,15 +34,8 @@ import { isCapabilityRule } from '../scoring/model.js';
 import { METHODOLOGY_VERSION, TOOL_VERSION } from '../version.js';
 import { c } from '../util/ansi.js';
 import { parseHeaderArgs } from '../util/headers.js';
-import {
-  DEFAULT_PUBLISH_URL,
-  buildPublishRequest,
-  publishScan,
-  publishableTargets,
-  type PublishTarget,
-} from '../publish.js';
 
-const KNOWN_COMMANDS = new Set(['scan', 'publish', 'pin', 'diff', 'rules', 'explain', 'version', 'help']);
+const KNOWN_COMMANDS = new Set(['scan', 'pin', 'diff', 'rules', 'explain', 'version', 'help']);
 
 function fail(msg: string, code = 2): never {
   process.stderr.write(`${c.red('mcptrustchecker: error')} ${msg}\n`);
@@ -115,13 +107,6 @@ ${c.bold('CI gates')}
   --fail-under <0-100>             exit 1 if the Trust Score is below N
   --min-grade <A-F>                exit 1 if the grade is worse than this
 
-${c.bold('publish <package>')} ${c.gray('— scan it, then submit it to the public MCP Trust Registry')}
-  A separate command on purpose: a plain scan never publishes and never asks.
-  Only npm and PyPI packages can be submitted. Running the command IS the consent.
-  --token <key>                    API key, required (also MCPTRUSTCHECKER_TOKEN)
-  --category <slug>                registry category (default: other)
-  --publish-url <origin>           self-hosted deployment (also MCPTRUSTCHECKER_PUBLISH_URL)
-
 ${c.bold('Options')}
   --config <path>                  config file (default: auto-discovered)
   --lockfile <path>                integrity lockfile (default: mcptrustchecker.lock)
@@ -178,9 +163,6 @@ async function main(): Promise<number | void> {
         'github-token': { type: 'string' },
         'include-builtins': { type: 'boolean' },
         registry: { type: 'string' },
-        token: { type: 'string' },
-        'publish-url': { type: 'string' },
-        category: { type: 'string' },
         quiet: { type: 'boolean' },
         details: { type: 'boolean' },
         'no-pager': { type: 'boolean' },
@@ -253,7 +235,7 @@ async function main(): Promise<number | void> {
     url: values.url,
     // `publish` always reads the real published source: submitting a package
     // graded from its name alone would be worse than not grading it at all.
-    online: command === 'publish' ? true : values.online,
+    online: values.online,
     metadataOnly: values['metadata-only'],
     run: values.run,
     envVars: parseEnvFlags(values.env),
@@ -327,26 +309,6 @@ async function main(): Promise<number | void> {
     }
   }
 
-  // Publishing is never a side effect of scanning: only the `publish` command
-  // submits anything, and invoking that command is itself the consent. Checked
-  // here, before the scan runs, so a missing key fails in a second rather than
-  // after a 30-second package download.
-  const publish = preparePublish(command, values, fileConfig, resolved);
-  if (publish.enabled) {
-    if (!publish.token) {
-      fail(
-        'publish needs an API key. Pass --token <key> or set MCPTRUSTCHECKER_TOKEN. ' +
-          'Get one free at https://mcptrustchecker.com/api',
-      );
-    }
-    if (publish.targets.length === 0) {
-      fail(
-        'nothing to publish: only npm and PyPI packages can be submitted for now, ' +
-          'and this target carries no registry identity.',
-      );
-    }
-  }
-
   // Flat tool inventory across all resolved servers, for cross-server collision.
   const allTools = resolved.flatMap((r) => r.surface.tools.map((t) => ({ server: r.surface.id, name: t.name })));
 
@@ -362,10 +324,6 @@ async function main(): Promise<number | void> {
     });
     reports.push(report);
   }
-
-  // Submit the applications. A publish failure is never fatal: it must not
-  // change the exit code, touch stdout, or abort a scan that already succeeded.
-  if (publish.enabled) await runPublish(publish, resolved, reports);
 
   // pin — always read the existing lockfile first (even under --no-lock) so we
   // merge into it rather than clobbering previously-pinned servers.
@@ -446,92 +404,6 @@ function paginate(text: string, allow: boolean): void {
     if (res.error) process.stdout.write(body); // pager missing → fall back
   } catch {
     process.stdout.write(body);
-  }
-}
-
-/**
- * First value that is actually set. An exported-but-empty env var (`TOKEN=`)
- * counts as unset, so it can't shadow a config file that does have a value.
- */
-function firstSet(...values: (string | undefined)[]): string {
-  for (const v of values) if (typeof v === 'string' && v.trim() !== '') return v.trim();
-  return '';
-}
-
-interface PublishState {
-  /** True only for the `publish` command — scanning never sets this. */
-  enabled: boolean;
-  targets: PublishTarget[];
-  token: string;
-  origin: string;
-  category?: string;
-}
-
-/**
- * Collect what the `publish` command needs. There is no decision to make and
- * nobody to ask: publishing happens when — and only when — the user typed
- * `publish`. Credentials still come from flag > environment > config file.
- */
-function preparePublish(
-  command: string,
-  values: Record<string, unknown>,
-  fileConfig: McpTrustCheckerConfig,
-  resolved: ResolvedTarget[],
-): PublishState {
-  const enabled = command === 'publish';
-  return {
-    enabled,
-    targets: enabled ? publishableTargets(resolved) : [],
-    token: firstSet(
-      values.token as string | undefined,
-      process.env.MCPTRUSTCHECKER_TOKEN,
-      fileConfig.publishToken,
-    ),
-    origin:
-      firstSet(
-        values['publish-url'] as string | undefined,
-        process.env.MCPTRUSTCHECKER_PUBLISH_URL,
-        fileConfig.publishUrl,
-      ) || DEFAULT_PUBLISH_URL,
-    category: (values.category as string | undefined) ?? fileConfig.publishCategory,
-  };
-}
-
-/**
- * POST one application per publishable package. Every message goes to stderr so
- * `--json`/`--sarif`/`--badge`/`-o` output stays machine-clean, and every error
- * is a warning: the scan's verdict is the product, publishing is a side errand.
- */
-async function runPublish(state: PublishState, resolved: ResolvedTarget[], reports: ScanReport[]): Promise<void> {
-  // reports[i] corresponds to resolved[i]; map each identity to its local scan
-  // so the application can carry an informational grade for comparison.
-  const localReports = new Map<string, ScanReport>();
-  resolved.forEach((r, i) => {
-    const p = publishableTargets([r])[0];
-    const report = reports[i];
-    if (p && report) localReports.set(`${p.registry}:${p.spec}`, report);
-  });
-
-  for (const target of state.targets) {
-    const body = buildPublishRequest(target, {
-      category: state.category,
-      report: localReports.get(`${target.registry}:${target.spec}`),
-    });
-    if (!body) continue;
-    try {
-      const result = await publishScan(body, { token: state.token, origin: state.origin });
-      if (!result.ok) {
-        process.stderr.write(`${c.yellow('!')} publish failed for ${target.spec}: ${result.error}\n`);
-        continue;
-      }
-      const { status, url, message } = result.response ?? ({} as { status?: string; url?: string; message?: string });
-      const tail = url ? ` → ${url}` : '';
-      const label = status === 'already-listed' ? 'already listed' : 'queued for review';
-      process.stderr.write(`${c.green('✓')} ${target.spec}: ${message ?? label}${tail}\n`);
-    } catch (err) {
-      // Belt and braces — publishScan already swallows its own errors.
-      process.stderr.write(`${c.yellow('!')} publish failed for ${target.spec}: ${(err as Error).message}\n`);
-    }
   }
 }
 

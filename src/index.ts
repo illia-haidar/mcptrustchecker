@@ -37,22 +37,6 @@ export { parseClientConfig, isClientConfig, packageFromStdio } from './acquire/c
 // package. `retryable` / `code` ('MTC_REGISTRY_UNAVAILABLE') tell a queue to rescan later.
 export { fetchNpmMeta, fetchPypiMeta, RegistryUnavailableError } from './acquire/npm.js';
 
-// Registry publishing (opt-in; sends an application, never a verdict)
-export {
-  buildPublishRequest,
-  publishScan,
-  publishableTarget,
-  publishableTargets,
-  publishEndpoint,
-  normalizeCategory,
-  DEFAULT_PUBLISH_URL,
-  PUBLISH_CATEGORIES,
-  type PublishTarget,
-  type PublishRequest,
-  type PublishResponse,
-  type PublishResult,
-  type PublishOptions,
-} from './publish.js';
 
 // Capabilities & flows (useful for custom analysis / UIs)
 export { extractCapabilities, extractToolCapability } from './util/capabilities.js';

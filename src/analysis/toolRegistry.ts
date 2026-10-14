@@ -29,10 +29,12 @@
  * server, and the file is not a minified bundle.
  */
 
-import type { CapabilityTag, SourceFile } from '../types.js';
+import type { CapabilityTag, JsonSchema, SourceFile } from '../types.js';
 import { type FileCtx, type FnInfo, fileCtxOf } from '../util/fileCtx.js';
 import { decodeEscapes, fold } from '../util/constFold.js';
-import { CODE, braceDepths, splitArgs } from '../util/jsLex.js';
+import { CODE, COMMENT, STRING, braceDepths, splitArgs } from '../util/jsLex.js';
+import { type PyPackage, inClassBody, pyImports } from './pyModules.js';
+import { pyDefAt, pyDocstring, pySignatureSchema } from './pySignature.js';
 
 export interface ToolHints {
   readOnlyHint?: boolean;
@@ -74,10 +76,14 @@ export interface FoundRegistration {
   hintSource: HintSource;
   condition?: RegistrationCondition;
   behavior?: HandlerEvidence[];
+  /** URL / host parameters whose destination the handler pins (see `pinnedParams`). */
+  pinned?: string[];
   /** Python: offset of the `(` of the `def` the decorator sits on (for the docstring). */
   defAt?: number;
   /** Python: the decorated function's own name, when the tool is registered under another. */
   defName?: string;
+  /** Python: the input schema FastMCP builds from the registered function's signature. */
+  inputSchema?: JsonSchema;
 }
 
 const MAX_REGS = 200;
@@ -89,6 +95,18 @@ export const MAX_MERGED_DESC = 32_768;
 /** Object fields spreads may copy per file, in all. */
 const MAX_SPREAD_COPIES = 2_000_000;
 const MAX_DEPTH = 24;
+/** A constant read from another file of a Python package is at most this many characters of source. */
+const MAX_PY_CONST = 64 * 1024;
+/** Characters a scope search for one Python name may look at before the name is taken as rebound. */
+const MAX_BIND_WORK = 400_000;
+/** `add_tool(…)` calls read per Python file; a file with more says so (`truncated`). */
+const MAX_PY_ADD_SITES = 400;
+/**
+ * Loop elements and wrapper callers read per Python file, in all: each may
+ * fold a constant at the cost of a pass over the file, and a hostile file
+ * lists tens of thousands of them. A file with more says so (`truncated`).
+ */
+const MAX_PY_EXPANSIONS = 400;
 /** Evaluation steps per registration: spreads of spreads must not grow without bound. */
 const MAX_STEPS = 20_000;
 const MAX_ITEMS = 200;
@@ -121,6 +139,8 @@ type Val =
   /** `partial`: a string with unreadable pieces left out — good enough to read, never to name. */
   | { k: 'lit'; v: boolean | string | number | null; partial?: boolean }
   | { k: 'fn'; fn: FnInfo; env: Env | null }
+  /** Python: a function another file of the package defines, imported by name. */
+  | { k: 'ext'; name: string; file: SourceFile; fn: FnInfo }
   | { k: 'unknown' };
 
 const UNKNOWN: Val = { k: 'unknown' };
@@ -142,10 +162,14 @@ class Reader {
   /** Fields copied by spreads in this file: a huge object spread a thousand times must not cost minutes. */
   copied = 0;
 
-  constructor(ctx: FileCtx) {
+  /** Python: the package's other files, for names this file imports from them. */
+  readonly pkg: PyPackage | undefined;
+
+  constructor(ctx: FileCtx, pkg?: PyPackage) {
     this.ctx = ctx;
     this.src = ctx.src;
     this.py = ctx.lang === 'py';
+    this.pkg = pkg;
   }
 
   /** Start reading one registration: a fresh step budget, and the call site's own argument ranges. */
@@ -326,6 +350,15 @@ class Reader {
     const text = s.slice(from, to);
     const d = depth + 1;
 
+    // Python: a top-level comma makes a tuple (`TOOLS = (a, b)` — its parentheses
+    // are trimmed off above), and a lambda's own parameters are not one.
+    if (this.py && !/^lambda\b/.test(text)) {
+      const items = this.split(from, to, ',').map(([a, b]) => this.trim(a, b)).filter(([a, b]) => b > a);
+      if (items.length > 1 || (items.length === 1 && /,\s*$/.test(text))) {
+        return { k: 'arr', items: items.slice(0, MAX_ITEMS).map(([a, b]) => ({ from: a, to: b, env, own: isOwn })), open: false };
+      }
+    }
+
     // Lowest precedence first: a ternary is a value we cannot choose.
     if (!this.py && this.hasTopLevelTernary(from, to)) return UNKNOWN;
     if (this.py && this.split(from, to, 'if').length > 1) return UNKNOWN;
@@ -356,6 +389,13 @@ class Reader {
     if (/^(?:null|undefined|None|void\s+0)$/.test(text)) return NULLISH;
     if (/^-?\d+(?:\.\d+)?$/.test(text)) return { k: 'lit', v: Number(text) };
     if (!this.py && text.startsWith('`') && text.endsWith('`') && text.length >= 2 && text.includes('${')) return this.template(from, to, env, d, isOwn);
+    // Python joins adjacent string literals (`("Search the web. "\n "Returns results.")`);
+    // an f-string piece that cannot be read leaves a partial string.
+    if (this.py && this.ctx.mask[from] === STRING) {
+      const pieces = this.pyStrings(from, to);
+      if (pieces && pieces.length > 1) return this.concat(pieces.map(([a, b]) => this.evRange(a, b, env, d, isOwn)));
+      if (/^(?:[fF][rR]?|[rR][fF])['"]/.test(text)) return this.pyFString(from, to, env, d, isOwn);
+    }
     if (/^[`'"]|^[rRbBuUfF]{1,2}['"]/.test(text)) {
       const f = fold(this.ctx, text, { at: from });
       return f.kind === 'literal' && f.values.length === 1 ? { k: 'lit', v: f.values[0]! } : UNKNOWN;
@@ -374,6 +414,11 @@ class Reader {
     const mem = this.memberSplit(from, to);
     if (mem) {
       const base = this.evRange(mem.base[0], mem.base[1], env, d, isOwn);
+      // `fn.__name__` — what FastMCP names a tool registered without a name.
+      if (this.py && mem.prop === '__name__' && (base.k === 'fn' || base.k === 'ext')) {
+        const ctx = base.k === 'ext' ? fileCtxOf(base.file) : this.ctx;
+        return base.fn.name && !renamedPyFn(ctx, base.fn) ? { k: 'lit', v: base.fn.name } : UNKNOWN;
+      }
       if (base.k === 'obj') {
         const f = base.fields.get(mem.prop);
         if (f) return this.ev(f, d);
@@ -403,6 +448,24 @@ class Reader {
           else items.push({ val: { k: 'arr', items: [{ val: keyVal, own: isOwn }, v], open: false }, own: isOwn });
         }
         return { k: 'arr', items: items.slice(0, MAX_ITEMS), open: false };
+      }
+      // Python `D.items()` / `.keys()` / `.values()` of a dict, and `list(X)` / `tuple(X)` of a sequence.
+      if (this.py && parts.length === 0 && /\.(?:items|keys|values)$/.test(callee)) {
+        const dot = text.lastIndexOf('.', call[0].length - 1);
+        const o = this.evRange(from, from + dot, env, d, isOwn);
+        if (o.k !== 'obj' || o.open) return UNKNOWN;
+        const items: Thunk[] = [];
+        for (const [key, v] of o.fields) {
+          const keyVal: Val = { k: 'lit', v: key };
+          if (callee.endsWith('.keys')) items.push({ val: keyVal, own: isOwn });
+          else if (callee.endsWith('.values')) items.push(v);
+          else items.push({ val: { k: 'arr', items: [{ val: keyVal, own: isOwn }, v], open: false }, own: isOwn });
+        }
+        return { k: 'arr', items: items.slice(0, MAX_ITEMS), open: false };
+      }
+      if (this.py && parts.length === 1 && (callee === 'list' || callee === 'tuple')) {
+        const v = this.evRange(parts[0]![0], parts[0]![1], env, d, isOwn);
+        return v.k === 'arr' ? v : UNKNOWN;
       }
       // Python `dict(X, k=v, **Y)` and an annotations constructor with keyword
       // arguments — `ToolAnnotations(readOnlyHint=True)`. A JS annotations class
@@ -461,6 +524,53 @@ class Reader {
     const rest = body.slice(last);
     if (rest.includes('${')) return UNKNOWN;
     vals.push({ k: 'lit', v: unescapeTemplate(rest) });
+    return this.concat(vals);
+  }
+
+  /**
+   * A Python f-string: its literal text, with each `{name}` piece read the way
+   * Python formats it; any other piece (a call, a format spec) is left out and
+   * the string is partial — good enough to read, never to name.
+   */
+  private pyFString(from: number, to: number, env: Env | null, d: number, own: boolean): Val {
+    const text = this.src.slice(from, to);
+    const m = /^([fF][rR]?|[rR][fF])("""|'''|"|')/.exec(text);
+    if (!m) return UNKNOWN;
+    const q = m[2]!;
+    if (text.length < m[0].length + q.length || !text.endsWith(q)) return UNKNOWN;
+    const raw = /[rR]/.test(m[1]!);
+    const body = text.slice(m[0].length, text.length - q.length);
+    const piece = (t: string): Val => ({ k: 'lit', v: raw ? t : decodeEscapes(t, true) });
+    const vals: Val[] = [];
+    let lit = '';
+    for (let i = 0; i < body.length; i++) {
+      const c = body[i]!;
+      if ((c === '{' || c === '}') && body[i + 1] === c) {
+        lit += c;
+        i++;
+        continue;
+      }
+      if (c !== '{') {
+        lit += c;
+        continue;
+      }
+      const close = body.indexOf('}', i);
+      if (close < 0) return UNKNOWN;
+      vals.push(piece(lit));
+      lit = '';
+      const inner = body.slice(i + 1, close);
+      const id = /^\s*([A-Za-z_]\w*)\s*$/.exec(inner);
+      let v: Val = UNKNOWN;
+      if (id && vals.length < MAX_ITEMS) {
+        v = this.evIdent(id[1]!, from + m[0].length + i + 1 + inner.indexOf(id[1]!), env, d, own);
+        if (v.k === 'lit' && typeof v.v === 'boolean') v = { k: 'lit', v: v.v ? 'True' : 'False' };
+        else if (v.k === 'lit' && v.v === null) v = { k: 'lit', v: 'None' };
+        else if (v.k !== 'lit') v = UNKNOWN;
+      }
+      vals.push(v);
+      i = close;
+    }
+    vals.push(piece(lit));
     return this.concat(vals);
   }
 
@@ -524,8 +634,9 @@ class Reader {
     const bound = this.lookup(env, name);
     if (bound) return this.ev(bound, d);
     if (name === 'undefined') return NULLISH;
-    // A name this file imports is defined somewhere we did not read.
-    if (this.imported(name)) return UNKNOWN;
+    // A name this file imports is defined somewhere we did not read — unless it
+    // is a Python name from one of the package's own files.
+    if (this.imported(name)) return this.py ? this.importedValue(name) : UNKNOWN;
     const decl = this.ctx.constInitAt(name, at);
     if (decl && decl.init && decl.init !== name) {
       // The whole initializer, not readInit's 4,000-character prefix: a table of
@@ -533,7 +644,12 @@ class Reader {
       const start = this.src.indexOf(decl.init, decl.at);
       if (start < 0) return UNKNOWN;
       let end = start + decl.init.length;
-      if (this.src[start] === '{' || this.src[start] === '[') {
+      if (this.py) {
+        // A Python statement ends at its logical line: a tuple's commas, a long
+        // triple-quoted string and a parenthesized concatenation are all of it.
+        end = this.pyStatementEnd(start);
+        if (end < 0) return UNKNOWN;
+      } else if (this.src[start] === '{' || this.src[start] === '[') {
         const c = this.close(start);
         if (c > 0) end = c + 1;
       } else if (/^Object\s*\.\s*freeze\s*\(/.test(decl.init)) {
@@ -553,9 +669,265 @@ class Reader {
       if (key && v.k !== 'unknown') this.constMemo.set(key, v);
       return v;
     }
-    const fn = this.fnNamed(name);
+    const fn = this.py ? this.pyFnAt(name, at) : this.fnNamed(name);
     if (fn) return { k: 'fn', fn, env: null };
     return UNKNOWN;
+  }
+
+  /** Where the Python statement whose expression starts at `from` ends, or -1 when a bracket is never closed. */
+  pyStatementEnd(from: number): number {
+    const { src } = this;
+    for (let i = from; i < src.length; i++) {
+      if (!this.ctx.isCode(i)) {
+        if (this.ctx.mask[i] === COMMENT) return this.trimWs(from, i)[1];
+        continue;
+      }
+      const c = src[i]!;
+      if (c === '(' || c === '[' || c === '{') {
+        const e = this.close(i);
+        if (e < 0) return -1;
+        i = e;
+      } else if ((c === '\n' && src[i - 1] !== '\\') || c === ';') return this.trimWs(from, i)[1];
+    }
+    return src.length;
+  }
+
+  /** Adjacent Python string literals filling a range, separated only by blanks and comments. */
+  private pyStrings(from: number, to: number): [number, number][] | null {
+    const { src } = this;
+    const mask = this.ctx.mask;
+    const out: [number, number][] = [];
+    let i = from;
+    while (i < to) {
+      if (mask[i] === STRING) {
+        const s = i;
+        while (i < to && mask[i] === STRING) i++;
+        out.push([s, i]);
+        if (out.length > MAX_ITEMS) return null;
+      } else if (mask[i] === COMMENT || /\s/.test(src[i]!) || (src[i] === '\\' && src[i + 1] === '\n')) i++;
+      else return null;
+    }
+    return out;
+  }
+
+  /**
+   * A Python name imported from one of the package's own files: a function
+   * there (its name is what FastMCP calls the tool), or a constant there — a
+   * string, number or boolean, read in that file alone, so a chain of imports
+   * is followed one hop for a value and never loops.
+   */
+  private importedValue(name: string): Val {
+    const pkg = this.pkg;
+    if (!pkg || !pkg.has(this.ctx.path)) return UNKNOWN;
+    const imp = pyImports(this.ctx).get(name);
+    if (!imp) return UNKNOWN;
+    const ref = pkg.refOf(this.ctx.path, imp);
+    if (!ref) return UNKNOWN;
+    if (ref.kind === 'fn') return { k: 'ext', name: ref.name, file: ref.file, fn: ref.fn };
+    const v = constReader(ref.file).moduleConst(ref.name);
+    return v.k === 'lit' ? v : UNKNOWN;
+  }
+
+  /** The value of a module-level constant of this file, when it is one literal value of a bounded size. */
+  moduleConst(name: string): Val {
+    if (this.imported(name)) return UNKNOWN;
+    const decl = this.ctx.constInitAt(name, this.src.length);
+    if (!decl) return UNKNOWN;
+    const start = this.src.indexOf(decl.init, decl.at);
+    const end = start < 0 ? -1 : this.pyStatementEnd(start);
+    if (end < 0 || end - start > MAX_PY_CONST) return UNKNOWN;
+    this.begin([]);
+    return this.evIdent(name, this.src.length, null, 0, false);
+  }
+
+  private readonly pyFnMemo = new Map<string, FnInfo | null>();
+
+  /**
+   * The Python `def` a bare name refers to at `at`, scope by scope from the
+   * innermost function out: a parameter, an assignment, a loop or `as` target,
+   * a class of that name in a scope in between is what the name means there,
+   * not the def. Two defs of the name in one scope are not one function.
+   */
+  pyFnAt(name: string, at: number): FnInfo | null {
+    const inner = this.enclosing(at);
+    const key = `${name}\u0000${inner ? inner.bodyStart : -1}`;
+    const hit = this.pyFnMemo.get(key);
+    if (hit !== undefined) return hit;
+    let found: FnInfo | null = null;
+    for (let scope: FnInfo | null = inner, n = 0; n < MAX_DEPTH; n++) {
+      if (scope && scope.params.some((p) => p.name === name)) break;
+      if (this.pyBound(name, scope)) break;
+      const defs = this.ctx.functions().filter(
+        (f) => f.name === name && f.kind !== 'method' && this.enclosing(f.headerStart) === scope && (scope !== null || !inClassBody(this.ctx, f)),
+      );
+      if (defs.length) {
+        found = defs.length === 1 ? defs[0]! : null;
+        break;
+      }
+      if (!scope) break;
+      scope = this.enclosing(scope.headerStart);
+    }
+    this.pyFnMemo.set(key, found);
+    return found;
+  }
+
+  private readonly pyBoundMemo = new Map<string, boolean>();
+
+  /** Is `name` bound in this scope (module when null) by anything but a `def` — an assignment, a loop, `as`, `class`? */
+  private pyBound(name: string, scope: FnInfo | null): boolean {
+    const key = `${name}\u0000${scope ? scope.bodyStart : -1}`;
+    const hit = this.pyBoundMemo.get(key);
+    if (hit !== undefined) return hit;
+    const { src } = this;
+    let v = false;
+    let work = 0;
+    for (const i of this.identOffsetsOf(name)) {
+      // A file that makes this cost more than a real one ever does: the name is
+      // taken as bound, and the reading stays unknown.
+      if ((work += 64) > MAX_BIND_WORK) {
+        v = true;
+        break;
+      }
+      // A class attribute binds the name in the class, not in the scope around it.
+      if (this.enclosing(i) !== scope || this.pyInClass(i)) continue;
+      // The line's start, looked for no further back than a binding's prefix may
+      // reach: a name repeated along one 500 KB line must not rescan it each time.
+      let lineStart = i;
+      while (lineStart > 0 && i - lineStart <= 400 && src[lineStart - 1] !== '\n') lineStart--;
+      if (i - lineStart > 400) continue;
+      const prefix = src.slice(lineStart, i);
+      const suffix = src.slice(i + name.length, i + name.length + 8);
+      const forAt = prefix.search(/\bfor\b/);
+      if (
+        (forAt >= 0 && !/\bin\b/.test(prefix.slice(forAt + 3))) ||
+        /\b(?:as|class)[ \t]+$/.test(prefix) ||
+        /^\s*:=/.test(suffix) ||
+        (this.pyDepth(i) === 0 && /^[\w\s,()*]*$/.test(prefix) && !/\bdef\s+$/.test(prefix) && this.pyAssigns(i, name.length, (n) => (work += n)))
+      ) {
+        v = true;
+        break;
+      }
+    }
+    this.pyBoundMemo.set(key, v);
+    return v;
+  }
+
+  /**
+   * Is the name at `i` an assignment target (`name = …`, `name: T = …`, `a, name = …`)?
+   * The `=` is the first one at the name's own bracket depth on its logical line.
+   */
+  private pyAssigns(i: number, len: number, spend: (n: number) => void): boolean {
+    const { src } = this;
+    const d0 = this.pyDepth(i);
+    let k = i + len;
+    while (src[k] === ' ' || src[k] === '\t') k++;
+    const annotated = src[k] === ':' && src[k + 1] !== '=';
+    let n = 0;
+    try {
+      return this.pyAssignsFrom(k, d0, annotated, () => n++);
+    } finally {
+      spend(n);
+    }
+  }
+
+  private pyAssignsFrom(k0: number, d0: number, annotated: boolean, tick: () => void): boolean {
+    const { src } = this;
+    let k = k0;
+    for (let n = 0; k < src.length && n < 2000; k++, n++) {
+      tick();
+      const c = src[k]!;
+      if (!this.ctx.isCode(k)) {
+        if (this.ctx.mask[k] === COMMENT) return false;
+        continue;
+      }
+      if (this.pyDepth(k) !== d0) continue;
+      if (c === '\n') {
+        if (src[k - 1] === '\\') continue;
+        return false;
+      }
+      if (c === '=') return src[k + 1] !== '=' && !/[=!<>:]/.test(src[k - 1] ?? '');
+      if (!annotated && !/[\w \t\r,()*\\]/.test(c)) return false;
+    }
+    return false;
+  }
+
+  private classLines?: Uint8Array;
+
+  /** Is offset `i` in a class body (its innermost `def` or `class` block is a class)? One indentation pass per file. */
+  private pyInClass(i: number): boolean {
+    if (!this.classLines) {
+      const { src } = this;
+      const flags: number[] = [];
+      const stack: { indent: number; cls: boolean }[] = [];
+      let pos = 0;
+      let opener: boolean | null = null;
+      while (pos <= src.length) {
+        const nl = src.indexOf('\n', pos);
+        const end = nl < 0 ? src.length : nl;
+        const ind = /^[ \t]*/.exec(src.slice(pos, Math.min(end, pos + 400)))![0].length;
+        const at = pos + ind;
+        // A line that starts code at the top bracket level closes the blocks indented as deep or deeper.
+        if (at < end && this.ctx.isCode(at) && src[at] !== '#' && this.pyDepth(at) === 0) {
+          while (stack.length && stack[stack.length - 1]!.indent >= ind) stack.pop();
+          const head = /^(?:async[ \t]+)?(def|class)\b/.exec(src.slice(at, at + 12));
+          opener = head ? head[1] === 'class' : null;
+        } else opener = null;
+        flags.push(stack.length && stack[stack.length - 1]!.cls ? 1 : 0);
+        if (opener !== null) stack.push({ indent: ind, cls: opener });
+        else if (stack.length && at < end && this.ctx.isCode(at) && this.pyDepth(at) === 0) {
+          // An `if`/`for`/`with` block inherits the innermost def or class around it.
+          const top = stack[stack.length - 1]!;
+          let k = end - 1;
+          while (k > at && (/\s/.test(src[k]!) || this.ctx.mask[k] === COMMENT)) k--;
+          if (src[k] === ':' && this.ctx.isCode(k)) stack.push({ indent: ind, cls: top.cls });
+        }
+        if (nl < 0) break;
+        pos = nl + 1;
+      }
+      this.classLines = Uint8Array.from(flags);
+    }
+    return this.classLines[this.ctx.line(i) - 1] === 1;
+  }
+
+  private identIndex?: Map<string, number[]>;
+
+  /** Offsets of `name` as a bare identifier in code (not `x.name`). */
+  identOffsetsOf(name: string): number[] {
+    if (!this.identIndex) {
+      // Every name in one pass: a scan of the file per name asked about let a
+      // file of loops over tens of thousands of names cost a minute.
+      const index = new Map<string, number[]>();
+      const { src } = this;
+      for (const m of src.matchAll(/\w+/g)) {
+        const i = m.index!;
+        if (/^\d/.test(m[0]) || src[i - 1] === '.' || !this.ctx.isCode(i)) continue;
+        const list = index.get(m[0]);
+        if (!list) index.set(m[0], [i]);
+        else if (list.length < MAX_RAW_CALLS) list.push(i);
+      }
+      this.identIndex = index;
+    }
+    return this.identIndex.get(name) ?? [];
+  }
+
+  private depths?: Uint16Array;
+
+  /** Bracket depth at an offset (code brackets only), from one pass over the file. */
+  private pyDepth(i: number): number {
+    if (!this.depths) {
+      const n = this.src.length;
+      const d = new Uint16Array(n);
+      let depth = 0;
+      for (let k = 0; k < n; k++) {
+        d[k] = depth;
+        if (!this.ctx.isCode(k)) continue;
+        const c = this.src.charCodeAt(k);
+        if (c === 40 || c === 91 || c === 123) depth = Math.min(depth + 1, 65535);
+        else if ((c === 41 || c === 93 || c === 125) && depth > 0) depth--;
+      }
+      this.depths = d;
+    }
+    return this.depths[i] ?? 0;
   }
 
   private readonly aliasMemo = new Map<string, boolean>();
@@ -610,6 +982,8 @@ class Reader {
       if (this.py) {
         for (const m of s.matchAll(/^[ \t]*from[ \t]+[\w.]+[ \t]+import[ \t]+\(?([^)\n]+)\)?/gm)) add(m[1]!);
         for (const m of s.matchAll(/^[ \t]*import[ \t]+([\w., ]+)$/gm)) add(m[1]!);
+        // A parenthesized list over several lines (`from pkg.contract import (\n A,\n B,\n)`).
+        for (const local of pyImports(this.ctx).keys()) out.add(local);
       } else {
         // `import { a, b as c } from '…'` — found by keyword, then the clause is
         // cut at `from` with indexOf: a regex with overlapping whitespace classes
@@ -1481,6 +1855,14 @@ function carries(index: Map<string, Assigned[]>, text: string, kind: RegExp, at:
 }
 
 const carryMemo = new WeakMap<Assigned, Map<string, boolean>>();
+/** One key per kind of value `carries` looks for: the memo of one kind is never read for another. */
+const kindIds = new WeakMap<RegExp, number>();
+let nextKindId = 0;
+function kindKey(kind: RegExp): number {
+  let id = kindIds.get(kind);
+  if (id === undefined) kindIds.set(kind, (id = nextKindId++));
+  return id;
+}
 
 /**
  * Does one assignment's value carry `kind`, `depth` links further? Memoised per
@@ -1489,7 +1871,7 @@ const carryMemo = new WeakMap<Assigned, Map<string, boolean>>();
  */
 function assignmentCarries(index: Map<string, Assigned[]>, a: Assigned, kind: RegExp, depth: number): boolean {
   if (a.file) return true;
-  const key = `${kind === FILE_DATA ? 'f' : kind === WHOLE_ENV ? 'w' : 'l'}${depth}`;
+  const key = `${kindKey(kind)}:${depth}`;
   let memo = carryMemo.get(a);
   if (!memo) carryMemo.set(a, (memo = new Map()));
   const hit = memo.get(key);
@@ -2333,13 +2715,74 @@ function handlerEvidenceUncached(r: Reader, handler: Thunk, env: Env | null): Ha
   const v = r.ev(handler);
   const read = v.k === 'fn' ? inputFetch(r, v.fn) : undefined;
   if (read) out.push(read);
+  // What the handler's own writes carry out is read first: a secret leaving is
+  // the read leg, whatever else the handler shows.
+  const secretInputs = v.k === 'fn' ? secretInputsOf(r, v.fn) : undefined;
+  let leak: HandlerEvidence | undefined;
   for (const [from, to] of bodies) {
+    leak ??= leaksIn(r, from, to, from === bodies[0]![0] ? secretInputs : undefined);
     for (const ev of writesIn(r, from, to)) {
-      if (!out.some((o) => o.why === ev.why)) out.push(ev);
-      if (out.length >= 3) return out;
+      if (out.length < 3 && !out.some((o) => o.why === ev.why)) out.push(ev);
     }
+    if (out.length >= 3 && leak) break;
   }
+  if (leak) out.push(leak);
   return out;
+}
+
+/** A credential file by its path, read: SSH keys, cloud, registry and Git credentials, `.env`, `.netrc`, a keychain. */
+const CREDENTIAL_PATH = String.raw`(?:\.ssh\b|\bid_(?:rsa|ed25519|ecdsa|dsa)\b|\.aws\b|\.npmrc\b|\.pypirc\b|\.netrc\b|\.git-credentials\b|\.docker\/config|\.kube\/config|\.pgpass\b|\.env\b|\bcredentials\b|\bkeychain\b|\bwallet\b)`;
+const CREDENTIAL_FILE = new RegExp(
+  String.raw`\b(?:readFile(?:Sync)?|createReadStream|open)\s*\([^()\n]{0,200}?${CREDENTIAL_PATH}|${CREDENTIAL_PATH}[^\n]{0,200}?\.\s*read_(?:text|bytes)\s*\(`,
+  'i',
+);
+
+/**
+ * The handler's inputs named for a secret, as a pattern over its code: a
+ * destructured `{ secret }`, a Python `client_secret` parameter, a member
+ * `args.secret`. Undefined when it takes none.
+ */
+function secretInputsOf(r: Reader, fn: FnInfo): RegExp | undefined {
+  const locals: string[] = [];
+  const holders: string[] = [];
+  const secretNamed = (n: string): boolean => nameWordsOf(n).some((w) => w === 'secret' || w === 'secrets');
+  for (const p of r.params(fn).slice(0, MAX_PIN_INPUTS)) {
+    if (p.name && !/^(?:self|cls|this|ctx|context)$/.test(p.name)) (secretNamed(p.name) ? locals : holders).push(p.name);
+    for (const k of p.keys ?? []) if (secretNamed(k.key)) locals.push(k.local);
+  }
+  const esc = (n: string): string => n.replace(/\$/g, '\\$');
+  const parts = [
+    // A value, not a key: `{ page, secret }`, `{"s": secret}` — never `{ secret: true }` or `"secret"`.
+    ...(locals.length ? [`(?<![\\w$.'"\`])(?:${locals.map(esc).join('|')})(?![\\w$]|\\s*:(?!:)|['"\`])`] : []),
+    ...(holders.length ? [`(?<![\\w$.'"\`])(?:${holders.map(esc).join('|')})\\s*\\??\\.\\s*[\\w$]*(?:secret|Secret|SECRET)[\\w$]*(?![\\w$]|\\s*:(?!:))`] : []),
+  ];
+  return parts.length ? new RegExp(parts.join('|')) : undefined;
+}
+
+/**
+ * Does a write in this body send a secret out (1.17)? The whole environment
+ * (`axios.post(…, { env: process.env })`), a credential file, or an input
+ * named for a secret (`{ page, secret }`) in what the request carries after
+ * its URL, written there or through the names it uses: the handler reads that
+ * secret, whatever its parameters are called. The API's own key from one
+ * environment variable in a header is not this.
+ */
+function leaksIn(r: Reader, from: number, to: number, secretInputs: RegExp | undefined): HandlerEvidence | undefined {
+  const { sites } = writesOf(r, from, to);
+  if (!sites.length) return undefined;
+  const index = bodyIndex(r, from, to);
+  for (const site of sites) {
+    const sent = named(site.sent.map(([a, b]) => r.src.slice(a, Math.min(b, a + 4000))).join(',\n'));
+    const what = carries(index, sent, WHOLE_ENV, site.at, 2)
+      ? 'the whole environment'
+      : carries(index, sent, CREDENTIAL_FILE, site.at, 2)
+        ? 'a credential file'
+        : secretInputs && carries(index, sent, secretInputs, site.at, 2)
+          ? 'an input named for a secret'
+          : undefined;
+    if (what) return { tag: 'sensitive-source', why: `${site.why.replace(/^handler sends/, `handler sends ${what} in`)}`, line: r.ctx.line(site.at) };
+  }
+  return undefined;
 }
 
 /**
@@ -2381,13 +2824,499 @@ function inputFetch(r: Reader, fn: FnInfo): HandlerEvidence | undefined {
       return { tag: 'untrusted-input', why: `handler fetches a URL taken from its input (${clip(m[0] + first)})`, line: r.ctx.line(at) };
     }
   }
+  return commandFetch(r, fn, isInput, names);
+}
+
+/**
+ * A download program named as the command a local runner starts: `runCmd('curl',
+ * [...])`, `execFile("wget", [...])`, a list `["curl", "-s", url]`, a command line
+ * `` `curl -sk ${url}` `` / f"wget {url}".
+ */
+const FETCH_COMMAND = /(["'])(?:curl|wget)(?:\.exe)?\1\s*,\s*\[|\[\s*(["'])(?:curl|wget)(?:\.exe)?\2\s*,|`(?:curl|wget)\s[^`]{0,400}`|\b[fF](["'])(?:curl|wget)\s[^"'\n]{0,400}\3/g;
+
+/**
+ * …run with one of the handler's inputs as an argument (1.17): operant's
+ * `runCmd("curl", ["-sk", target_url])` fetches `target_url` as surely as
+ * `fetch(target_url)` does.
+ */
+function commandFetch(r: Reader, fn: FnInfo, isInput: RegExp, names: string): HandlerEvidence | undefined {
+  const body = r.src.slice(fn.bodyStart, fn.bodyEnd);
+  const interpolated = new RegExp(`\\$?\\{\\s*(?:${names})(?:\\s*\\??\\.\\s*[A-Za-z_$][\\w$]*){0,2}\\s*(?:![rsa])?\\s*\\}`);
+  let seen = 0;
+  for (const m of body.matchAll(FETCH_COMMAND)) {
+    if (++seen > 64) break;
+    const at = fn.bodyStart + m.index!;
+    let takes = false;
+    if (m[0].endsWith('[') || m[0].startsWith('[')) {
+      // The argument list: the array after the program, or the list it heads.
+      const open = m[0].startsWith('[') ? at : at + m[0].length - 1;
+      if (!r.ctx.isCode(open)) continue;
+      const items = r.parts(open) ?? [];
+      takes = items.slice(m[0].startsWith('[') ? 1 : 0, 64).some(([a, b]) => isInput.test(r.src.slice(a, Math.min(b, a + 200)).trim()));
+    } else {
+      // A command line — a string in the code, not a comment — with the input interpolated into it.
+      if (r.ctx.mask[m[0][0] === '`' ? at : at + 1] !== STRING) continue;
+      takes = interpolated.test(m[0]);
+    }
+    if (takes) return { tag: 'untrusted-input', why: `handler runs a download command on a URL taken from its input (${clip(m[0])})`, line: r.ctx.line(at) };
+  }
   return undefined;
 }
 
-const writesMemo = new WeakMap<Reader, Map<string, HandlerEvidence[]>>();
+// --- Destinations a handler pins (1.17) ------------------------------------------
+
+/** A handler body read for where a URL parameter goes, at most. */
+const MAX_PIN_BODY = 20_000;
+/** Uses of one name read; a parameter used more often is not followed. */
+const MAX_PIN_USES = 32;
+/** Names followed per parameter: itself and the locals it is copied into. */
+const MAX_PIN_NAMES = 4;
+/** Inputs a handler may take for its uses to be read: a header of thousands of keys is padding. */
+const MAX_PIN_INPUTS = 64;
+
+/** A URL / host parameter by one of its words, camelCase split too: `url`, `case_uri`, `targetUrl`, `urls`. */
+const namesDestinationParam = (name: string): boolean =>
+  nameWordsOf(name.slice(0, 200)).some((w) => /^(?:url|uri|host|hostname)s?$/.test(w));
+const nameWordsOf = (name: string): string[] =>
+  name.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+
+/** Calls that hand back the value they are given, re-encoded: the use is wherever their result goes. */
+const PIN_TRANSPARENT = /^(?:str|String|quote|quote_plus|unquote|encodeURIComponent|encodeURI|decodeURIComponent|(?:urllib\.)?parse\.(?:quote|quote_plus|unquote))$/;
+/** Calls that only test, measure or log a value. */
+const PIN_INERT_CALL = /^(?:len|isinstance|bool|type|repr|print|console\.\w+|warnings\.warn|(?:self\.|this\.)?_?(?:logger|logging|log|LOGGER|LOG)\.\w+)$/;
+/** Methods whose result is a test of the value, not the value. */
+const PIN_INERT_METHOD = /^\s*\.\s*(?:startswith|endswith|includes|startsWith|endsWith|test|match|count|find|index|isdigit|isalnum|isidentifier)\s*\(/;
+/** The rest of a statement that copies the value, trimmed or re-cased at most: `case_uri.lstrip("/")`. */
+const PIN_COPY_TAIL = /^(?:\s*\.\s*(?:strip|lstrip|rstrip|lower|upper|trim|trimStart|trimEnd|toLowerCase|toString|removeprefix|removesuffix)\s*\([^()\n]{0,40}\))*\s*(?:;|#|\/\/|\r?\n|$)/;
+/** An assignment head: `x = `, `const x = `, `x: str = `, `x = await `. */
+const PIN_ASSIGN_HEAD = /^\s*(?:(?:const|let|var)\s+)?([A-Za-z_$][\w$]*)\s*(?::[^=\n]{1,60})?=\s*(?:await\s+)?$/;
+const PIN_ID_NAME = /(?:^|_)id$|[a-z0-9]Id$/;
+/** Words of a function that reaches the URL rather than parsing it. */
+const PIN_FETCH_WORDS = new Set(['download', 'fetch', 'scrape', 'crawl', 'request', 'load', 'open', 'resolve', 'retrieve', 'lookup', 'http', 'curl', 'wget', 'get', 'visit', 'browse']);
+/** A constructor that builds a request, a URL or a client is no data value. */
+const PIN_REQUESTISH = /request|url|uri|client|session|http|fetch|connect|socket/i;
+/** Words before a `(` that make it a group, not a call. */
+const PIN_KEYWORDS = new Set(['if', 'elif', 'while', 'for', 'return', 'await', 'not', 'and', 'or', 'in', 'switch', 'catch', 'typeof', 'void', 'yield', 'assert', 'with', 'else', 'lambda']);
+
+/**
+ * Does the head of a URL — the text before a parameter's value is spliced in —
+ * fix its host? A literal `scheme://host` closed by `/`, `?` or `#`; a path on
+ * the client's own base (`/v1/items/…`, not `/…` or `//…` — where the path goes
+ * is the caller's to check, see `pathBaseOpen`); or a module constant closed the
+ * same way (`{TNA_BASE}/…`, `${API}/…`). `new URL(url, BASE)` is not one: an
+ * absolute `url` replaces the base. Nor is a fixed host that fetches what it is
+ * handed (see `FORWARDS`).
+ */
+function headPins(r: Reader, head: string, tainted: Set<string>): boolean {
+  if (/^(?:https?|wss?):\/\/[^/?#{}\s$\\]+[/?#]/i.test(head)) return !forwards(head);
+  if (/^\/[^/\\{$\s]/.test(head)) return !forwards(head);
+  const m = (r.py ? /^\{\s*([A-Za-z_][\w.]{0,80})\s*\}(?=[/?#])/ : /^\$\{\s*([A-Za-z_$][\w$.]{0,80})\s*\}(?=[/?#])/).exec(head);
+  if (!m || !moduleConstant(r, m[1]!, tainted)) return false;
+  // The constant's own value, when the file writes it as a literal, is read with the rest.
+  return !forwards(`${constValue(r, m[1]!) ?? ''}${head.slice(m[0].length)}`);
+}
+
+/**
+ * A URL head that hands the value on to be fetched: a reader, a CORS or caching
+ * proxy, an archive or screenshot service by its host or path (`https://r.jina.ai/${url}`,
+ * `/proxy/${url}`), or a query key that names the target (`?url=`, `?target=`,
+ * `?u=`). The host is fixed; what it fetches is the caller's.
+ */
+const FORWARD_HOST = /^(?:[a-z]+:\/\/)?[^?#]*?(?:^|[./_-])(?:jina|cors|proxy|proxies|allorigins|webcache|archive|thum|12ft|microlink|unfurl|screenshots?|scraper|scrape|crawler|crawl|reader|fetcher|fetch)(?:[./_-]|$)/i;
+const FORWARD_QUERY = /[?&](?:url|uri|u|target|target_url|link|src|source|href|dest|destination|site|website|page|address|redirect|redirect_uri|to)=$/i;
+function forwards(head: string): boolean {
+  const h = head.slice(0, 400);
+  return FORWARD_QUERY.test(h) || FORWARD_HOST.test(h.split(/[?#]/, 1)[0]!);
+}
+
+/**
+ * A name that holds a module constant, not an input: an upper-case constant
+ * (`API`, `TNA_BASE`, `settings.API_URL`) or a lower-case name the file
+ * declares once at its top level (`const apiBase = …`). A local, an attribute
+ * (`self.base_url`) or an input is not one.
+ */
+function moduleConstant(r: Reader, name: string, tainted: Set<string>): boolean {
+  const parts = name.split('.');
+  if (tainted.has(parts[0]!)) return false;
+  if (/^[A-Z][A-Z0-9_]*$/.test(parts[parts.length - 1]!) && /[A-Z]/.test(parts[parts.length - 1]!)) return true;
+  if (parts.length > 1) return false;
+  const c = fileConsts(r).get(name);
+  return !!c && c.block === -1;
+}
+
+/** The literal a constant is declared as (`const API = "https://…"`), when it is one. */
+function constValue(r: Reader, name: string): string | undefined {
+  const c = name.includes('.') ? undefined : fileConsts(r).get(name);
+  if (!c) return undefined;
+  return /^\s*(["'`])([^"'`\\\n$]{0,300})\1/.exec(r.src.slice(c.init, c.init + 320))?.[2];
+}
+
+/** A request base written in a call: a literal URL, or a module constant. */
+function basePins(r: Reader, text: string, tainted: Set<string>): boolean {
+  const t = text.trim();
+  const lit = /^[rRbBuU]?(["'`])((?:https?|wss?):\/\/[^"'`\s{}$]+)\1$/i.exec(t);
+  if (lit) return !forwards(lit[2]!);
+  return /^[A-Za-z_$][\w$.]{0,80}$/.test(t) && moduleConstant(r, t, tainted) && !forwards(constValue(r, t) ?? '');
+}
+
+/**
+ * Where a path (`/v1/items/…`, a template from offset `start`) is sent: joined
+ * to a base the caller controls, it pins nothing (1.17). What stands before it
+ * (`server + f"/api/{url}"`), the base it is resolved against (`new
+ * URL(\`/x/${url}\`, domain)`, `urljoin(endpoint, f"/x/{url}")`), and — for a
+ * path first assigned to a local — the same at each use of that local (`path =
+ * …; fetch(server + path)`), read up to `MAX_PIN_USES` uses.
+ */
+function pathBaseOpen(r: Reader, start: number, from: number, to: number, tainted: Set<string>, alias = true): boolean {
+  const before = concatHead(r, start, from);
+  if (before !== undefined && !headOnly(r, before, tainted)) return true;
+  const call = enclosingCall(r, start, from);
+  if (call) {
+    const k = call.args.findIndex(([a, b]) => a <= start && start < b);
+    const last = call.callee.split('.').pop() ?? '';
+    if (last === 'URL' && k === 0 && call.args[1]) return !basePins(r, r.src.slice(call.args[1][0], call.args[1][1]), tainted);
+    if ((last === 'urljoin' || last === 'join') && k > 0) return !basePins(r, r.src.slice(call.args[0]![0], call.args[0]![1]), tainted);
+  }
+  if (!alias) return false;
+  const stmt = r.src.slice(Math.max(from, start - 200), start);
+  const target = PIN_ASSIGN_HEAD.exec(stmt.slice(stmt.lastIndexOf('\n') + 1))?.[1];
+  if (!target) return false;
+  const re = new RegExp(`(?<![\\w$.])${target.replace(/\$/g, '\\$')}(?![\\w$])`, 'g');
+  let uses = 0;
+  for (const m of r.src.slice(start, to).matchAll(re)) {
+    if (++uses > MAX_PIN_USES) return true;
+    const at = start + m.index!;
+    const tpl = templateAround(r, at, from);
+    if (tpl === 'unknown') return true;
+    if (tpl) {
+      if (!headOnly(r, tpl.head, tainted)) return true;
+      continue;
+    }
+    if (r.ctx.isCode(at) && pathBaseOpen(r, at, from, to, tainted, false)) return true;
+  }
+  return false;
+}
+
+/** A base written whole before a path: nothing, a literal URL, or a module constant (`{BASE}`, `${API}`, `BASE + `). */
+function headOnly(r: Reader, head: string, tainted: Set<string>): boolean {
+  if (head === '') return true;
+  if (/^(?:https?|wss?):\/\/[^?#{}\s$\\]+$/i.test(head)) return !forwards(head);
+  const m = (r.py ? /^\{\s*([A-Za-z_][\w.]{0,80})\s*\}/ : /^\$\{\s*([A-Za-z_$][\w$.]{0,80})\s*\}/).exec(head);
+  if (!m || !moduleConstant(r, m[1]!, tainted)) return false;
+  const rest = head.slice(m[0].length);
+  return (rest === '' || /^\/[^{$\s]*$/.test(rest)) && !forwards(`${constValue(r, m[1]!) ?? ''}${rest}`);
+}
+
+/**
+ * The template around offset `at` — a Python f-string's `{…}`, a JS template's
+ * `${…}` — as its start and the text before that interpolation; undefined when
+ * the offset sits in none (plain code, a docstring, a message); `unknown` when
+ * the template cannot be read within `floor`.
+ */
+function templateAround(r: Reader, at: number, floor: number): { start: number; head: string } | 'unknown' | undefined {
+  const { src, ctx } = r;
+  if (r.py) {
+    if (ctx.mask[at] !== STRING) return undefined;
+    let s = at;
+    while (s > floor && ctx.mask[s - 1] === STRING) s--;
+    const pre = /^(?:[rR]?[fF]|[fF][rR])(?=["'])/.exec(src.slice(s, s + 3))?.[0];
+    if (!pre) return undefined;
+    const q = src[s + pre.length]!;
+    const open = src.startsWith(q.repeat(3), s + pre.length) ? 3 : 1;
+    const text = src.slice(s + pre.length + open, at);
+    // `at` must sit inside a `{…}` interpolation: the last single `{` not closed before it.
+    let brace = -1;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (c === '{') {
+        if (text[i + 1] === '{' && brace < 0) i++;
+        else brace = i;
+      } else if (c === '}' && brace >= 0) brace = -1;
+    }
+    return brace >= 0 ? { start: s, head: text.slice(0, brace) } : undefined;
+  }
+  if (!ctx.isCode(at)) return undefined;
+  // JS: the code of a `${…}` sits right after a string-masked `${`.
+  let i = at;
+  while (i > floor && ctx.isCode(i - 1)) i--;
+  if (i - 2 < floor || ctx.mask[i - 1] !== STRING || src[i - 1] !== '{' || src[i - 2] !== '$') return undefined;
+  let s = i - 3;
+  while (s > floor && !(src[s] === '`' && ctx.mask[s] === STRING && src[s - 1] !== '\\')) s--;
+  if (src[s] !== '`') return 'unknown';
+  return { start: s, head: src.slice(s + 1, i - 2) };
+}
+
+/** The `+` chain to the left of offset `at` as one URL head, or undefined when nothing readable is concatenated before it. */
+function concatHead(r: Reader, at: number, floor: number): string | undefined {
+  return concatChain(r, at, floor)?.head;
+}
+
+/** …and where that chain starts. A chain longer than six parts is not read: its head is unknown. */
+function concatChain(r: Reader, at: number, floor: number): { head: string; start: number } | undefined {
+  const { src, ctx } = r;
+  const parts: string[] = [];
+  let i = at - 1;
+  let start = at;
+  for (let k = 0; k < 7; k++) {
+    while (i > floor && /\s/.test(src[i]!)) i--;
+    if (src[i] !== '+' || !ctx.isCode(i) || src[i - 1] === '+') break;
+    if (k === 6) return undefined;
+    i--;
+    while (i > floor && /\s/.test(src[i]!)) i--;
+    if (!ctx.isCode(i)) {
+      // A whole string literal: quotes (and a Python prefix) at its start, no code inside.
+      let s = i;
+      while (s > floor && !ctx.isCode(s - 1)) s--;
+      const m = /^[rRbBuUfF]{0,2}(["'`])/.exec(src.slice(s, s + 3));
+      if (!m || src[i] !== m[1]) return undefined;
+      parts.unshift(src.slice(s + m[0].length, i));
+      start = s;
+      i = s - 1;
+    } else {
+      const id = /[A-Za-z_$][\w$.]{0,80}$/.exec(src.slice(Math.max(floor, i - 80), i + 1))?.[0];
+      if (!id) return undefined;
+      parts.unshift(r.py ? `{${id}}` : `\${${id}}`);
+      i -= id.length;
+      start = i + 1;
+    }
+  }
+  return parts.length ? { head: parts.join(''), start } : undefined;
+}
+
+interface PinFrame {
+  /** Start of the statement holding the offset. */
+  stmt: number;
+  /** The brackets around the offset inside that statement, outermost first. */
+  open: number[];
+}
+
+/**
+ * For each offset (ascending), its statement start and enclosing brackets, in
+ * one pass over the body: a line break or `;` outside brackets ends a
+ * statement, and so does a JS block's `{` or `}`.
+ */
+function pinFrames(r: Reader, from: number, to: number, offsets: number[]): Map<number, PinFrame> {
+  const { src, ctx } = r;
+  const out = new Map<number, PinFrame>();
+  const stack: { at: number; block: boolean }[] = [];
+  let stmt = from;
+  let k = 0;
+  for (let i = from; i < to && k < offsets.length; i++) {
+    while (k < offsets.length && offsets[k] === i) {
+      const open: number[] = [];
+      for (let j = stack.length - 1; j >= 0 && !stack[j]!.block; j--) open.unshift(stack[j]!.at);
+      out.set(offsets[k++]!, { stmt, open });
+    }
+    if (!ctx.isCode(i)) continue;
+    const c = src[i]!;
+    if (c === '(' || c === '[' || c === '{') {
+      const block = c === '{' && !r.py && blockBrace(src, i, from);
+      stack.push({ at: i, block });
+      if (block) stmt = i + 1;
+    } else if (c === ')' || c === ']' || c === '}') {
+      if (stack.pop()?.block) stmt = i + 1;
+    } else if ((c === '\n' || c === ';') && (stack.length === 0 || stack[stack.length - 1]!.block)) stmt = i + 1;
+  }
+  return out;
+}
+
+/** A JS `{` that opens a block (after `)`, `=>`, `;`, a brace or `else` / `try` / `do` / `finally`), not an object. */
+function blockBrace(src: string, at: number, floor: number): boolean {
+  let i = at - 1;
+  while (i > floor && /\s/.test(src[i]!)) i--;
+  if (i <= floor) return true;
+  const c = src[i]!;
+  return c === ')' || c === ';' || c === '{' || c === '}' || (c === '>' && src[i - 1] === '=') || /\b(?:else|try|do|finally)$/.test(src.slice(Math.max(floor, i - 8), i + 1));
+}
+
+/**
+ * The URL / host parameters (`candidates`, as the schema names them) whose
+ * destination handler `fn` pins: every use of the value — or of a local copied
+ * from it (`uri = case_uri.lstrip("/")`) — builds a URL whose host is fixed
+ * (`f"{TNA_BASE}/{uri}/data.xml"`, `BASE + "/" + x`, `` `${API}/items/${id}` ``),
+ * reduces it to an id (`video_id = extract_video_id(video_url)`), or only tests,
+ * logs, raises with or returns it as data. Any other use — handed to a function
+ * the handler does not show (`_http_get_json(url)`), a request made with it, a
+ * template whose host it can change — leaves the destination open: nothing is
+ * pinned by what the handler does not say. Bounded: the body, the uses and the
+ * names followed are capped, and each pass is linear in the body.
+ */
+function pinnedParams(r: Reader, fn: FnInfo, candidates: string[]): string[] {
+  const from = fn.bodyStart;
+  const to = fn.bodyEnd;
+  if (!candidates.length || to <= from || to - from > MAX_PIN_BODY) return [];
+  const { src } = r;
+  const body = src.slice(from, to);
+  // The handler's inputs as locals: a schema key → the binding that holds it.
+  const local = new Map<string, string>();
+  const tainted = new Set<string>();
+  for (const p of r.params(fn)) {
+    if (p.name && !/^(?:self|cls|this|ctx|context)$/.test(p.name)) {
+      tainted.add(p.name);
+      if (r.py) local.set(p.name, p.name);
+    }
+    for (const k of p.keys ?? []) {
+      tainted.add(k.local);
+      local.set(k.key, k.local);
+    }
+  }
+  if (!tainted.size || tainted.size > MAX_PIN_INPUTS) return [];
+  // Locals computed from an input are inputs too, for the heads of other URLs.
+  const assign = r.py ? /^[ \t]*([A-Za-z_]\w*)\s*(?::[^=\n]{1,60})?=(?!=)([^\n]{1,300})/gm : /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;\n]{1,300})/g;
+  for (let pass = 0; pass < 2; pass++) {
+    const any = new RegExp(`(?<![\\w$.])(?:${[...tainted].map((n) => n.replace(/\$/g, '\\$')).join('|')})(?![\\w$])`);
+    let n = 0;
+    for (const m of body.matchAll(assign)) {
+      if (++n > 400 || tainted.size >= MAX_PIN_INPUTS * 2) break;
+      if (!tainted.has(m[1]!) && any.test(m[2]!)) tainted.add(m[1]!);
+    }
+  }
+  const out: string[] = [];
+  for (const cand of candidates) {
+    const name = local.get(cand);
+    if (name && pinsEveryUse(r, from, to, name, tainted)) out.push(cand);
+  }
+  return out;
+}
+
+/** Every use of `start` (and of the locals copied from it) pins or is inert, and at least one pins. */
+function pinsEveryUse(r: Reader, from: number, to: number, start: string, tainted: Set<string>): boolean {
+  const { src, ctx } = r;
+  const names = [start];
+  let pinned = false;
+  for (let q = 0; q < names.length; q++) {
+    if (q >= MAX_PIN_NAMES) return false;
+    const name = names[q]!;
+    const re = new RegExp(`(?<![\\w$.])${name.replace(/\$/g, '\\$')}(?![\\w$])`, 'g');
+    const anchors = new Map<number, number>();
+    let uses = 0;
+    for (const m of src.slice(from, to).matchAll(re)) {
+      if (++uses > MAX_PIN_USES) return false;
+      const at = from + m.index!;
+      const tpl = templateAround(r, at, from);
+      if (tpl === 'unknown') return false;
+      if (tpl) {
+        // What is concatenated before the template is part of its head: `server + \`/v1/${url}\``.
+        const before = concatChain(r, tpl.start, from);
+        const head = (before?.head ?? '') + tpl.head;
+        if (headPins(r, head, tainted) && !(head[0] === '/' && pathBaseOpen(r, before?.start ?? tpl.start, from, to, tainted))) pinned = true;
+        else anchors.set(at, tpl.start);
+        continue;
+      }
+      if (!ctx.isCode(at)) continue; // the name in text: a docstring, a message, a comment
+      // A keyword argument's name or an object key is not the value: `case_uri=uri`, `{ url: x }`.
+      const after = src.slice(at + name.length, at + name.length + 40);
+      const before = src.slice(Math.max(from, at - 40), at);
+      if (r.py ? /^\s*=(?!=)/.test(after) && /[(,]\s*$/.test(before) : /^\s*:/.test(after) && /[{,]\s*$/.test(before)) continue;
+      if (PIN_INERT_METHOD.test(after)) continue;
+      const chain = concatChain(r, at, from);
+      if (chain !== undefined) {
+        if (headPins(r, chain.head, tainted) && !(chain.head[0] === '/' && pathBaseOpen(r, chain.start, from, to, tainted))) {
+          pinned = true;
+          continue;
+        }
+        return false;
+      }
+      anchors.set(at, at);
+    }
+    if (!anchors.size) continue;
+    const frames = pinFrames(r, from, to, [...new Set(anchors.values())].sort((a, b) => a - b));
+    for (const [at, anchor] of anchors) {
+      const frame = frames.get(anchor);
+      const verdict = frame ? useVerdict(r, at, anchor, frame, name, to) : 'open';
+      if (verdict === 'open') return false;
+      if (verdict === 'pinned') pinned = true;
+      else if (verdict !== 'inert' && !names.includes(verdict.alias)) names.push(verdict.alias);
+    }
+  }
+  return pinned;
+}
+
+/** What one use of `name` at `at` (judged at `anchor`, its template when it sits in one) does with the value. */
+function useVerdict(r: Reader, at: number, anchor: number, frame: PinFrame, name: string, to: number): 'pinned' | 'inert' | 'open' | { alias: string } {
+  const { src } = r;
+  const stmtText = src.slice(frame.stmt, Math.min(to, frame.stmt + 600));
+  if (/^\s*(?:raise|throw)\b/.test(stmtText)) return 'inert';
+  const returns = /^\s*return\b/.test(stmtText);
+  // Out through the brackets around the use, innermost first.
+  for (let j = frame.open.length - 1; j >= 0; j--) {
+    const open = frame.open[j]!;
+    const lead = src.slice(Math.max(frame.stmt, open - 80), open);
+    if (src[open] === '[') {
+      // A subscript (`cache[url]`) looks something up with the value; a list literal holds it.
+      if (/[\w$\])]\s*$/.test(lead)) return 'open';
+      continue;
+    }
+    if (src[open] === '{') continue;
+    const callee = /([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*$/.exec(lead)?.[1]?.replace(/\s+/g, '') ?? '';
+    if (!callee || PIN_KEYWORDS.has(callee) || PIN_TRANSPARENT.test(callee)) continue;
+    if (PIN_INERT_CALL.test(callee)) return 'inert';
+    const last = callee.split('.').pop()!;
+    // `video_id = extract_video_id(video_url)`: the whole value is reduced to an id —
+    // by a function that parses it, not one that fetches it (`download_page_id(url)`).
+    if (j === 0) {
+      const calleeAt = open - (/[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*$/.exec(lead)?.[0].length ?? 0);
+      const target = PIN_ASSIGN_HEAD.exec(src.slice(frame.stmt, calleeAt))?.[1];
+      const words = nameWordsOf(last);
+      if (target && PIN_ID_NAME.test(target) && words.includes('id') && !words.some((w) => PIN_FETCH_WORDS.has(w))) return 'pinned';
+    }
+    // `return CitationNetwork(case_uri=uri, …)`: a data model handed back, held by nothing but data.
+    const heldByData = frame.open.slice(0, j).every((o) => src[o] === '{' || (src[o] === '[' && !/[\w$\])]\s*$/.test(src.slice(Math.max(frame.stmt, o - 80), o))));
+    if (returns && heldByData && /^[A-Z]/.test(last) && !PIN_REQUESTISH.test(last)) return 'inert';
+    return 'open';
+  }
+  const prefix = src.slice(frame.stmt, anchor);
+  if (anchor === at) {
+    const rest = src.slice(at + name.length, Math.min(to, at + name.length + 200));
+    // `uri = case_uri.lstrip("/")`: a copy, followed in its own right.
+    const target = PIN_ASSIGN_HEAD.exec(prefix)?.[1];
+    if (target && PIN_COPY_TAIL.test(rest)) return { alias: target };
+    // The name assigned to (`url = url.strip()`): the value it takes is its own use.
+    if (/^\s*$/.test(prefix) && /^\s*(?::[^=\n]{1,60})?=(?![=>])/.test(rest)) return 'inert';
+  }
+  // `if not url:`, `assert url`, `return url`, `return {"url": url}`.
+  return /^\s*(?:else\s+)?(?:if|elif|while|assert|return)\b/.test(prefix) ? 'inert' : 'open';
+}
+
+const pinnedMemo = new WeakMap<Reader, Map<string, string[] | undefined>>();
+
+/**
+ * The URL / host parameters among a registration's schema names whose
+ * destination its handler pins. One handler shared by thousands of
+ * registrations is read once.
+ */
+function pinnedOf(r: Reader, fn: FnInfo | undefined, names: readonly string[] | undefined): string[] | undefined {
+  if (!fn || !names?.length) return undefined;
+  const candidates = names.filter(namesDestinationParam).slice(0, 8);
+  if (!candidates.length) return undefined;
+  let memo = pinnedMemo.get(r);
+  if (!memo) pinnedMemo.set(r, (memo = new Map()));
+  const key = `${fn.bodyStart}:${candidates.join(',')}`;
+  if (memo.has(key)) return memo.get(key);
+  const out = pinnedParams(r, fn, candidates);
+  const result = out.length ? out : undefined;
+  if (memo.size < 4096) memo.set(key, result);
+  return result;
+}
+
+/** An HTTP write in a body: where the call is, and the arguments after its URL (the payload and the options). */
+interface WriteSite {
+  at: number;
+  sent: [number, number][];
+  why: string;
+}
+interface Writes {
+  ev: HandlerEvidence[];
+  sites: WriteSite[];
+}
+const writesMemo = new WeakMap<Reader, Map<string, Writes>>();
 
 /** HTTP writes (external-sink) and database writes (state-write) in a handler body — once per body. */
 function writesIn(r: Reader, from: number, to: number): HandlerEvidence[] {
+  return writesOf(r, from, to).ev;
+}
+
+function writesOf(r: Reader, from: number, to: number): Writes {
   let m = writesMemo.get(r);
   if (!m) writesMemo.set(r, (m = new Map()));
   const key = `${from}:${to}`;
@@ -2405,10 +3334,13 @@ function writesIn(r: Reader, from: number, to: number): HandlerEvidence[] {
  * otherwise. A body of thousands of options objects is padding, not a client.
  */
 const MAX_OPTIONS_READ = 64;
+/** HTTP writes per body read for what they carry out (see `leaksIn`): the rest is padding. */
+const MAX_WRITE_SITES = 64;
 
-function writesInUncached(r: Reader, from: number, to: number): HandlerEvidence[] {
+function writesInUncached(r: Reader, from: number, to: number): Writes {
   const { src, ctx } = r;
   const out: HandlerEvidence[] = [];
+  const sites: WriteSite[] = [];
   const body = src.slice(from, to);
 
   for (const m of body.matchAll(/\.\s*(post|put|patch|delete)\s*\(/gi)) {
@@ -2438,7 +3370,9 @@ function writesInUncached(r: Reader, from: number, to: number): HandlerEvidence[
       const req = postParts(r, first, args.slice(1).map(([a, b]) => src.slice(a, b).trim()), recv, bodyIndex(r, from, to), at);
       if (requestReads(r, req, from, to, at, true)) continue;
     }
-    out.push({ tag: 'external-sink', why: `handler sends an HTTP ${method} (${clip(src.slice(at - chain.length - 1, open + 1) + first)})`, line: ctx.line(at) });
+    const why = `handler sends an HTTP ${method} (${clip(src.slice(at - chain.length - 1, open + 1) + first)})`;
+    out.push({ tag: 'external-sink', why, line: ctx.line(at) });
+    if (sites.length < MAX_WRITE_SITES) sites.push({ at, sent: args.slice(1), why });
   }
 
   // `fetch(url, { method: 'POST' })`, `axios({ method: 'put' })` — the method key
@@ -2465,7 +3399,9 @@ function writesInUncached(r: Reader, from: number, to: number): HandlerEvidence[
         if (requestReads(r, req, from, to, at, false)) continue;
       }
     }
-    out.push({ tag: 'external-sink', why: `handler sends an HTTP ${method} (${clip(call.callee + '(' + (url || a0).trim())})`, line: ctx.line(at) });
+    const why = `handler sends an HTTP ${method} (${clip(call.callee + '(' + (url || a0).trim())})`;
+    out.push({ tag: 'external-sink', why, line: ctx.line(at) });
+    if (sites.length < MAX_WRITE_SITES) sites.push({ at, sent: config ? call.args : call.args.slice(1), why });
   }
 
   // Python: `requests.request("DELETE", url)`, `session.request('post', …)`. A
@@ -2474,13 +3410,15 @@ function writesInUncached(r: Reader, from: number, to: number): HandlerEvidence[
     const at = from + mm.index!;
     if (!ctx.isCode(at)) continue;
     const method = mm[2]!.toUpperCase();
+    const args = r.parts(at + mm[0].indexOf('(')) ?? [];
     if (method === 'POST') {
-      const args = r.parts(at + mm[0].indexOf('(')) ?? [];
       const url = args[1] ? src.slice(args[1][0], args[1][1]).trim() : '';
       const req = postParts(r, url, args.slice(2).map(([a, b]) => src.slice(a, b).trim()), 'requests', bodyIndex(r, from, to), at);
       if (requestReads(r, req, from, to, at, false)) continue;
     }
-    out.push({ tag: 'external-sink', why: `handler sends an HTTP ${method} (request("${mm[2]}", …))`, line: ctx.line(at) });
+    const why = `handler sends an HTTP ${method} (request("${mm[2]}", …))`;
+    out.push({ tag: 'external-sink', why, line: ctx.line(at) });
+    if (sites.length < MAX_WRITE_SITES) sites.push({ at, sent: args.slice(2), why });
   }
 
   // Database writes: an ORM mutation, a Mongo write, a write statement in SQL.
@@ -2499,7 +3437,7 @@ function writesInUncached(r: Reader, from: number, to: number): HandlerEvidence[
     if (!ctx.isCode(at)) continue;
     out.push({ tag: 'state-write', why: `handler runs a ${mm[1]!.toUpperCase()} statement`, line: ctx.line(at) });
   }
-  return out;
+  return { ev: out, sites };
 }
 
 const clip = (s: string): string => {
@@ -3251,12 +4189,33 @@ function pyDecorated(r: Reader): PyDecorated[] {
   return out;
 }
 
+/** A Python call's arguments: keywords by name, positionals in order, and what spreads left unknown. */
+interface PyCall {
+  kw: Map<string, Thunk>;
+  pos: Thunk[];
+  /** An unreadable `**kwargs` spread: any keyword may be in it. */
+  open: boolean;
+  /** An unreadable `*args` spread: the positions after it are unknown. */
+  posOpen: boolean;
+}
+
+/** A Python argument's range without the blanks and comments around it (`tool(  # note\n  name="x")`). */
+function pyArg(r: Reader, a: number, b: number): [number, number] {
+  const mask = r.ctx.mask;
+  while (a < b && (mask[a] === COMMENT || /\s/.test(r.src[a]!))) a++;
+  while (b > a && (mask[b - 1] === COMMENT || /\s/.test(r.src[b - 1]!))) b--;
+  return [a, b];
+}
+
 /** Keyword arguments of a Python call as name → expression, positional arguments in order. */
-function pyArgs(r: Reader, args: [number, number][] | null, env: Env | null, own: boolean): { kw: Map<string, Thunk>; pos: Thunk[]; open: boolean } {
+function pyArgs(r: Reader, args: [number, number][] | null, env: Env | null, own: boolean): PyCall {
   const kw = new Map<string, Thunk>();
   const pos: Thunk[] = [];
   let open = false;
-  for (const [a, b] of args ?? []) {
+  let posOpen = false;
+  for (const [a0, b0] of args ?? []) {
+    const [a, b] = pyArg(r, a0, b0);
+    if (a >= b) continue;
     const t = r.text(a, b);
     const lead = t.length - t.trimStart().length;
     const m = /^\s*([A-Za-z_]\w*)\s*=(?!=)\s*/.exec(t);
@@ -3278,49 +4237,331 @@ function pyArgs(r: Reader, args: [number, number][] | null, env: Env | null, own
       }
       continue;
     }
-    pos.push({ from: a, to: b, env, own });
+    // `*args` spreads a sequence into the positions; an unreadable one hides every position after it.
+    if (t.trimStart().startsWith('*')) {
+      const v = posOpen ? UNKNOWN : r.evRange(a + lead + 1, b, env, 0, own);
+      if (v.k === 'arr' && !v.open) pos.push(...v.items);
+      else if (!(v.k === 'lit' && v.v === null)) posOpen = true;
+      continue;
+    }
+    if (!posOpen) pos.push({ from: a, to: b, env, own });
   }
-  return { kw, pos, open };
+  return { kw, pos, open, posOpen };
 }
 
-function pyRegistrations(r: Reader, file: string): FoundRegistration[] {
+/**
+ * The tool name a Python registration gives itself: its `name=` keyword, or
+ * the positional FastMCP reads as the name (`tool(name)`, `add_tool(fn, name)`).
+ * `none` — it gives none (or `None`), so the function's own name stands;
+ * `unknown` — it gives one we cannot read, and then the function's name is
+ * certainly NOT the tool's.
+ */
+function pyExplicitName(r: Reader, call: PyCall, idx: number): { name: string } | 'none' | 'unknown' {
+  const t = call.kw.get('name') ?? call.pos[idx];
+  if (!t) return call.posOpen && !call.kw.has('name') ? 'unknown' : 'none';
+  const v = r.ev(t);
+  if (v.k === 'lit' && v.v === null) return 'none';
+  if (v.k === 'lit' && typeof v.v === 'string' && !v.partial) return { name: v.v };
+  return 'unknown';
+}
+
+const renamedMemo = new WeakMap<FnInfo, boolean>();
+const renamedNamesMemo = new WeakMap<FileCtx, Set<string>>();
+
+/** The names a file assigns a `__name__` to (`fn.__name__ = …`, `setattr(fn, "__name__", …)`), from one pass over it. */
+function renamedNames(ctx: FileCtx): Set<string> {
+  let out = renamedNamesMemo.get(ctx);
+  if (!out) {
+    out = new Set();
+    for (const m of ctx.src.matchAll(/(?<![\w.])([A-Za-z_]\w*)\s*\.\s*__name__\s*=(?!=)|\bsetattr\s*\(\s*([A-Za-z_]\w*)\s*,\s*['"]__name__['"]/g)) {
+      out.add((m[1] ?? m[2])!);
+    }
+    renamedNamesMemo.set(ctx, out);
+  }
+  return out;
+}
+
+/**
+ * Does the function carry another `__name__` than its `def` says? A wrapper
+ * made with `@functools.wraps(f)` takes f's name, and code that assigns
+ * `fn.__name__ = …` (or `setattr(fn, "__name__", …)`) names it at run time.
+ */
+function renamedPyFn(ctx: FileCtx, fn: FnInfo): boolean {
+  const hit = renamedMemo.get(fn);
+  if (hit !== undefined) return hit;
+  const { src } = ctx;
+  const n = fn.name ?? '';
+  // One pass per file, not one per function: thousands of functions must not each rescan it.
+  let v = !n || renamedNames(ctx).has(n);
+  // The decorators right above the `def`.
+  let lineStart = src.lastIndexOf('\n', fn.headerStart - 1) + 1;
+  for (let k = 0; !v && k < 16 && lineStart > 0; k++) {
+    const prev = src.lastIndexOf('\n', lineStart - 2) + 1;
+    const line = src.slice(prev, Math.min(lineStart - 1, prev + 400)).trim();
+    if (!line.startsWith('@')) break;
+    if (/^@\s*(?:functools\s*\.\s*)?wraps\b/.test(line)) v = true;
+    lineStart = prev;
+  }
+  renamedMemo.set(fn, v);
+  return v;
+}
+
+/** Readers of the package's other files: one per file, without the package (a constant there is read one hop deep). */
+const constReaders = new WeakMap<SourceFile, Reader>();
+
+function constReader(file: SourceFile): Reader {
+  let r = constReaders.get(file);
+  if (!r) constReaders.set(file, (r = new Reader(fileCtxOf(file))));
+  return r;
+}
+
+/** Readers of the package's other files with the package: a function defined there reads its own imports. */
+const pkgReaders = new WeakMap<PyPackage, Map<string, Reader>>();
+
+function pkgReader(file: SourceFile, pkg: PyPackage | undefined): Reader {
+  if (!pkg) return constReader(file);
+  let m = pkgReaders.get(pkg);
+  if (!m) pkgReaders.set(pkg, (m = new Map()));
+  let r = m.get(file.path);
+  if (!r) m.set(file.path, (r = new Reader(fileCtxOf(file), pkg)));
+  return r;
+}
+
+/** The function FastMCP reads a tool's schema and docstring from, and the file it is in. */
+interface PyTarget {
+  ctx: FileCtx;
+  fn: FnInfo;
+  /** Another file of the package; absent for this one. */
+  file?: SourceFile;
+}
+
+/** The input schema FastMCP builds for a registered function, its values folded where the function is defined. */
+function pySchema(r: Reader, target: PyTarget, call: PyCall): JsonSchema | undefined {
+  let exclude: Set<string> | undefined;
+  const ex = call.kw.get('exclude_args');
+  if (ex) {
+    const v = r.ev(ex);
+    if (v.k !== 'arr' || v.open) return undefined;
+    exclude = new Set();
+    for (const t of v.items) {
+      const s = r.str(t);
+      if (s === undefined) return undefined;
+      exclude.add(s);
+    }
+  }
+  const tr = target.file ? pkgReader(target.file, r.pkg) : r;
+  tr.begin([]);
+  return pySignatureSchema(
+    target.ctx,
+    target.fn,
+    (a, b, text) => {
+      const v = tr.evRange(a, b, null, 0);
+      if (v.k !== 'lit' || (v.partial && !(text && typeof v.v === 'string'))) return undefined;
+      return v.v;
+    },
+    exclude,
+  );
+}
+
+/** One `for <targets> in <iter>:` header. */
+interface PyLoopHead {
+  targets: [number, number];
+  iter: [number, number];
+  /** Offset of the header's `:`. */
+  colon: number;
+  /** The names the targets bind. */
+  names: string[];
+}
+
+/** The `for` header on the line starting at `lineStart`, if that line is one. */
+function pyForHeader(r: Reader, lineStart: number): PyLoopHead | undefined {
+  const { src } = r;
+  const m = /^[ \t]*(?:async[ \t]+)?for[ \t]+/.exec(src.slice(lineStart, lineStart + 200));
+  if (!m || !r.ctx.isCode(lineStart + m[0].length - 1)) return undefined;
+  const tStart = lineStart + m[0].length;
+  let inAt = -1;
+  for (let i = tStart, n = 0; i < src.length && n < 2000; i++, n++) {
+    if (!r.ctx.isCode(i)) continue;
+    const c = src[i]!;
+    if (c === '\n') return undefined;
+    if (c === '(' || c === '[' || c === '{') {
+      const e = r.close(i);
+      if (e < 0) return undefined;
+      i = e;
+    } else if (c === 'i' && src[i + 1] === 'n' && !/\w/.test(src[i - 1] ?? '') && !/\w/.test(src[i + 2] ?? '')) {
+      inAt = i;
+      break;
+    }
+  }
+  if (inAt < 0) return undefined;
+  for (let i = inAt + 2, n = 0; i < src.length && n < 20_000; i++, n++) {
+    if (!r.ctx.isCode(i)) continue;
+    const c = src[i]!;
+    if (c === '\n' && src[i - 1] !== '\\') return undefined;
+    if (c === '(' || c === '[' || c === '{') {
+      const e = r.close(i);
+      if (e < 0) return undefined;
+      n += e - i;
+      i = e;
+    } else if (c === ':') {
+      const names = [...r.text(tStart, inAt).matchAll(/[A-Za-z_]\w*/g)].map((x) => x[0]).slice(0, 32);
+      return { targets: [tStart, inAt], iter: [inAt + 2, i], colon: i, names };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The innermost `for` loop whose body holds `at`, found by walking the lines
+ * above it to the blocks that open them — never out of a `def` or a `class`.
+ */
+function pyLoopAt(r: Reader, at: number): PyLoopHead | undefined {
+  const { src } = r;
+  const lineStart = src.lastIndexOf('\n', at - 1) + 1;
+  // A one-line loop: `for fn in TOOLS: mcp.add_tool(fn)`.
+  const same = pyForHeader(r, lineStart);
+  if (same) return same.colon < at ? same : undefined;
+  let indent = /^[ \t]*/.exec(src.slice(lineStart, lineStart + 400))![0].length;
+  let end = lineStart - 1;
+  for (let steps = 0; end > 0 && indent > 0 && steps < 5000 && lineStart - end < 400_000; steps++) {
+    const start = src.lastIndexOf('\n', end - 1) + 1;
+    const ind = /^[ \t]*/.exec(src.slice(start, Math.min(end, start + 400)))![0].length;
+    const c0 = start + ind;
+    if (c0 < end && r.ctx.isCode(c0) && src[c0] !== '#' && ind < indent) {
+      const head = src.slice(c0, Math.min(end, c0 + 20));
+      if (/^(?:async[ \t]+)?(?:def|class)\b/.test(head)) return undefined;
+      if (/^(?:async[ \t]+)?for\b/.test(head)) return pyForHeader(r, start);
+      indent = ind;
+    }
+    end = start - 1;
+  }
+  return undefined;
+}
+
+/** Bind a loop's targets (`fn`, `fn, title`, `(name, (fn, title))`) to one element; what does not unpack is unknown. */
+function bindPyTargets(r: Reader, a: number, b: number, el: Thunk, vars: Map<string, Thunk>, depth = 0): void {
+  const [from, to] = r.trim(a, b);
+  const parts = r.split(from, to, ',').map(([x, y]) => r.trim(x, y)).filter(([x, y]) => y > x);
+  const unknown = (x: number, y: number): void => {
+    for (const n of r.text(x, y).matchAll(/[A-Za-z_]\w*/g)) vars.set(n[0], { val: UNKNOWN });
+  };
+  if (parts.length === 1 && !/,\s*$/.test(r.text(from, to))) {
+    const [x, y] = parts[0]!;
+    const t = r.text(x, y);
+    if (/^[A-Za-z_]\w*$/.test(t)) vars.set(t, el);
+    else if (r.src[x] === '[' && r.close(x) === y - 1 && depth < 4) bindPyTargets(r, x + 1, y - 1, el, vars, depth + 1);
+    else unknown(x, y);
+    return;
+  }
+  const v = r.ev(el);
+  const ok = v.k === 'arr' && !v.open && v.items.length === parts.length && depth < 4;
+  parts.forEach(([x, y], i) => {
+    if (ok) bindPyTargets(r, x, y, (v as { items: Thunk[] }).items[i]!, vars, depth + 1);
+    else unknown(x, y);
+  });
+}
+
+/** Bind a Python function's parameters to one call's arguments: positionals, keywords, `*args`, `**kwargs`, defaults. */
+function pyBindCall(r: Reader, fn: FnInfo, args: [number, number][], own: boolean): Env {
+  const header = r.text(fn.headerStart, fn.bodyStart);
+  const kwParam = /\*\*\s*([A-Za-z_]\w*)/.exec(header)?.[1];
+  const varParam = /(?<!\*)\*\s*([A-Za-z_]\w*)/.exec(header)?.[1];
+  const vars = new Map<string, Thunk>();
+  const extra = new Map<string, Thunk>();
+  const rest: Thunk[] = [];
+  let spread = false;
+  let k = 0;
+  for (const [a0, b0] of args) {
+    const [a, b] = pyArg(r, a0, b0);
+    if (a >= b) continue;
+    const t = r.text(a, b);
+    const m = /^\s*([A-Za-z_]\w*)\s*=(?!=)\s*/.exec(t);
+    if (m) {
+      const th: Thunk = { from: a + m[0].length, to: b, env: null, own };
+      if (fn.params.some((p) => p.name === m[1] && p.name !== kwParam && p.name !== varParam)) vars.set(m[1]!, th);
+      else extra.set(m[1]!, th);
+      continue;
+    }
+    // A spread at the call site: which parameter gets what is not known.
+    if (/^\s*\*/.test(t)) {
+      spread = true;
+      continue;
+    }
+    const p = fn.params[k];
+    if (!p || !p.name || p.name === kwParam) {
+      spread = true;
+      continue;
+    }
+    if (p.name === varParam) {
+      rest.push({ from: a, to: b, env: null, own });
+      continue;
+    }
+    vars.set(p.name, { from: a, to: b, env: null, own });
+    k++;
+  }
+  for (const p of fn.params) {
+    if (!p.name) continue;
+    const changed = reassigned(r, fn, p.name);
+    if (p.name === varParam) vars.set(p.name, spread || changed ? { val: UNKNOWN } : { val: { k: 'arr', items: rest, open: false } });
+    else if (p.name === kwParam) vars.set(p.name, { val: { k: 'obj', fields: extra, open: spread || changed } });
+    else if (vars.has(p.name)) {
+      if (changed) vars.set(p.name, { val: UNKNOWN });
+    } else if (spread || changed) vars.set(p.name, { val: UNKNOWN });
+    else if (p.default) {
+      const at = r.src.indexOf(p.default, fn.headerStart);
+      vars.set(p.name, at >= 0 && at < fn.bodyStart ? { from: at, to: at + p.default.length, env: null } : { val: UNKNOWN });
+    } else vars.set(p.name, { val: NULLISH });
+  }
+  return { vars, fn, parent: null };
+}
+
+/** Registration lines whose tool names could not be read, per file, at most. */
+const MAX_UNNAMED = 50;
+
+function pyRegistrations(r: Reader, file: string, unnamed: Set<number>): FoundRegistration[] {
   const out: FoundRegistration[] = [];
   const isMcp = mcpFile(r);
+  const unknownAt = (at: number): void => {
+    if (unnamed.size < MAX_UNNAMED) unnamed.add(r.ctx.line(at));
+  };
   const emit = (
     d: { at: number; defName?: string; defAt?: number },
     via: FoundRegistration['via'],
-    call: { kw: Map<string, Thunk>; pos: Thunk[]; open: boolean },
-    nameAt: number,
+    call: PyCall,
+    name: string,
+    target: PyTarget | undefined,
     helpers?: string[],
   ): void => {
     if (out.length >= MAX_REGS) return;
-    // FastMCP: `tool(name=None, …)` — the first positional is the name;
-    // `add_tool(fn, name=None, …)` — the second.
-    const name = r.str(call.kw.get('name')) ?? r.str(call.pos[nameAt]) ?? d.defName;
-    if (!name) return;
     const annT = call.kw.get('annotations');
     // `annotations` passed through an unreadable `**kwargs` may be anything.
     const ann = annT ? r.ev(annT) : call.open ? UNKNOWN : NULLISH;
     const h = r.hints(ann);
-    const description = r.str(call.kw.get('description'), true);
+    // FastMCP: the registration's description, else the function's docstring.
+    // One the registration gives but we cannot read is not replaced by the docstring.
+    const descT = call.kw.get('description');
+    const description = descT ? r.str(descT, true) : target ? pyDocstring(target.ctx, target.fn) : undefined;
     const title = r.str(call.kw.get('title'), true);
     const condition = conditionAt(r, d.at);
     // The decorated function IS the handler: read what its body sends or writes.
     const def = d.defAt !== undefined ? r.ctx.functions().find((f) => f.headerStart < d.defAt! && d.defAt! - f.headerStart < 160 && f.bodyStart > d.defAt!) : undefined;
     const fetched = def ? inputFetch(r, def) : undefined;
     const behavior = def ? [...(fetched ? [fetched] : []), ...writesIn(r, def.bodyStart, def.bodyEnd)].slice(0, 3) : [];
+    const inputSchema = target ? pySchema(r, target, call) : undefined;
+    const pinned = def ? pinnedOf(r, def, Object.keys(inputSchema?.properties ?? {})) : undefined;
     out.push({
       name, file, line: r.ctx.line(d.at), via, ...(helpers ? { helpers } : {}),
       ...(title ? { title } : {}), ...(description ? { description } : {}),
       ...(h.hints ? { hints: h.hints } : {}), hintSource: h.source,
-      ...(condition ? { condition } : {}), ...(behavior.length ? { behavior } : {}),
+      ...(condition ? { condition } : {}), ...(behavior.length ? { behavior } : {}), ...(pinned ? { pinned } : {}),
       ...(d.defAt !== undefined ? { defAt: d.defAt } : {}),
       ...(d.defName && d.defName !== name ? { defName: d.defName } : {}),
+      ...(inputSchema ? { inputSchema } : {}),
     });
   };
 
   // Decorator wrappers: a named function whose body calls `X.tool(…)`.
-  const wrappers = new Map<string, { fn: FnInfo; call: [number, number][]; kwParam?: string }>();
+  const wrappers = new Map<string, { fn: FnInfo; call: [number, number][] }>();
   for (const fn of r.ctx.functions()) {
     if (!fn.name) continue;
     const body = r.text(fn.bodyStart, fn.bodyEnd);
@@ -3330,76 +4571,173 @@ function pyRegistrations(r: Reader, file: string): FoundRegistration[] {
     if (!r.ctx.isCode(open)) continue;
     const parts = r.parts(open);
     if (!parts) continue;
-    const header = r.text(fn.headerStart, fn.bodyStart);
-    const kwParam = /\*\*\s*([A-Za-z_]\w*)/.exec(header)?.[1];
-    wrappers.set(fn.name, { fn, call: parts, ...(kwParam ? { kwParam } : {}) });
+    wrappers.set(fn.name, { fn, call: parts });
   }
 
-  for (const d of pyDecorated(r)) {
+  const decorated = pyDecorated(r);
+  for (const d of decorated) {
     if (out.length >= MAX_REGS) break;
     const segs = d.callee.split('.');
     const last = segs.pop()!;
+    const fnDef = pyDefAt(r.ctx, d.defAt);
+    const target = fnDef ? { ctx: r.ctx, fn: fnDef } : undefined;
     if (segs.length && last === 'tool') {
       // `@agent.tool` (pydantic-ai) and other frameworks' `.tool` decorators are
       // not MCP: the receiver has to look like one, or the file has to be MCP.
       if (!isMcp && !MCP_RECEIVER.test(segs.join('.'))) continue;
-      const own = d.args ?? [];
-      r.begin(own);
-      emit(d, 'decorator', pyArgs(r, d.args, null, true), 0);
+      r.begin(d.args ?? []);
+      const call = pyArgs(r, d.args, null, true);
+      const nm = pyExplicitName(r, call, 0);
+      if (nm === 'unknown') unknownAt(d.at);
+      else emit(d, 'decorator', call, nm === 'none' ? d.defName : nm.name, target);
       continue;
     }
     const w = wrappers.get(d.callee);
     if (!w || r.fnNamed(d.callee) !== w.fn || !isMcp) continue;
     // Bind the wrapper's parameters to the decorator call: positional, then keywords;
     // keywords it does not name go to its `**kwargs`.
-    const vars = new Map<string, Thunk>();
-    const extra = new Map<string, Thunk>();
-    let pos = 0;
-    const own = d.args ?? [];
-    r.begin(own);
-    for (const [a, b] of d.args ?? []) {
-      const m = /^\s*([A-Za-z_]\w*)\s*=(?!=)\s*/.exec(r.text(a, b));
-      if (m) {
-        const t: Thunk = { from: a + m[0].length, to: b, env: null, own: true };
-        if (w.fn.params.some((p) => p.name === m[1] && p.name !== w.kwParam)) vars.set(m[1]!, t);
-        else extra.set(m[1]!, t);
-      } else {
-        const p = w.fn.params[pos++];
-        if (p?.name) vars.set(p.name, { from: a, to: b, env: null, own: true });
-      }
-    }
-    for (const p of w.fn.params) {
-      if (!p.name || vars.has(p.name)) {
-        if (p.name && vars.has(p.name) && reassigned(r, w.fn, p.name)) vars.set(p.name, { val: UNKNOWN });
-        continue;
-      }
-      if (p.name === w.kwParam) {
-        // A wrapper that edits its **kwargs (`kwargs.setdefault(…)`) decides values we cannot see.
-        vars.set(p.name, { val: { k: 'obj', fields: extra, open: reassigned(r, w.fn, p.name) } });
-      } else if (p.default) {
-        const at = r.src.indexOf(p.default, w.fn.headerStart);
-        vars.set(p.name, at >= 0 && !reassigned(r, w.fn, p.name) ? { from: at, to: at + p.default.length, env: null } : { val: UNKNOWN });
-      } else vars.set(p.name, reassigned(r, w.fn, p.name) ? { val: UNKNOWN } : { val: NULLISH });
-    }
-    const env: Env = { vars, fn: w.fn, parent: null };
-    emit(d, 'decorator-helper', pyArgs(r, w.call, env, false), 0, [d.callee]);
+    r.begin(d.args ?? []);
+    const env = pyBindCall(r, w.fn, d.args ?? [], true);
+    const call = pyArgs(r, w.call, env, false);
+    const nm = pyExplicitName(r, call, 0);
+    if (nm === 'unknown') unknownAt(d.at);
+    else emit(d, 'decorator-helper', call, nm === 'none' ? d.defName : nm.name, target, [d.callee]);
   }
+
+  /**
+   * One `add_tool(fn, …)` evaluated: its explicit name, else the name of the
+   * function it registers — a `def` in this file or one imported from the
+   * package, never a loop variable, a parameter or a local that holds who
+   * knows what. `param` — the function is a parameter of the enclosing
+   * function, whose callers say which.
+   */
+  const addOne = (at: number, call: PyCall, via: FoundRegistration['via'], helpers?: string[]): 'done' | 'param' => {
+    const nm = pyExplicitName(r, call, 1);
+    if (nm === 'unknown') {
+      unknownAt(at);
+      return 'done';
+    }
+    const first = call.pos[0];
+    let target: PyTarget | undefined;
+    let fnName: string | undefined;
+    if (first) {
+      const v = r.ev(first);
+      if (v.k === 'fn' && v.fn.name) {
+        target = { ctx: r.ctx, fn: v.fn };
+        if (!renamedPyFn(r.ctx, v.fn)) fnName = v.fn.name;
+      } else if (v.k === 'ext') {
+        const ctx = fileCtxOf(v.file);
+        target = { ctx, fn: v.fn, file: v.file };
+        if (!renamedPyFn(ctx, v.fn)) fnName = v.name;
+      }
+    }
+    const name = nm === 'none' ? fnName : nm.name;
+    if (name) {
+      emit({ at, ...(target?.fn.name ? { defName: target.fn.name } : {}) }, via, call, name, target, helpers);
+      return 'done';
+    }
+    if (!helpers && first && !('val' in first)) {
+      const id = /^[A-Za-z_]\w*$/.exec(r.text(first.from, first.to).trim())?.[0];
+      const owner = r.enclosing(at);
+      if (id && owner?.params.some((p) => p.name === id)) return 'param';
+    }
+    unknownAt(at);
+    return 'done';
+  };
+
+  // One more loop element or wrapper caller read, within the file's budget.
+  let expansions = 0;
+  const canExpand = (site: number): boolean => {
+    if (++expansions <= MAX_PY_EXPANSIONS) return true;
+    truncatedFlag = true;
+    unknownAt(site);
+    return false;
+  };
+
+  // `def register(fn): mcp.add_tool(fn)` — the tools are what its callers in this file pass.
+  const expandHelper = (site: number, parts: [number, number][]): void => {
+    const h = r.enclosing(site)!;
+    if (!h.name || h.kind === 'method' || !h.params.length) {
+      unknownAt(site);
+      return;
+    }
+    const calls = r.ctx.callSitesOf(h.name).filter((c) => r.enclosing(c.index) !== h);
+    const uses = decorated.filter((d) => d.callee === h.name && d.args === null);
+    if (!calls.length && !uses.length) {
+      unknownAt(site);
+      return;
+    }
+    let n = 0;
+    for (const c of calls) {
+      if (++n > MAX_ITEMS || out.length >= MAX_REGS || !canExpand(site)) break;
+      const args = c.args.args.map((t, i) => [c.args.starts[i]!, c.args.starts[i]! + t.length] as [number, number]);
+      r.begin(args);
+      const env = pyBindCall(r, h, args, true);
+      addOne(c.index, pyArgs(r, parts, env, true), 'helper', [h.name]);
+    }
+    // `@register` on a `def`: the decorated function is the argument.
+    for (const d of uses) {
+      if (++n > MAX_ITEMS || out.length >= MAX_REGS || !canExpand(site)) break;
+      const def = pyDefAt(r.ctx, d.defAt);
+      const p0 = h.params[0]!.name;
+      if (!def || !p0) continue;
+      r.begin([]);
+      const env = pyBindCall(r, h, [], true);
+      env.vars.set(p0, { val: { k: 'fn', fn: def, env: null }, own: true });
+      addOne(d.at, pyArgs(r, parts, env, true), 'helper', [h.name]);
+    }
+  };
+
+  const addTool = (site: number, parts: [number, number][]): void => {
+    // In a loop, a registration that reads the loop's variables is one per element.
+    const loop = pyLoopAt(r, site);
+    if (loop && loop.names.some((n) => r.identOffsetsOf(n).some((i) => i >= parts[0]![0] && i < parts[parts.length - 1]![1]))) {
+      r.begin([]);
+      const iter = r.evRange(loop.iter[0], loop.iter[1], null, 0);
+      if (iter.k !== 'arr') {
+        // What the loop yields is unknown; a name that does not depend on it is still read.
+        const env: Env = { vars: new Map(loop.names.map((n) => [n, { val: UNKNOWN }])), fn: null, parent: null };
+        r.begin(parts);
+        if (addOne(site, pyArgs(r, parts, env, true), 'direct') === 'param') unknownAt(site);
+        return;
+      }
+      for (const el of iter.items.slice(0, MAX_ITEMS)) {
+        if (out.length >= MAX_REGS || !canExpand(site)) break;
+        const env: Env = { vars: new Map(), fn: null, parent: null };
+        bindPyTargets(r, loop.targets[0], loop.targets[1], el, env.vars);
+        r.begin(parts);
+        addOne(site, pyArgs(r, parts, env, true), 'loop', undefined);
+      }
+      if (iter.open) unknownAt(site);
+      return;
+    }
+    r.begin(parts);
+    if (addOne(site, pyArgs(r, parts, null, true), 'direct') === 'param') expandHelper(site, parts);
+  };
 
   // `mcp.add_tool(fn, name=…, annotations=…)` and low-level `Tool(name=…, inputSchema=…, annotations=…)`.
   if (isMcp) {
+    let sites = 0;
     for (const m of r.src.matchAll(/\.\s*add_tool\s*\(|(?<![\w.])(?:[A-Za-z_]\w{0,40}\.){0,4}Tool\s*\(/g)) {
       if (out.length >= MAX_REGS) break;
       if (!r.ctx.isCode(m.index!)) continue;
       const open = m.index! + m[0].length - 1;
       const parts = r.parts(open);
       if (!parts?.length) continue;
-      const isAdd = m[0].includes('add_tool');
+      if (m[0].includes('add_tool')) {
+        if (++sites > MAX_PY_ADD_SITES) {
+          truncatedFlag = true;
+          break;
+        }
+        addTool(m.index!, parts);
+        continue;
+      }
       r.begin(parts);
       const call = pyArgs(r, parts, null, true);
       // A LangChain `Tool(func=…)` is not an MCP tool; the MCP type carries an inputSchema.
-      if (!isAdd && !call.kw.has('inputSchema')) continue;
-      const fnName = isAdd ? /^[A-Za-z_]\w*$/.exec(r.text(parts[0]![0], parts[0]![1]).trim())?.[0] : undefined;
-      emit({ at: m.index!, ...(fnName ? { defName: fnName } : {}) }, 'direct', call, isAdd ? 1 : 99);
+      if (!call.kw.has('inputSchema')) continue;
+      const name = r.str(call.kw.get('name'));
+      if (name) emit({ at: m.index! }, 'direct', call, name, undefined);
     }
   }
   return out;
@@ -3408,25 +4746,33 @@ function pyRegistrations(r: Reader, file: string): FoundRegistration[] {
 // --- entry point ----------------------------------------------------------------
 
 /** Every tool registration this file makes that can be read with certainty. */
-export function readRegistrations(file: SourceFile): FoundRegistration[] {
-  return readRegistrationsWithStats(file).regs;
+export function readRegistrations(file: SourceFile, pkg?: PyPackage): FoundRegistration[] {
+  return readRegistrationsWithStats(file, pkg).regs;
 }
 
-/** {@link readRegistrations}, and whether a cap stopped the reading early (then some tools may be missing). */
-export function readRegistrationsWithStats(file: SourceFile): { regs: FoundRegistration[]; truncated: boolean } {
+/**
+ * {@link readRegistrations}, whether a cap stopped the reading early (then some
+ * tools may be missing), and the lines of registrations whose tool names cannot
+ * be read — `for fn in load_tools(): mcp.add_tool(fn)` registers tools, but
+ * which is known only at run time. `pkg` lets a Python file's registrations
+ * follow imports into the package's other files.
+ */
+export function readRegistrationsWithStats(file: SourceFile, pkg?: PyPackage): { regs: FoundRegistration[]; truncated: boolean; unnamed: number[] } {
   truncatedFlag = false;
-  const regs = readAll(file);
-  return { regs, truncated: truncatedFlag };
+  unnamedLines = new Set();
+  const regs = readAll(file, pkg);
+  return { regs, truncated: truncatedFlag, unnamed: [...unnamedLines].sort((a, b) => a - b) };
 }
 
 let truncatedFlag = false;
+let unnamedLines = new Set<number>();
 
-function readAll(file: SourceFile): FoundRegistration[] {
+function readAll(file: SourceFile, pkg?: PyPackage): FoundRegistration[] {
   const ctx = fileCtxOf(file);
-  const r = new Reader(ctx);
+  const r = new Reader(ctx, pkg);
   if (r.py) {
     if (!/\.tool\b|add_tool|\bTool\s*\(/.test(file.content)) return [];
-    return dedupe(pyRegistrations(r, file.path));
+    return dedupe(pyRegistrations(r, file.path, unnamedLines));
   }
   const hasRegs = /registerTool|addTool|\.tool\s*\(/.test(file.content);
   const hasList = /ListToolsRequestSchema|['"`]tools\/list['"`]/.test(file.content);
@@ -3465,12 +4811,14 @@ function readAll(file: SourceFile): FoundRegistration[] {
     const h = r.hints(v.annotations);
     const condition = guard ?? conditionAt(r, site);
     const behavior = handlerEvidence(r, v.handler, env);
+    const hv = v.handler && v.params?.some(namesDestinationParam) ? r.ev(v.handler) : undefined;
+    const pinned = hv?.k === 'fn' ? pinnedOf(r, hv.fn, v.params) : undefined;
     out.push({
       name: v.name, file: file.path, line: ctx.line(site), via, ...(helpers ? { helpers } : {}),
       ...(v.title ? { title: v.title } : {}), ...(v.description ? { description: v.description } : {}),
       ...(v.params ? { params: v.params } : {}),
       ...(h.hints ? { hints: h.hints } : {}), hintSource: h.source,
-      ...(condition ? { condition } : {}), ...(behavior.length ? { behavior } : {}),
+      ...(condition ? { condition } : {}), ...(behavior.length ? { behavior } : {}), ...(pinned ? { pinned } : {}),
     });
   };
 
@@ -3577,7 +4925,7 @@ function ownOfPair(el: { val: Val }): [number, number][] {
  * the two sit in the if and the else of one statement.
  */
 function mergeRegs(prev: FoundRegistration, r: FoundRegistration): FoundRegistration {
-  const richer = (x: FoundRegistration): number => (x.description ? 2 : 0) + (x.params ? 1 : 0);
+  const richer = (x: FoundRegistration): number => (x.description ? 2 : 0) + (x.params || x.inputSchema ? 1 : 0);
   const keep: FoundRegistration = { ...(richer(r) > richer(prev) ? r : prev) };
   // Every text the server may present under this name is scanned: a poisoned
   // description beside a longer clean one must not be the one dropped.
@@ -3588,6 +4936,10 @@ function mergeRegs(prev: FoundRegistration, r: FoundRegistration): FoundRegistra
   keep.hintSource = prev.hints && r.hints && !sameHints(prev.hints, r.hints) ? 'merged' : prev.hints ? prev.hintSource : r.hintSource;
   const behavior = [...(prev.behavior ?? []), ...(r.behavior ?? [])].filter((b, i, all) => all.findIndex((x) => x.why === b.why) === i);
   if (behavior.length) keep.behavior = behavior.slice(0, 3);
+  // A destination is pinned only where every handler of the name pins it.
+  const pinned = (prev.pinned ?? []).filter((p) => r.pinned?.includes(p));
+  if (pinned.length) keep.pinned = pinned;
+  else delete keep.pinned;
   if (!(prev.condition && r.condition) || complementary(prev.condition, r.condition)) delete keep.condition;
   return keep;
 }

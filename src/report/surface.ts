@@ -310,6 +310,10 @@ export function buildReportSurface(surface: ServerSurface): ReportSurface {
   for (const f of Array.isArray(surface.staticToolsTruncated) ? surface.staticToolsTruncated : []) {
     cut.push(`file ${f}: static tool recovery hit a reading cap — tools it registers may be missing`);
   }
+  for (const u of Array.isArray(surface.staticToolsUnnamed) ? surface.staticToolsUnnamed : []) {
+    if (typeof u?.file !== 'string') continue;
+    cut.push(`file ${u.file} line ${Number(u.line)}: registers tools whose names cannot be read statically — they are not listed`);
+  }
 
   const server: ReportSurface['server'] = {};
   const srv = isObject(surface.server) ? surface.server : {};

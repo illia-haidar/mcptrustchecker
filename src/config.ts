@@ -19,9 +19,6 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   minGrade: undefined,
   lockfile: undefined,
   policy: undefined,
-  publishToken: undefined,
-  publishUrl: undefined,
-  publishCategory: undefined,
 };
 
 const CONFIG_FILENAMES = ['mcptrustchecker.config.json', '.mcptrustcheckerrc.json', '.mcptrustcheckerrc'];
@@ -70,9 +67,6 @@ export function resolveConfig(partial: McpTrustCheckerConfig = {}): ResolvedConf
     minGrade: partial.minGrade,
     lockfile: partial.lockfile,
     policy: partial.policy,
-    publishToken: partial.publishToken,
-    publishUrl: partial.publishUrl,
-    publishCategory: partial.publishCategory,
   };
 }
 

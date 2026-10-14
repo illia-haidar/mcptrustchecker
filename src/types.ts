@@ -226,6 +226,12 @@ export interface ServerSurface {
   staticTools?: Record<string, StaticToolOrigin>;
   /** Files where static tool recovery hit a reading cap (some tools may be missing). */
   staticToolsTruncated?: string[];
+  /**
+   * Registrations the static extractor found but whose tool names it cannot read
+   * (`for fn in load_tools(): mcp.add_tool(fn)`): the server registers tools
+   * this surface does not list. Set with or without any recovered tools.
+   */
+  staticToolsUnnamed?: { file: string; line: number }[];
 }
 
 /** How the static extractor recovered one tool (see {@link ServerSurface.staticTools}). */
@@ -246,6 +252,12 @@ export interface StaticToolOrigin {
   condition?: { kind: 'if' | 'else' | 'unless'; expr: string; line: number };
   /** Capability evidence read from the handler body (an HTTP write). */
   behavior?: { tag: CapabilityTag; why: string; line: number }[];
+  /**
+   * URL / host parameters whose destination the handler pins (1.17): every use
+   * builds a URL on a fixed host (`f"{BASE}/{uri}"`) or reduces the value to an
+   * id first. Such a parameter is not a destination the model chooses.
+   */
+  pinned?: string[];
 }
 
 export interface SourceFile {
@@ -689,16 +701,6 @@ export interface McpTrustCheckerConfig {
   suppress?: Suppression[];
   /** Organisational policy the scan is gated against (see {@link Policy}). */
   policy?: Policy;
-  /**
-   * Credentials for the `publish` command. They only ever apply to that command:
-   * a scan never publishes, so there is no setting here that could turn it on.
-   */
-  /** API key for publishing (prefer the `MCPTRUSTCHECKER_TOKEN` env var). */
-  publishToken?: string;
-  /** Origin of the deployment to publish to (self-hosted installs). */
-  publishUrl?: string;
-  /** Registry category slug to file published packages under (default `other`). */
-  publishCategory?: string;
 }
 
 /** A single baseline waiver. `rule` is required; the rest narrow the match. */
@@ -729,13 +731,10 @@ export interface ResolvedConfig
   extends Required<
     Omit<
       McpTrustCheckerConfig,
-      'minGrade' | 'lockfile' | 'policy' | 'publishToken' | 'publishUrl' | 'publishCategory'
+      'minGrade' | 'lockfile' | 'policy'
     >
   > {
   minGrade?: Grade;
   lockfile?: string;
   policy?: Policy;
-  publishToken?: string;
-  publishUrl?: string;
-  publishCategory?: string;
 }

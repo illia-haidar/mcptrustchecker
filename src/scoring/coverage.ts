@@ -103,6 +103,17 @@ export function computeCoverage(surface: ServerSurface, verification?: Verificat
         );
       }
     }
+    // Registrations the extractor saw but could not name: the server has tools
+    // this surface does not list, and nothing was invented in their place.
+    const unnamed = !liveTransport && Array.isArray(surface.staticToolsUnnamed) ? surface.staticToolsUnnamed.filter((u) => typeof u?.file === 'string') : [];
+    if (unnamed.length) {
+      caveats.push(
+        `The source has registrations with unknown names: the tools registered at ${unnamed.slice(0, 3).map((u) => `\`${u.file}:${u.line}\``).join(', ')}` +
+          `${unnamed.length > 3 ? ` and ${unnamed.length - 3} more` : ''} get their names only at run time (a loop over a list the code ` +
+          'builds, a name it computes), so they are not in this surface and were not analysed. To see them, scan the running server: ' +
+          '--command "npx -y <package>".',
+      );
+    }
     if (!implementationSource && !liveTransport) {
       caveats.push(
         artifactRead && skipped.length

@@ -176,11 +176,15 @@ test('a statically recovered tool keeps only parameter names: its registration s
   assert.equal((await scanPkg('dist/index.js', zod('z.string()'))).capabilityProfile.level, 'moderate');
   assert.equal((await scanPkg('dist/index.js', zod("z.enum(['https://api.example.com/a', 'https://api.example.com/b'])"))).capabilityProfile.level, 'minimal');
 
-  // A Python decorator keeps no parameters at all: the handler is what shows a URL taken from the input.
-  const py = (body: string) =>
-    `import httpx\nfrom mcp.server.fastmcp import FastMCP\nmcp = FastMCP("x")\n\n@mcp.tool()\nasync def fetch_page(url: str, query: str) -> str:\n    """Fetch a page."""\n    ${body}\n`;
-  assert.equal((await scanPkg('src/srv/server.py', py('return httpx.get(url).text'))).capabilityProfile.level, 'moderate');
-  const fixed = await scanPkg('src/srv/server.py', py('return httpx.get("https://api.example.com/search", params={"q": query}).text'));
+  // A Python tool's parameters are its signature, as FastMCP sends them (1.17): a
+  // free `url: str` is the model's choice, a `Literal[…]` pins it; with no URL
+  // parameter, the handler is what shows a URL taken from the input.
+  const py = (params: string, body: string) =>
+    `import httpx\nfrom typing import Literal\nfrom mcp.server.fastmcp import FastMCP\nmcp = FastMCP("x")\n\n@mcp.tool()\nasync def fetch_page(${params}) -> str:\n    """Fetch a page."""\n    ${body}\n`;
+  assert.equal((await scanPkg('src/srv/server.py', py('url: str, query: str', 'return httpx.get(url).text'))).capabilityProfile.level, 'moderate');
+  const pinned = await scanPkg('src/srv/server.py', py('url: Literal["https://api.example.com/a"], query: str', 'return httpx.get("https://api.example.com/a", params={"q": query}).text'));
+  assert.equal(pinned.capabilityProfile.level, 'minimal');
+  const fixed = await scanPkg('src/srv/server.py', py('query: str', 'return httpx.get("https://api.example.com/search", params={"q": query}).text'));
   assert.equal(fixed.capabilityProfile.level, 'minimal');
   assert.deepEqual(fixed.capabilityProfile.observations, [UNTRUSTED_INPUT_OBSERVATION]);
 });

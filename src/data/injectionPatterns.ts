@@ -288,6 +288,14 @@ export const SUSPICIOUS_URL_PATH = /discord(?:app)?\.com\/api\/webhooks\/|api\.t
 export const URL_IP_LITERAL = /^\d{1,3}(?:\.\d{1,3}){3}$|^\[[0-9a-f:]+\]$/i;
 
 /**
+ * A loopback or private (RFC 1918) address literal, port optional: a lab device
+ * or the user's own machine, not an exfiltration endpoint (1.17). Link-local
+ * (169.254.0.0/16, the cloud metadata address) and public literals stay
+ * suspicious.
+ */
+export const URL_PRIVATE_IP = /^(?:127(?:\.\d{1,3}){3}|10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|0\.0\.0\.0|\[::1?\])(?::\d{1,5})?$/;
+
+/**
  * High-precision secret-value patterns. A match is an actual embedded
  * credential (not merely a reference to one), so it is `confirmed`. Evidence is
  * always redacted to a short prefix — never echo the secret.

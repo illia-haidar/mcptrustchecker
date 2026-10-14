@@ -43,7 +43,6 @@ src/
   util/                 text extraction, decode ladder, distance, hashing,
                         capabilities, transport headers, ansi
   policy.ts             policy-as-code gates (minGrade / denyRules / maxCapability)
-  publish.ts            `mcptrustchecker publish` — submit to the Trust Registry
   cli/index.ts          the `mcptrustchecker` binary (node:util parseArgs, no deps)
   index.ts              the public library API
 test/                   node:test suites + fixtures (incl. a real mock MCP server)

@@ -75,8 +75,12 @@ function opensDestination(cap: ToolCapability, defs: ToolDef[], surface: ServerS
   for (const def of defs) {
     const props = def.inputSchema?.properties;
     if (!props || typeof props !== 'object') continue;
+    // A URL the handler builds on a fixed host, or reduces to an id first, is not
+    // a destination the model chooses (see `StaticToolOrigin.pinned`).
+    const origins = surface?.toolProvenance === 'static' ? surface.staticTools : undefined;
+    const pinned = origins && typeof def.name === 'string' && Object.hasOwn(origins, def.name) ? origins[def.name]?.pinned : undefined;
     for (const [pname, pschema] of Object.entries(props)) {
-      if (!namesDestination(pname) || !freeDestination(pschema)) continue;
+      if (!namesDestination(pname) || !freeDestination(pschema) || pinned?.includes(pname)) continue;
       // A statically recovered tool keeps only parameter NAMES; its registration
       // source says whether the value is an enum, a literal or a pattern — and a
       // pattern pins the destination only when it bounds the whole value, as above.

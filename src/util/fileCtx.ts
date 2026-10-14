@@ -212,28 +212,44 @@ export class FileCtx {
   }
 
   private readonly _decls = new Map<string, Decl[]>();
+  private _pyDecls?: Map<string, { at: number; end: number }[]>;
 
   /** All `const|let|var NAME = …` (JS) / module-level `NAME = …` (Python) declarations, with their scope. */
   declsOf(name: string): Decl[] {
     const hit = this._decls.get(name);
     if (hit) return hit;
     const out: Decl[] = [];
+    if (this.lang === 'py') {
+      // Every module-level assignment of the file in one pass, then looked up by
+      // name: a scan per name asked about let a file of loops over tens of
+      // thousands of names cost a minute.
+      if (!this._pyDecls) {
+        this._pyDecls = new Map();
+        for (const m of this.src.matchAll(/^([A-Za-z_]\w*)\s*(?::[^=\n]{1,80})?=(?!=)/gm)) {
+          if (!this.isCode(m.index!)) continue;
+          const list = this._pyDecls.get(m[1]!);
+          const d = { at: m.index!, end: m.index! + m[0].length };
+          if (list) list.push(d);
+          else this._pyDecls.set(m[1]!, [d]);
+        }
+      }
+      for (const d of this._pyDecls.get(name) ?? []) out.push({ at: d.at, init: this.readInit(d.end), scope: null });
+      this._decls.set(name, out);
+      return out;
+    }
     const esc = name.replace(/[$]/g, '\\$');
-    const re =
-      this.lang === 'py'
-        ? new RegExp(`^${esc}\\s*(?::[^=\\n]{1,80})?=(?!=)`, 'gm')
-        : // A TypeScript annotation may hold `;` inside an object type:
-          // `const TOOLS: Array<{ name: string; description: string }> = [`.
-          new RegExp(`\\b(const|let|var)\\s+${esc}\\s*(?::[^=]{1,200}?)?=(?![=>])`, 'g');
+    // A TypeScript annotation may hold `;` inside an object type:
+    // `const TOOLS: Array<{ name: string; description: string }> = [`.
+    const re = new RegExp(`\\b(const|let|var)\\s+${esc}\\s*(?::[^=]{1,200}?)?=(?![=>])`, 'g');
     let m: RegExpExecArray | null;
     while ((m = re.exec(this.src))) {
       if (!this.isCode(m.index)) continue;
-      if (this.lang !== 'py' && m[1] !== 'const' && this.reassigned(name)) continue;
-      const nameAt = this.lang === 'py' ? m.index : m.index + m[0].indexOf(name, m[1]!.length);
-      const scope = this.lang === 'py' ? null : this.enclosingFn(nameAt);
+      if (m[1] !== 'const' && this.reassigned(name)) continue;
+      const nameAt = m.index + m[0].indexOf(name, m[1]!.length);
+      const scope = this.enclosingFn(nameAt);
       // `const`/`let` are BLOCK-scoped: inside `if (…) { const x = … }` the binding
       // ends at that block's `}`, and a same-named parameter rules outside it.
-      const block = this.lang !== 'py' && m[1] !== 'var' ? this.blockOf(m.index, scope) : null;
+      const block = m[1] !== 'var' ? this.blockOf(m.index, scope) : null;
       out.push({ at: nameAt, init: this.readInit(m.index + m[0].length), scope, ...(block ? { block } : {}) });
     }
     this._decls.set(name, out);

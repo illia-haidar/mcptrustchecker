@@ -67,13 +67,9 @@ test('CAP-003 (a): a parameter nothing says is run is low/heuristic — still re
         inputSchema: schema({ command: str("Natural-language command, e.g. 'go north', 'take the lantern'") }),
         annotations: { readOnlyHint: true, openWorldHint: true },
       },
-      // pkgtruth@0.2.2: the command is checked before someone else runs it.
-      {
-        name: 'check_install_command',
-        description: 'Verify the packages a shell command would install or execute, before running it: `npm install …`, `npx …`. Read-only.',
-        inputSchema: schema({ command: str('The exact shell command about to run, e.g. "npm install express crossenv".'), cwd: str() }),
-        annotations: { ...RO, destructiveHint: false, openWorldHint: true },
-      },
+      // pkgtruth@0.2.2 `check_install_command` (the command is checked before
+      // someone else runs it) gives no evidence at all since 1.17: a checker is
+      // handed the command, it does not run it (test/capability-1.17.test.ts).
       // @paretools/lint@0.22.2: `shell` is the dialect ShellCheck assumes.
       {
         name: 'shellcheck',
@@ -127,7 +123,6 @@ test('CAP-003 (a): a parameter nothing says is run is low/heuristic — still re
     {
       update_app_command: LOW,
       act: LOW,
-      check_install_command: LOW,
       shellcheck: LOW,
       get_agent_processes: LOW,
       grep_session_output: LOW,
@@ -642,7 +637,8 @@ export function registerHadolintTool(server) {
   // Lower case is the verb, and so is RUN as an order.
   assert.equal(assertsExecution('Default shell to run the given command'), true);
   assert.equal(assertsExecution('RUN the given command in a shell.'), true);
-  assert.deepEqual(live({ name: 'lint_x', description: 'Lints.', inputSchema: schema({ shell: str('Shell used to run instruction lines') }), annotations: RO }), {
-    lint_x: MEDIUM,
+  // (A linter's name would make the parameter its input, not a command, since 1.17.)
+  assert.deepEqual(live({ name: 'docker_x', description: 'Processes Dockerfiles.', inputSchema: schema({ shell: str('Shell used to run instruction lines') }), annotations: RO }), {
+    docker_x: MEDIUM,
   });
 });

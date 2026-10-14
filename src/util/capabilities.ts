@@ -37,8 +37,91 @@ function tokenize(text: string): Set<string> {
 
 function keywordMatches(haystack: string, tokens: Set<string>, keyword: string): boolean {
   const k = normalizeForMatch(keyword);
-  if (k.includes(' ')) return haystack.includes(k);
+  if (k.includes(' ')) return keywordAt(haystack, k, 0) >= 0;
   return tokens.has(k);
+}
+
+const WORD_START = /[a-z0-9]/;
+const WORD_END = /[a-z]/;
+
+/**
+ * Where phrase `k` (normalised, with a space) stands in normalised `text` as
+ * whole words, at or after `from`, or -1. Since 1.17 a phrase matches only at
+ * word boundaries: "read pr" is not inside "read project", "get token" is not
+ * inside "budget tokens". Its last word may take a plural ("read files", "web
+ * searches") or a version digit (`send_email2`).
+ */
+export function phraseAt(text: string, k: string, from: number): number {
+  for (let at = text.indexOf(k, from); at >= 0; at = text.indexOf(k, at + 1)) {
+    if (at > 0 && WORD_START.test(text[at - 1]!)) continue;
+    let end = at + k.length;
+    if (text[end] === 's') end += 1;
+    else if (text[end] === 'e' && text[end + 1] === 's') end += 2;
+    if (end < text.length && WORD_END.test(text[end]!)) continue;
+    return at;
+  }
+  return -1;
+}
+
+/**
+ * A phrase's last word that takes nothing after it but a plural: a short or
+ * ambiguous word whose continuation is another word — "read pr" is not inside
+ * "read project", "get logs" not inside "get_logsources", "export data" not
+ * inside "export_datasource", "export to" not inside "export_token".
+ */
+const STRICT_LAST = new Set(['pr', 'dm', 'db', 'id', 'to', 'env', 'sms', 'page', 'log', 'logs', 'data', 'repo']);
+/** …except where the continuation is the same word: the environment's variables, a database. */
+const STRICT_EXTENDS: Record<string, RegExp> = {
+  env: /^iron(?:ment variables?|ment vars?)?(?![a-z])/,
+  data: /^bases?(?![a-z])/,
+};
+/**
+ * A word a phrase may stand behind without a word boundary: "unread messages",
+ * a PR's "thread comments", MySQL's and PostgreSQL's SQL.
+ */
+const LEFT_PREFIXES: Record<string, readonly string[]> = {
+  'read comment': ['th', 'un'],
+  'read message': ['th', 'un'],
+  'read email': ['un'],
+  'read dm': ['un'],
+  'sql query': ['my', 'ms', 'no', 'pl', 'postgre', 't'],
+};
+
+/**
+ * Where lexicon phrase `k` stands in normalised `text` as a keyword, at or after
+ * `from`, or -1 (1.17). It starts at a word boundary (or behind one of its
+ * `LEFT_PREFIXES`). A short or ambiguous last word ({@link STRICT_LAST}) ends at
+ * a word boundary, as {@link phraseAt} reads it; a longer one also takes an
+ * inflection or a compound — "read_configuration", "python_execute",
+ * "read_filesystem", "search_websites", "web_searcher", "run_shellscript",
+ * "execute_sqlite_query" — as 1.16.1's substring match did, and a final `y`
+ * its `ies` plural ("sql queries"). Linear in the text: one `indexOf` scan per form.
+ */
+export function keywordAt(text: string, k: string, from: number): number {
+  const at = keywordScan(text, k, from, k);
+  if (!k.endsWith('y')) return at;
+  const plural = keywordScan(text, `${k.slice(0, -1)}ies`, from, k);
+  return at < 0 ? plural : plural < 0 ? at : Math.min(at, plural);
+}
+
+function keywordScan(text: string, form: string, from: number, k: string): number {
+  const last = k.slice(k.lastIndexOf(' ') + 1);
+  const strict = STRICT_LAST.has(last) || last.length <= 2;
+  const prefixes = LEFT_PREFIXES[k];
+  for (let at = text.indexOf(form, from); at >= 0; at = text.indexOf(form, at + 1)) {
+    if (at > 0 && WORD_START.test(text[at - 1]!)) {
+      const p = prefixes?.find((x) => at >= x.length && text.startsWith(x, at - x.length));
+      if (!p || (at > p.length && WORD_START.test(text[at - p.length - 1]!))) continue;
+    }
+    const end = at + form.length;
+    if (end >= text.length || !WORD_END.test(text[end]!)) return at;
+    if (form !== k) continue; // the `ies` plural takes nothing after it
+    if (!strict) return at;
+    if (text[end] === 's' && (end + 1 >= text.length || !WORD_END.test(text[end + 1]!))) return at;
+    if (text[end] === 'e' && text[end + 1] === 's' && (end + 2 >= text.length || !WORD_END.test(text[end + 2]!))) return at;
+    if (STRICT_EXTENDS[last]?.test(text.slice(end, end + 24))) return at;
+  }
+  return -1;
 }
 
 /** A sentence end in the prose, kept as its own token so a negation does not reach past it. */
@@ -83,7 +166,7 @@ class DescriptionMatcher {
     // same words in prose ("List files attached to a task" next to a
     // `list_files` tool) are prose. A one-word name (`curl`, `fetch`) is a tool
     // only where the text marks it as one: quoted, `curl tool`, `call curl`.
-    let raw = desc;
+    let raw = maskExampleValues(desc);
     for (const n of otherNames) {
       if (!raw.includes(n)) continue;
       raw = maskMentions(raw, n);
@@ -110,8 +193,8 @@ class DescriptionMatcher {
       for (let i = 0; i < this.tokens.length; i++) if (this.tokens[i] === k && !this.negatedAt(i)) return true;
       return false;
     }
-    // A phrase matches as a substring, as `keywordMatches` does.
-    for (let at = this.text.indexOf(k); at >= 0; at = this.text.indexOf(k, at + 1)) {
+    // A phrase matches as a keyword, as `keywordMatches` reads it.
+    for (let at = keywordAt(this.text, k, 0); at >= 0; at = keywordAt(this.text, k, at + 1)) {
       if (!this.negatedAt(this.tokenAt(at))) return true;
     }
     return false;
@@ -188,6 +271,61 @@ function maskMentions(text: string, name: string): string {
   });
 }
 
+/** An example in prose and the text it covers: up to a `)`, a line end or a sentence end. */
+const EXAMPLE_FRAME = /(?:\be\.g\.|\bi\.e\.|\bfor (?:example|instance)\b|\bsuch as\b|\bexamples?[ \t]{0,4}:)([^)\n]{0,200})/gi;
+/** A quoted one-word value: `"call-api"`, `'search_web'`. */
+const QUOTED_VALUE = /(["'`])[\w.:/@-]{1,60}\1/g;
+
+/**
+ * A sentence that says the tool runs what it is named — "Run any integration
+ * action by name, e.g. "send_email" …": its examples are what the tool does.
+ */
+const DISPATCH_LEAD =
+  /\b(?:run|runs|perform|performs|execute|executes|invoke|invokes|call|calls|dispatch|dispatches|trigger|triggers)\b[^.\n]{0,120}?\b(?:actions?|tools?|commands?|operations?|functions?|methods?|capabilit(?:y|ies)|integrations?|tasks?)\b/i;
+
+/**
+ * Mask the quoted values an example gives — "Name of this step (e.g.
+ * "search-memories", "call-api")" names what a caller may pass, not what the
+ * tool does (1.17). A value with spaces in it (`e.g. "curl -X POST …"`) is a
+ * sentence, and stays; so do the examples of a dispatcher whose sentence says it
+ * runs the actions it is named.
+ */
+function maskExampleValues(desc: string): string {
+  if (!/e\.g\.|i\.e\.|for (?:example|instance)|such as|example/i.test(desc)) return desc;
+  return desc.replace(EXAMPLE_FRAME, (m: string, body: string, offset: number) => {
+    const lead = desc.slice(Math.max(0, offset - 200), offset);
+    if (DISPATCH_LEAD.test(lead.slice(Math.max(lead.lastIndexOf('\n'), lead.lastIndexOf('. ')) + 1))) return m;
+    const end = /\.(?=\s|$)/.exec(body);
+    const cut = end ? end.index : body.length;
+    return m.slice(0, m.length - body.length) + body.slice(0, cut).replace(QUOTED_VALUE, ` ${MASK} `) + body.slice(cut);
+  });
+}
+
+const CURL_WORD = /(?<![\w-])curl(?![\w-])/gi;
+const CURL_BEFORE = /(?:[`'"]|\b(?:via|using|with|through|use|uses|run|runs|call|calls|invoke|invokes|execute|executes|out to|like|as|than|system))\s*$/i;
+const CURL_AFTER =
+  /^(?:\s*[`'"]|\s+(?:-{1,2}[A-Za-z]|['"]?https?:\/\/|['"]?\$\{?\w|<\w|(?:command|commands|request|requests|call|calls|cli|does)\b|to[ \t]+(?:upload|download|fetch|post|send|get|call|hit|query|request|retrieve|probe|ping|reach|test)\b|(?:(?:the|that|this|your|an?)[ \t]+)?(?:target|pages?|it)\b|(?:[A-Za-z]+[ \t]+){0,3}?(?:endpoints?|urls?|apis?|servers?|sites?|hosts?|links?|webhooks?|services?)\b)|[^\n|]{0,200}\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b)/i;
+
+/**
+ * "curl" in prose is the program only in a command's context: in backticks or
+ * quotes, followed by a flag, a URL or what it requests (`curl -X POST`, "curl
+ * https://…", "curl the given URL", "curl each url", "curl to upload"), piped
+ * into a shell (`curl … | sh`), or named as a program ("via curl", "the system
+ * curl", "like curl does", "a curl command", the product's own spelling
+ * "cURL"). Otherwise it is the English verb: "large flat surfaces that tend to
+ * curl at the corners" (1.17).
+ */
+function curlIsCommand(desc: string): boolean {
+  if (desc.length > MAX_PROSE) return true; // not read whole: no exemption rests on it
+  const text = desc;
+  for (const m of text.matchAll(CURL_WORD)) {
+    const at = m.index!;
+    if (m[0] === 'cURL') return true;
+    if (CURL_BEFORE.test(text.slice(Math.max(0, at - 16), at)) || CURL_AFTER.test(text.slice(at + 4, at + 260))) return true;
+  }
+  return false;
+}
+
 const relevantNamesMemo = new WeakMap<readonly string[], string[]>();
 
 /**
@@ -244,6 +382,8 @@ export interface ToolWords {
   nameSet: Set<string>;
   /** Parameter names as declared. */
   params: string[];
+  /** Each parameter's words, in `params` order. */
+  paramWords: string[][];
   paramTokens: Set<string>;
   description: string;
   title: string;
@@ -252,11 +392,13 @@ export interface ToolWords {
 export function toolWords(tool: ToolDef): ToolWords {
   const name = normalizeForMatch(typeof tool?.name === 'string' ? tool.name : '').split(' ').filter(Boolean);
   const params = paramNames(tool);
+  const paramWords = params.map(tokensOf);
   return {
     name,
     nameSet: new Set(name),
     params,
-    paramTokens: new Set(params.flatMap(tokensOf)),
+    paramWords,
+    paramTokens: new Set(paramWords.flat()),
     description: typeof tool?.description === 'string' ? tool.description : '',
     title: typeof tool?.title === 'string' ? tool.title : '',
   };
@@ -340,19 +482,275 @@ export function schemaParamDescription(tool: ToolDef, param: string): string {
   return p && typeof p === 'object' && typeof p.description === 'string' ? p.description : '';
 }
 
+// A `script` of a translation tool is a writing system ("Mayura only. None = native script.").
+const WRITING_SCRIPT_CONTEXT = /\b(?:translat\w*|transliterat\w*|romani[sz]\w*|writing systems?|alphabets?|native script|latin script|devanagari|cyrillic)\b/i;
+// The word before `code` that makes it a label, not source: `source_language_code`, `country_code`, `status_code`.
+const CODE_LABELS = new Set(['language', 'lang', 'locale', 'country', 'currency', 'region', 'status', 'error', 'exit', 'response', 'http', 'postal', 'zip', 'color', 'colour', 'iso', 'auth', 'verification', 'otp', 'promo', 'discount', 'coupon', 'invite', 'referral']);
+/** Verbs of a tool that inspects a command it is given rather than running it. */
+const VALIDATOR_VERBS = new Set(['validate', 'validates', 'check', 'checks', 'lint', 'lints', 'verify', 'verifies', 'parse', 'parses', 'analyze', 'analyzes', 'analyse', 'analyses']);
+// `build_command` on `verify_build`: the tool is named for what the command does.
+export const COMMAND_ACTIONS = new Set(['build', 'test', 'tests', 'typecheck', 'lint', 'compile', 'install', 'start', 'run', 'launch', 'deploy', 'setup', 'init', 'bootstrap', 'format', 'migrate', 'seed', 'serve']);
+// Words of a description sentence that are about what a command parameter carries.
+const EXEC_OBJECT_MENTIONS = new Set(['command', 'commands', 'cmd', 'cmds', 'script', 'scripts', 'shell', 'shells', 'code', 'program', 'programs', 'process', 'processes', 'executable', 'binary', 'expression', 'expressions', 'snippet', 'snippets', 'cli']);
+// The last word of a parameter name that makes it an identifier or a setting of
+// the command, not the command itself: `command_number`, `script_id`, `shell_dialect`.
+const NON_COMMAND_HEADS = new Set(['id', 'ids', 'uuid', 'guid', 'number', 'num', 'no', 'index', 'idx', 'count', 'key', 'keys', 'type', 'types', 'kind', 'status', 'version', 'ref', 'timeout', 'limit', 'level', 'mode', 'format', 'lang', 'language', 'dialect', 'style', 'tier', 'hash', 'size', 'length', 'offset', 'cursor', 'page', 'total', 'enabled']);
+// The first word of a parameter name that makes it a switch: `include_command`, `show_script`.
+const FLAG_LEADS = new Set(['include', 'with', 'show', 'use', 'enable', 'disable', 'allow', 'has', 'is', 'skip', 'no', 'hide', 'exclude', 'omit']);
+
+/** A name's words, camelCase split too (`runScript` → run, script). */
+export const nameWords = (name: string): string[] =>
+  name.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+
+/** What the sentences of one description say about runs, read once (see `proseRuns`). */
+interface ProseRuns {
+  text: string;
+  /** A sentence asserts a run about a command / script / process word, or with a start verb ("an MCP server starts"). */
+  always: boolean;
+  /** The words of the sentences that assert a run: a parameter's word among them says it is what is run. */
+  words: Set<string>;
+  /** A sentence about a command reports a run of it (see `REPORTS_RUN`). */
+  reports: boolean;
+  /** The words of the sentences that report a run. */
+  reportWords: Set<string>;
+}
+/** The last description read: one tool's thousands of parameters ask about the same prose. */
+let proseRunsMemo: ProseRuns | undefined;
+
+function proseRuns(description: string): ProseRuns {
+  if (proseRunsMemo?.text === description) return proseRunsMemo;
+  const out: ProseRuns = { text: description, always: false, words: new Set(), reports: false, reportWords: new Set() };
+  for (const s of proseSentences(description)) {
+    if (s.some((_, i) => execVerbAt(s, i))) {
+      for (const t of s) out.words.add(t);
+      if (s.some((t) => EXEC_OBJECT_MENTIONS.has(t)) || s.some((t, i) => (t.startsWith('start') || t.startsWith('launch')) && execVerbAt(s, i))) out.always = true;
+    }
+    if (s.some((_, i) => reportsRunAt(s, i))) {
+      for (const t of s) out.reportWords.add(t);
+      if (s.some((t) => EXEC_OBJECT_MENTIONS.has(t))) out.reports = true;
+    }
+  }
+  proseRunsMemo = out;
+  return out;
+}
+
+/**
+ * Does a sentence of `description` say that something is run, about the
+ * command (a word of the parameter's name, or a command / script / process
+ * word) or with a start verb ("an MCP server starts")? Prose too long to read
+ * whole counts as saying it.
+ */
+export function proseRunsCommand(description: string, paramTokens: readonly string[]): boolean {
+  if (description.length > MAX_PROSE) return true;
+  const p = proseRuns(description);
+  return p.always || sharesWord(paramTokens, p.words);
+}
+
+/** Does a word of three letters or more of `toks` stand in `words`? */
+function sharesWord(toks: readonly string[], words: Set<string>): boolean {
+  if (words.size === 0) return false;
+  for (const t of toks) if (t.length >= 3 && words.has(t)) return true;
+  return false;
+}
+
+/**
+ * Words that report a run's result as the tool's own (1.17): the command "is
+ * invoked", "exits with status 0", the tool "returns its exit code" / "its
+ * output". A checker that says so runs what it checks.
+ */
+function reportsRunAt(s: readonly string[], i: number): boolean {
+  const w = s[i]!;
+  const next = s[i + 1] ?? '';
+  let hit = false;
+  if (w === 'invoked') hit = true;
+  else if (w === 'exit' || w === 'exits' || w === 'exited') {
+    const k = next === 'with' ? i + 2 + (s[i + 2] === 'a' || s[i + 2] === 'an' ? 1 : 0) : i + 1;
+    hit = s[k] === 'status' || s[k] === 'code';
+  } else if (w === 'return' || w === 'returns' || w === 'returned') {
+    const o = next === 'its' || next === 'the' ? s[i + 2] : '';
+    hit = (o === 'exit' && (s[i + 3] === 'code' || s[i + 3] === 'status')) || o === 'output' || o === 'stdout' || o === 'stderr';
+  } else if (w === 'output' || w === 'stdout') {
+    hit = (s[i - 1] === 'its' || s[i - 1] === 'the') && (next === 'returned' || (next === 'is' && s[i + 2] === 'returned'));
+  }
+  if (!hit) return false;
+  for (let j = i - 1; j >= 0 && j >= i - VERB_WINDOW; j--) if (VERB_NEGATORS.has(s[j]!) || NOT_ASSERTED.has(s[j]!)) return false;
+  return true;
+}
+
+/** What a tool's name and prose say about its command parameters, read once per tool. */
+interface CommandFacts {
+  name: string;
+  description: string;
+  title: string;
+  words: string[];
+  /** A validator, linter, checker or parser by its name, with no execution verb in it. */
+  validator: boolean;
+  spoken: boolean;
+  writing: boolean;
+  execProse: boolean;
+}
+const commandFactsMemo = new WeakMap<object, CommandFacts>();
+
+function commandFacts(tool: ToolDef, w: ToolWords): CommandFacts {
+  const name = typeof tool?.name === 'string' ? tool.name : '';
+  const key = tool && typeof tool === 'object' ? tool : undefined;
+  const hit = key && commandFactsMemo.get(key);
+  if (hit && hit.name === name && hit.description === w.description && hit.title === w.title) return hit;
+  const words = nameWords(name);
+  const said = `${w.name.join(' ')} ${w.title} ${w.description}`;
+  const facts: CommandFacts = {
+    name,
+    description: w.description,
+    title: w.title,
+    words,
+    validator: words.some((t) => VALIDATOR_VERBS.has(t)) && !words.some((_, i) => execVerbAt(words, i)),
+    spoken: SPOKEN_SCRIPT_CONTEXT.test(said),
+    writing: WRITING_SCRIPT_CONTEXT.test(said),
+    execProse: EXEC_SEMANTICS.test(w.description),
+  };
+  if (key) commandFactsMemo.set(key, facts);
+  return facts;
+}
+
+/**
+ * A validator, linter, checker or parser handed a command does not run it
+ * (1.17): `validate_script(script: "The script to run.")` returns a token for a
+ * later `run_script` call. Its name has such a verb and no execution verb, it is
+ * not named for what the command does (`verify_build` runs its
+ * `build_command`), and no sentence of its own description says it runs one
+ * ("Test that an MCP server starts" does) or reports the run ("Check whether a
+ * shell command exits with status 0", "the given command is invoked and its
+ * output returned"). The parameter's own text is not read: it describes the
+ * command as it will run, later and elsewhere.
+ */
+function validatesCommand(toks: readonly string[], facts: CommandFacts, w: ToolWords): boolean {
+  if (!facts.validator) return false;
+  const action = toks.length > 1 ? toks[toks.length - 2]! : '';
+  if (COMMAND_ACTIONS.has(action) && facts.words.includes(action)) return false;
+  if (proseRunsCommand(w.description, toks)) return false;
+  const p = proseRuns(w.description);
+  return !(p.reports || sharesWord(toks, p.reportWords));
+}
+
 /**
  * Is code-exec parameter token `token` of parameter `param` another word here?
  * `eval_id` / `eval_name` name an evaluation (a parameter called `eval`
- * evaluates); the `script` of a speech tool is the text to be spoken unless its
- * text says it is run.
+ * evaluates); the `script` of a speech tool is the text to be spoken, and of a
+ * translation tool a writing system, unless its text says it is run; a
+ * `language_code` is a label; and a validator's command is inspected, not run.
  */
 export function execParamIsHomonym(param: string, token: string, tool: ToolDef, w: ToolWords): boolean {
-  const toks = tokensOf(param);
+  return homonymOf(tokensOf(param), param, token, tool, w);
+}
+
+function homonymOf(toks: readonly string[], param: string, token: string, tool: ToolDef, w: ToolWords): boolean {
   if (token === 'eval') return toks.length > 1 && !toks.some((x) => CODE_TOKENS.has(x));
-  if (token === 'script' && SPOKEN_SCRIPT_CONTEXT.test(`${w.name.join(' ')} ${w.title} ${w.description}`)) {
-    return !EXEC_SEMANTICS.test(`${w.description} ${schemaParamDescription(tool, param)}`);
+  if (token === 'code') {
+    const at = toks.indexOf('code');
+    if (at > 0 && CODE_LABELS.has(toks[at - 1]!)) return true;
+  }
+  const facts = commandFacts(tool, w);
+  if (token === 'script') {
+    const own = schemaParamDescription(tool, param);
+    // The parameter's text is read on its own and where it meets the tool's ("… native" + "script …").
+    const writing = facts.writing || (own !== '' && WRITING_SCRIPT_CONTEXT.test(`${w.description.slice(-40)} ${own}`));
+    if ((facts.spoken || writing) && !facts.execProse && !(own !== '' && EXEC_SEMANTICS.test(own))) return true;
+  }
+  return validatesCommand(toks, facts, w);
+}
+
+/**
+ * What command word `token` makes of parameter `param` (1.17):
+ *  - `other` — another word here ({@link execParamIsHomonym}): no evidence at all;
+ *  - `setting` — an identifier, a setting or a switch OF a command (`script_id`,
+ *    `shell_type`, `include_command`): weak evidence that gives no tag. MTC-CAP-003
+ *    still reports a contradiction resting on it, low; MTC-CAP-001, MTC-CAP-006
+ *    and the capability level do not count it;
+ *  - `command` — the command itself.
+ */
+export function commandParamKind(param: string, token: string, tool: ToolDef, w: ToolWords, toks: readonly string[] = tokensOf(param)): 'command' | 'setting' | 'other' {
+  if (homonymOf(toks, param, token, tool, w)) return 'other';
+  if (NON_COMMAND_HEADS.has(toks[toks.length - 1]!) || (toks.length > 1 && FLAG_LEADS.has(toks[0]!))) return 'setting';
+  return 'command';
+}
+
+// A parameter named for a secret is a credential the CALLER passes in —
+// `validate_jwt(token, secret)`, `verify_webhook(payload, signature, secret)`,
+// `configure_sso(client_secret)` — not a secret the tool reads (1.17). It counts
+// as a read only on a tool that reads secrets, whose name or first word reads
+// (`vault_read`, "Retrieves …"): as the SELECTOR of a secret (`secret_name`,
+// `secret_id`, `secret_path`), or as a bare `secret` on a tool about secrets
+// (`retrieve_secret(secret)`, "Retrieve a secret from Azure Key Vault", "Resolve
+// a 1Password secret reference … and return its plaintext value").
+const SECRET_SELECTORS = new Set(['name', 'names', 'id', 'ids', 'path', 'paths', 'ref', 'refs', 'arn', 'uri', 'label', 'alias']);
+const SECRET_READ_VERBS = new Set(['get', 'gets', 'read', 'reads', 'list', 'lists', 'fetch', 'fetches', 'retrieve', 'retrieves', 'reveal', 'reveals', 'show', 'shows', 'view', 'dump', 'dumps', 'export', 'exports', 'decrypt', 'decrypts', 'load', 'loads', 'lookup', 'access', 'accesses', 'describe', 'describes', 'cat', 'return', 'returns', 'resolve', 'resolves']);
+const SECRET_NOUNS = new Set(['secret', 'secrets']);
+// A parameter that names where the tool sends (the external-sink parameter names
+// of PARAM_NAME_SIGNALS): a secret passed to a tool that also takes its
+// destination — `summarize(url, secret, webhook)` — goes wherever the caller says.
+const DESTINATION_PARAMS = new Set(['webhook', 'webhooks', 'recipient', 'recipients']);
+
+// …or on a tool whose description says its answer carries one ("the response then
+// carries `license.license_key` … naming the secret field"), not withheld, and not
+// on a tool that says its secrets are write-only.
+const SECRET_WORD = /\b(?:secrets?|credentials?|passwords?|api[ _-]?keys?|private[ _-]?keys?|license[ _-]?keys?)\b/gi;
+const ANSWER_WORD = /\b(?:response|result|output|returns?|reveals?|surfaces?|exposes?|prints?)\b/gi;
+/** Between the answer word and the secret: "returns metadata, never the secret", "a redacted password". */
+const WITHHELD = /\b(?:never|not|no|without|redact\w*|mask\w*|hidden|omit\w*)\b|n['’]t\b/i;
+/** Right before the answer word: "does not return", "never prints", "won't reveal". */
+const WITHHELD_BEFORE = /(?:\b(?:never|not|no)|n['’]t)\s+(?:\w+\s+)?$/i;
+const WRITE_ONLY = /\bwrite[- ]only\b/gi;
+
+/** Does a sentence about secrets call them write-only ("Secrets are write-only: …")? Not one about an audit log. */
+function secretsWriteOnly(desc: string): boolean {
+  if (desc.length > MAX_PROSE) return false; // not read whole: no exemption rests on it
+  for (const m of desc.matchAll(WRITE_ONLY)) {
+    const start = Math.max(desc.lastIndexOf('\n', m.index), desc.lastIndexOf('. ', m.index)) + 1;
+    const rest = /\.\s|\n/.exec(desc.slice(m.index, m.index + 400));
+    if (/\b(?:secrets?|credentials?|passwords?|api[ _-]?keys?|private[ _-]?keys?|license[ _-]?keys?)\b/i.test(desc.slice(start, m.index + (rest ? rest.index : 400)))) return true;
   }
   return false;
+}
+
+/**
+ * Does the description say the tool's answer carries a secret? Each secret word
+ * is read with the answer word nearest before it in its sentence: a negation
+ * elsewhere in the sentence ("not cached and returns the decrypted password",
+ * "never truncated: it prints the API key in full") does not withhold it, one
+ * between them or on the answer word does. Prose too long to read whole counts
+ * as saying it.
+ */
+function answerHoldsSecret(desc: string): boolean {
+  if (desc.length > MAX_PROSE) return true;
+  for (const s of desc.matchAll(SECRET_WORD)) {
+    let before = desc.slice(Math.max(0, s.index - 120), s.index);
+    before = before.slice(Math.max(before.lastIndexOf('\n'), before.lastIndexOf('. ')) + 1);
+    let anchor = -1;
+    for (const a of before.matchAll(ANSWER_WORD)) anchor = a.index;
+    if (anchor < 0) continue;
+    if (!WITHHELD.test(before.slice(anchor)) && !WITHHELD_BEFORE.test(before.slice(Math.max(0, anchor - 24), anchor))) return true;
+  }
+  return false;
+}
+
+function readsNamedSecret(tool: ToolDef, w: ToolWords): boolean {
+  if (secretsWriteOnly(w.description)) return false;
+  if (answerHoldsSecret(w.description)) return true;
+  if (w.params.some((p) => tokensOf(p).some((t) => DESTINATION_PARAMS.has(t)) && !tokensOf(p).some((t) => SECRET_NOUNS.has(t)))) return true;
+  let selects = false;
+  let bare = false;
+  for (const p of w.params) {
+    const toks = tokensOf(p);
+    const at = toks.findIndex((t) => SECRET_NOUNS.has(t));
+    if (at < 0) continue;
+    if (SECRET_SELECTORS.has(toks[at + 1] ?? '')) selects = true;
+    else if (toks.length === 1) bare = true;
+  }
+  if (!selects && !bare) return false;
+  const name = nameWords(typeof tool?.name === 'string' ? tool.name : '');
+  const lead = proseSentences(w.description)[0] ?? [];
+  if (!name.some((t) => SECRET_READ_VERBS.has(t)) && !SECRET_READ_VERBS.has(lead[0] ?? '')) return false;
+  return selects || name.some((t) => SECRET_NOUNS.has(t)) || lead.some((t) => SECRET_NOUNS.has(t));
 }
 
 /** Verbs that, next to a `url` parameter, say the tool reads that URL. */
@@ -619,7 +1017,8 @@ export function extractToolCapability(tool: ToolDef, origin?: StaticToolOrigin, 
         inName = true;
         break;
       }
-      if (!operative && !why && prose.hit(kw)) {
+      // "curl" in prose is the program only in a command's context, not the verb.
+      if (!operative && !why && prose.hit(kw) && (kw !== 'curl' || curlIsCommand(desc))) {
         why = `keyword "${kw}"`;
         inProse = true;
       }
@@ -631,8 +1030,12 @@ export function extractToolCapability(tool: ToolDef, origin?: StaticToolOrigin, 
   for (const sig of PARAM_NAME_SIGNALS) {
     for (const pn of sig.names) {
       if (!pTokens.has(pn)) continue;
-      // Every parameter carrying it is another word here: `eval_id`, the `script` a speech tool speaks.
-      if (sig.tag === 'code-exec' && words.params.every((p) => !tokensOf(p).includes(pn) || execParamIsHomonym(p, pn, tool, words))) continue;
+      // Every parameter carrying it is another word here (`eval_id`, the `script`
+      // a speech tool speaks, a validator's command) or names a setting of a
+      // command (`script_id`, `shell_type`): no tag.
+      if (sig.tag === 'code-exec' && words.params.every((p, i) => !words.paramWords[i]!.includes(pn) || commandParamKind(p, pn, tool, words, words.paramWords[i]) !== 'command')) continue;
+      // A secret passed in is not a secret read.
+      if (sig.tag === 'sensitive-source' && pn === 'secret' && !readsNamedSecret(tool, words)) continue;
       addReason(sig.tag, `parameter "${pn}"`, 'param');
       break;
     }
@@ -681,8 +1084,9 @@ export function extractToolCapability(tool: ToolDef, origin?: StaticToolOrigin, 
   // token inside `relayer_ui_url` — and says it fetches, downloads or scrapes
   // takes in whatever the caller points it at. That makes its prose-only
   // untrusted-input leg operative (a live scan has no handler to show it).
+  // A URL the handler pins to a fixed host (see `StaticToolOrigin.pinned`) is not one.
   const from = sources['untrusted-input'];
-  if (from && !from.some((f) => f !== 'description') && words.params.some((p) => /^(?:url|uri|urls|uris)$/i.test(p))) {
+  if (from && !from.some((f) => f !== 'description') && words.params.some((p) => /^(?:url|uri|urls|uris)$/i.test(p) && !origin?.pinned?.includes(p))) {
     const fetchVerb = FETCH_VERBS.find((v) => prose.hit(v));
     if (fetchVerb) addReason('untrusted-input', `parameter "url" with "${fetchVerb}" in the description`, 'param');
   }
