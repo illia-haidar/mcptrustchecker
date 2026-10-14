@@ -7,7 +7,7 @@
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { join, relative, extname } from 'node:path';
+import { join, relative, extname, sep } from 'node:path';
 import type { PackageLayout, ServerSurface, SkippedFile, SourceFile } from '../types.js';
 import { LICENSE_FILE, licenseFromNpmManifest, licenseFromPyproject, licenseFromSetupCfg } from '../util/license.js';
 import { SOURCE_EXTENSIONS } from '../data/sourcePatterns.js';
@@ -71,12 +71,16 @@ export function readSourceFiles(dir: string, skipped?: SkippedFile[]): SourceFil
         continue;
       }
       if (!SOURCE_EXTENSIONS.has(extname(name).toLowerCase())) continue;
+      // POSIX separators on every OS, as in a packed artifact: every path rule
+      // downstream (test / example / fixture skipping, entry points, layout)
+      // reads `/`, so on Windows `tests\test_server.py` slipped past them.
+      const path = (relative(dir, full) || name).split(sep).join('/');
       if (st.size > MAX_FILE_BYTES) {
-        skipped?.push({ path: relative(dir, full) || name, bytes: st.size, reason: 'over-per-file-limit' });
+        skipped?.push({ path, bytes: st.size, reason: 'over-per-file-limit' });
         continue;
       }
       try {
-        out.push({ path: relative(dir, full) || name, content: readFileSync(full, 'utf8') });
+        out.push({ path, content: readFileSync(full, 'utf8') });
         total += st.size;
       } catch {
         /* unreadable file — skip */

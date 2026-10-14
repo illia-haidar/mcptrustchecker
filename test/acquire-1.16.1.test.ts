@@ -434,7 +434,7 @@ test('CLI --auto-discover: every config failing on a hiccup exits 3; one that re
   writeFileSync(join(home, '.codeium', 'windsurf', 'mcp_config.json'), JSON.stringify({ mcpServers: { remote: { url: 'https://example.com/mcp' } } }));
   const partial = cli(['--online', '--json'], { packument: 503 }, { cwd, home });
   assert.equal(partial.status, 3, partial.stderr);
-  assert.match(partial.stderr, /skipped .*\.cursor\/mcp\.json: the registry answered HTTP 503/);
+  assert.match(partial.stderr, /skipped .*\.cursor[\\/]mcp\.json: the registry answered HTTP 503/);
   assert.match(partial.stderr, /temporary failure some discovered configs could not be scanned, so no gate was evaluated/);
   assert.ok(JSON.parse(partial.stdout), 'the configs that resolved are still reported');
   notABug(partial.stderr);

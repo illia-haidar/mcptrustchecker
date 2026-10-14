@@ -180,6 +180,13 @@ object; every cut is named in `surface.truncated`. Without the flag the report
 is unchanged; scores and `surfaceDigest` are untouched. New exports:
 `buildReportSurface`, `SURFACE_LIMITS`, `ReportSurface`, `ReportSurfaceTool`.
 
+### Windows: local scans skip test and example code again
+
+A local directory scan built its file paths with the OS separator, so on Windows
+`tests\test_server.py` slipped past every path rule that reads `/` — test,
+example and fixture code could add its throwaway tools to the surface. Local
+paths now use `/`, as in a packed artifact (also in 1.16.0 and earlier).
+
 ### Hardened before release
 
 Seven rounds of review attacked the changes themselves. Every reproduced case is
