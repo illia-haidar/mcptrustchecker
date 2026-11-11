@@ -5,6 +5,88 @@ deterministic: the **methodology version** is bumped whenever a change could
 move a score, so a grade is always reproducible against the version that
 produced it.
 
+## 1.18.0 — methodology `mcptrustchecker-1.18`
+
+**MTC-SRC-002 says what the scanner saw when a program is resolved at runtime.** Only MTC-SRC-002 changes, and only in its words and labels: no severity, confidence, capability tag, score or client score moves. Re-scan stored results before comparing with 1.17.0.
+
+### Words that match what the scanner saw
+
+- A `dynamic-program` finding keeps its severity, confidence, capability tag and score contribution whatever the tool-input check finds: the analysis reads one file, and tool input may arrive from another.
+- The finding is reworded when all of this holds for the file's reported call and for every other call of the file that runs code chosen at runtime, so the order of the calls does not decide the words:
+  - the program does not fold, and it is written as a plain name, a member of one or an element of one: `bin`, `this.bin`, `cfg?.paths.bin`, `process.env.TOOL`, `argv[0]`. In Python it is the first element of one inline list, or the whole first argument (`cmd`, `*argv`);
+  - the API takes a program and an argv array: `execFile`, `spawn`, `fork` and their `Sync` forms, execa's `execa`, Python `subprocess` without a shell, `asyncio.create_subprocess_exec`;
+  - no shell or eval flag is written as a string anywhere in the arguments, or held by an argv that folds: `-c`, `-lc`, `-ic`, `-e`, `-p`, `--eval`, `--print`, `--command`, `--exec`, and in any case `/c`, `/k`, `/r`, `-Command`, `-EncodedCommand`, `-enc`;
+  - the options neither ask for a shell nor name one: no `shell: true`, no `shell: isWin`, no `shell` key next to a spread;
+  - in Python, the program is not given by keyword (`args=`, `executable=`);
+  - the call shows no tool input.
+- A reworded finding has the title "Runs a program resolved at runtime" where 1.17 said "Shell/command execution", with the same place ("in package code (…)", "in server code (…)", …). Its description has three parts:
+  - what runs: "`execFile(…)` runs a program resolved at runtime (a variable, configuration or a lookup)";
+  - what the scanner saw, which depends on the file (below);
+  - what follows: "If tool input can reach it, this is command injection / RCE; if it is the package's own binary or a known tool run with fixed arguments, it is a process-spawning capability."
+- What the scanner saw:
+  - in a file with no sign of MCP or tools: "In this file the scanner saw no tool input reach the program or its arguments". The remediation is "If the program comes only from your own configuration or a fixed install path, keep it that way: pass an argv array (no shell), never let tool input choose the program or a command line it runs, and validate any argument that comes from tool input."
+  - in any other file: "The scanner cannot tell whether tool input reaches the program or its arguments in this file", with the 1.17 remediation. The tool-input tracker knows only some handler shapes, so the sign is broad:
+    - "tool" in the file's path (`src/tools/exec.ts`);
+    - "tool", "schema", "jsonrpc" / "json-rpc" or an MCP tool annotation (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`), in any case, anywhere in the file's text: code, comments and strings alike (`MCPTool`, `@Tool(`, `call_tool`, `.tool(`, `tools/call`, `inputSchema`, `CallToolRequestSchema`, "Handlers for the tools");
+    - "mcp" or `modelcontextprotocol`, in any case, in the file's code (`FastMCP`, `mcp.server`), on a line that imports or requires (`require("@modelcontextprotocol/sdk")`, `from "mcp-framework"`), or more than a thousand times anywhere;
+    - a handler the tracker recognises.
+- The reworded text reports what the scanner saw and what follows from it. It never says that there is nothing to fix.
+- The 1.17 text stays in these cases:
+  - tool input is visible;
+  - the reported call is `shell-dynamic`: it is not reworded, and keeps the 1.17 title and remediation. Its description changes only where it carries the runtime-shell words below, or where its list of calls shows that label;
+  - a literal program runs code chosen at runtime (`osascript -e <script>`, `node -e <code>`, `npx <package>`, `process.execPath <script>`);
+  - the program is not written as a plain reference, because it may be a literal the scanner did not read: a comment before it (`subprocess.run(  # noqa` followed by `["git", …])`), `["git"] + args`, a tuple, `` `${dir}/bin/tool` ``, `process.env.RUNNER ?? "npx"`, a call (`getBin()`, `shutil.which("uvx")`, `wrap(["ls-files"])`, `String.fromCharCode(…)`), a cast (`<Brand<string, "bin">>"node"`), a ternary, an `await`;
+  - the arguments hold a shell or eval flag: `execFile(process.env.SHELL, ["-lc", command])`, `spawn(comspec, ["/d", "/c", line])`, `[shell, "-c", line]`, `["-c"].concat(line)`;
+  - the options ask for a shell or name one: `{ shell: true, env: { ...process.env } }`, `{ cwd, shell: win, ...extra }`;
+  - in Python, the program is given by keyword: `subprocess.run(args=["git", "status"])`, `subprocess.run(argv, executable="/bin/sh")`;
+  - the API runs a shell (`exec`, `execSync`), splits one command string (`execaCommand`), or cannot be named by the scanner (`cp[name](…)`, `getattr(subprocess, name)(…)`, a module loaded through a binding it cannot read);
+  - a bound process function is recorded as `<passed on as a value>`: handed on (`runWith(cmd, spawn)`, `module.exports = { spawn }`) or used right where it is named (`spawn.sync(…)`, `spawn["call"](…)`, `(spawn)(…)`, `(0, spawn)(…)`, `execFileSync!(…)`, ``execa`git status` ``, `typeof spawn`). The record does not say which, so it keeps the 1.17 words, as it keeps the 1.17 severity;
+  - another call of the same file is one of the above.
+- A finding whose only change is its text keeps its evidence and fingerprint.
+
+### Tool input in the program and the options of a call that runs a program chosen at runtime
+
+- For a call that runs a program chosen at runtime (`dynamic-program`, `shell-dynamic`), tool input counts as visible in the program and the options, not only in the argv or the command line.
+- A result callback does not count: it runs after the process. A program or options that hold a template literal, or are longer than 4 KB together, are not read again, and the 1.17 reading stays.
+- As in 1.17, `toolInput` is false for a call recorded without its arguments: a function handed on as a value, an API chosen at runtime, a module loaded through a binding the scanner cannot read.
+- A fixed program keeps the argv-only reading of 1.17, so the medium "option injection" case fires nowhere new. None of this moves a severity; it changes only `toolInput` and which words a finding gets.
+
+### A `shell` option set at runtime
+
+- `spawn("npx", args, { shell: process.platform === "win32" })` is labelled `shell-dynamic`: a `shell` key at the top level of inline options, set at runtime, with runtime arguments. The words are "a shell may run a command line built at runtime (the shell option is set at runtime)"; 1.17 said `dynamic-program (npx)`.
+- "Set at runtime" means that the value of that key names a binding (`process.platform === "win32"`, `isWin`, a parameter). A value of literals and operators only (`!1`, `!0`, `void 0`), a constant set to one, or a value longer than 200 characters keeps the 1.17 label and words.
+- The word `shell` elsewhere does not count: in a comment, in a nested object (`env: { shell: loginShell }`), inside another value (`cwd: cmd === shell ? a : b`), or in options held in a name. Those calls keep the 1.17 label and words.
+- Both shapes have the same profile (high, strong, `code-exec`), and the call ranks as before, so the file's reported call, its evidence and the score stay. What 1.17 called `shell-fixed` or fixed stays so.
+
+### Also
+
+- Large minified bundles scan much faster, with the same findings: the `let` / `var` reassignment check is memoised per name. CLI timings:
+  - oioxo-mcp 0.5.92 (one 3.7 MB bundle): 14.7 s → 1.1 s;
+  - @visa/cli 4.0.1 (two 3 MB bundles): 43.0 s → 2.0 s.
+- The tool-input check visits only the functions that hold tool input; the answers are the same. The program and the options are read in the same walk as the argv.
+- firebase-tools 15.34.2 scans in the same time: the CLI median of six alternating pairs is 435 ms on 1.17.0 and 440 ms on 1.18.0.
+- Proving a program fixed through `cross-spawn`'s `.sync`, objects or wrapper functions is not part of this release.
+
+### Measured movement
+
+The corpus has 341 artifacts: 11 whose `dynamic-program` reports prompted this change, 300 MCP server packages that spawn processes (200 npm, 100 PyPI) and 30 controls. Against 1.17.0:
+
+- no grade, score, client score or score vector changes;
+- no severity, confidence or capability tag moves;
+- no finding is added or removed, and no evidence or fingerprint changes;
+- no other rule changes.
+
+What does change:
+
+- 336 findings in 178 artifacts now read "Runs a program resolved at runtime" (289 high, 47 low outside the server):
+  - 130 say the scanner saw no tool input reach the program or its arguments, and get the "If the program comes only from your own configuration …" remediation;
+  - 206, in files with a sign of MCP or tools, say the scanner cannot tell whether tool input reaches them, and keep the 1.17 remediation.
+- 347 findings change their words: the 336 above, nine with the runtime-shell words, and two whose list of calls shows the new label. 338 change only in text; the other 9 also carry a new label in the finding or in its list of calls.
+- 13 calls in 9 artifacts take the runtime-shell label. Seven findings change from `dynamic-program` to `shell-dynamic` with the same profile: four high, and three low outside the server. `dynamic-program` high findings go from 496 in 203 artifacts to 492 in 202; MTC-SRC-002 high findings stay 677.
+- Five calls in four artifacts now count tool input in the program or the options. Two findings, both already `shell-dynamic` high, change `toolInput` to true. Five findings change only in this data or in a call's label, not in their words.
+- The 102 `<passed on as a value>` calls stay, with the 1.17 words. Among them are five firebase-tools `spawn.sync` calls: two in `extensionsEmulator.js`, two in `docker.js` and one in `buildToolsJarHelper.js`.
+- Scan time, both engines run back to back on each artifact: the sum over the corpus falls from 200.5 s to 130.6 s, and the median ratio per artifact is ×0.99.
+
 ## 1.17.0 — methodology `mcptrustchecker-1.17`
 
 **Python tools are read the way FastMCP serves them, and placeholder names are gone.** Scores move for Python servers whose tools 1.16 saw by name only; re-scan stored results before comparing with 1.16.1.

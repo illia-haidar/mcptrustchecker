@@ -402,14 +402,24 @@ export class FileCtx {
     return value;
   }
 
+  private readonly _reassigned = new Map<string, boolean>();
+
+  /** Is NAME assigned more than once in the file? Memoised: `declsOf` asks once per `let`/`var` of the name. */
   private reassigned(name: string): boolean {
+    const hit = this._reassigned.get(name);
+    if (hit !== undefined) return hit;
     let n = 0;
+    let v = false;
     for (const i of identOffsets(this.src, this.mask, name)) {
       const after = this.src.slice(i + name.length, i + name.length + 4);
       if (/^\s*=(?!=)/.test(after) || /^\s*(?:\+\+|--|[+\-*/]=)/.test(after)) n++;
-      if (n > 1) return true;
+      if (n > 1) {
+        v = true;
+        break;
+      }
     }
-    return false;
+    this._reassigned.set(name, v);
+    return v;
   }
 
   /** Read an initializer starting at `from` up to the end of the statement. */

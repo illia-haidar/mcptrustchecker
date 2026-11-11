@@ -151,7 +151,7 @@ All gates except the any-critical floor fire only on `confirmed` findings, so a 
 
 Every report ships everything needed to recompute the score:
 
-1. `score.methodologyVersion` (`mcptrustchecker-1.17`).
+1. `score.methodologyVersion` (`mcptrustchecker-1.18`).
 2. `score.threatScore` — the pure threat number, preserved before the client terms.
 3. `score.vector` — one line per step, of two kinds:
    - `{ kind: "threat", ruleId, category, severity, confidence, rawWeight, confidenceMult, diminishingFactor, appliedPenalty }`

@@ -1,4 +1,4 @@
-# Methodology — the Capability-Flow Trust Model (`mcptrustchecker-1.17`)
+# Methodology — the Capability-Flow Trust Model (`mcptrustchecker-1.18`)
 
 This document specifies exactly what MCP Trust Checker does, stage by stage. It is the spec behind every finding. The design goal is **auditability**: nothing here depends on a model's opinion, so a result can be reproduced and defended.
 
@@ -253,6 +253,69 @@ in another function is never borrowed), ternaries of literals, `process.execPath
 **local** wrapper whose every call site passes a constant. An exported wrapper is
 never folded from its in-file callers: an outside caller could pass anything.
 `process-spawn` raises the blast radius to `moderate` at most.
+
+**The words follow what the scanner saw (changed in `mcptrustchecker-1.18`).** A
+`dynamic-program` call keeps its severity, confidence, capability tag and score
+contribution whatever the tool-input check finds — the analysis reads one file, and
+input may arrive from another. The finding says "Runs a program resolved at runtime"
+when all of this holds for the file's reported call and for every other call of the file
+that runs code chosen at runtime (so the order of the calls does not decide the words):
+the program does not fold and is written as a plain name, a member of one or an element
+of one (`bin`, `this.bin`, `process.env.TOOL`, `argv[0]`; in Python the first element of
+one inline list, or the whole first argument); the API takes a program and an argv array
+(`execFile`, `spawn`, `fork` and their `Sync` forms, execa's `execa`, Python
+`subprocess` without a shell, `asyncio.create_subprocess_exec`); no shell or eval flag
+is written as a string anywhere in the arguments or held by an argv that folds (`-c`,
+`-lc`, `-e`, `--eval`, `/c`, `-Command`, `-EncodedCommand`, …); the options neither ask
+for a shell nor name one; in Python the program is not given by keyword (`args=`,
+`executable=`); and the call shows no tool input. The description then says what runs
+("`execFile(…)` runs a program resolved at runtime (a variable, configuration or a
+lookup)"), what the scanner saw, and what follows: with tool input it is command
+injection / RCE; the package's own binary or a known tool run with fixed arguments is a
+process-spawning capability. These words are observations and conditionals; they never
+say that there is nothing to fix. In a file with no sign of MCP or tools the scanner saw
+no tool input reach the program or its arguments, and the remediation is to keep the
+program coming only from the package's own configuration or a fixed install path, pass
+an argv array with no shell, never let tool input choose the program or a command line
+it runs, and validate any argument that comes from tool input. The tool-input tracker
+knows only some handler shapes, so any sign counts: "tool" in the file's path; "tool",
+"schema", "jsonrpc" / "json-rpc" or an MCP tool annotation (`readOnlyHint`,
+`destructiveHint`, `idempotentHint`, `openWorldHint`), in any case, anywhere in the
+file's text — code, comments and strings alike; "mcp" or `modelcontextprotocol` in the
+file's code, on a line that imports or requires, or more than a thousand times anywhere;
+or a handler the tracker recognises. In a file with a sign the finding says the scanner
+cannot tell whether tool input reaches the program or its arguments, and keeps the 1.17
+remediation. These keep the 1.17 words: visible tool input; a `shell-dynamic` finding,
+which is not reworded and keeps the 1.17 title and remediation (its description changes
+only where it carries the runtime-shell words below or its list of calls shows that
+label); a literal program running code chosen at runtime (`osascript -e <script>`,
+`node -e <code>`, `npx <package>`); a program not written as a plain reference, because
+it may be a literal the scanner did not read (a comment before it, `["git"] + args`, a
+tuple, `` `${dir}/tool` ``, `env.RUNNER ?? "npx"`, a call such as `getBin()` or
+`shutil.which("uvx")`, a cast, a ternary); arguments with a shell or eval flag
+(`[shell, "-c", line]`, `["-c"].concat(line)`); options that ask for a shell or name one
+(`shell: true`, a `shell` key next to a spread); a Python program given by keyword; an
+API that runs a shell (`exec`, `execSync`), splits one command string (`execaCommand`)
+or cannot be named by the scanner (`cp[name](…)`, `getattr(subprocess, name)(…)`, a
+module loaded through a binding it cannot read); a bound process function recorded as
+`<passed on as a value>` — handed on, or used right where it is named (`spawn.sync(…)`,
+`(0, spawn)(…)`, `typeof spawn`): the record does not say which; and any file in which
+another call is one of these. For a call that runs a program chosen at runtime, tool
+input in its program and its options counts, not only in the argv; a result callback
+does not (it runs after the process), and a program or options that hold a template
+literal, or are longer than 4 KB together, keep the argv-only reading. A call recorded
+without its arguments has no visible tool input, as in 1.17. A fixed program keeps the
+argv-only reading, so the medium option-injection case is unchanged. A `shell` key at the
+top level of inline options whose value names a binding
+(`shell: process.platform === "win32"`), with runtime arguments, is labelled
+`shell-dynamic`, "a shell may run a command line built at runtime (the shell option is
+set at runtime)", where 1.17 said `dynamic-program`; both have the same profile and the
+call ranks as before. A value of literals and operators only (`!1`, `void 0`), a constant
+set to one, the word `shell` in a comment, a nested object or another value, and options
+held in a name keep the 1.17 label and words, and what 1.17 called `shell-fixed` or fixed
+stays so. Text-only changes keep the evidence and the fingerprint. Proving a program
+fixed through `cross-spawn`'s `.sync`, objects or wrapper functions is not part of this
+methodology.
 
 **Reach from the MCP server (added in `mcptrustchecker-1.15`).** A package is
 rarely only a server; it ships a CLI, a daemon, a client for its own server. The

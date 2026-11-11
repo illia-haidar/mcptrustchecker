@@ -8,8 +8,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-3c873a.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/package.json)
-[![Methodology](https://img.shields.io/badge/methodology-mcptrustchecker--1.15-6f42c1.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/docs/methodology.md)
-[![Tests](https://img.shields.io/badge/tests-966%20passing-brightgreen.svg)](https://github.com/illia-haidar/mcptrustchecker/tree/main/test)
+[![Methodology](https://img.shields.io/badge/methodology-mcptrustchecker--1.18-6f42c1.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/docs/methodology.md)
+[![Tests](https://img.shields.io/badge/tests-1084%20passing-brightgreen.svg)](https://github.com/illia-haidar/mcptrustchecker/tree/main/test)
 [![Rules](https://img.shields.io/badge/rules-84-orange.svg)](https://github.com/illia-haidar/mcptrustchecker/blob/main/docs/rules.md)
 [![No account](https://img.shields.io/badge/account-not%20required-brightgreen.svg)](#why-this-is-different)
 [![Offline](https://img.shields.io/badge/runs-100%25%20offline-brightgreen.svg)](#why-this-is-different)
@@ -36,7 +36,7 @@ npx mcptrustchecker                # 🔍 scan every MCP server you already have
 
 ## What makes the algorithm unique
 
-The **Capability-Flow Trust Model** (methodology `mcptrustchecker-1.17`) is an **original algorithm designed from scratch for this project** by [Illia Haidar](https://mcptrustchecker.com) — it is not a wrapper around, or derivative of, any existing scanner or methodology. It is named, versioned, fully specified in docs/methodology.md, and citable via [CITATION.cff](CITATION.cff).
+The **Capability-Flow Trust Model** (methodology `mcptrustchecker-1.18`) is an **original algorithm designed from scratch for this project** by [Illia Haidar](https://mcptrustchecker.com) — it is not a wrapper around, or derivative of, any existing scanner or methodology. It is named, versioned, fully specified in docs/methodology.md, and citable via [CITATION.cff](CITATION.cff).
 
 **It is refined against 30,000+ real MCP servers — and still improving.** The model is not theoretical: it is calibrated on a continuously-scanned corpus of **30,000+ MCP servers** published on npm and PyPI. Each revision comes from a **full-population audit** of that corpus — every server in a grade band re-examined for *both* false positives (benign code graded down) and false negatives (real threats graded up), each change measured against the threats it must keep catching, and the whole corpus re-scanned before the version ships. That loop produced `mcptrustchecker-1.9`, which moved "evaluating a runtime value" off the threat axis after the data showed it was charging capability as malice. The corpus keeps growing and the audits keep running, so the methodology is expected to keep tightening — which is why every score carries the version that produced it.
 
@@ -67,7 +67,7 @@ Real output, `mcptrustchecker scan test/fixtures/poisoned-server.json`:
    │  GRADE  F  │   Trust Score 46/100   (client adoption risk · threat 50)
    ╰────────────╯   Capability MINIMAL   (blast radius)
                     Coverage MANIFEST   (static tool list only — no source)
-   methodology mcptrustchecker-1.17
+   methodology mcptrustchecker-1.18
 
 Threats    2 critical · 4 high · 2 medium
 
@@ -285,7 +285,7 @@ A single number can't answer "should I use this server?" — because **"powerful
 - **Trust — the A–F grade.** Driven by *threat* signals: prompt-injection with concealment, embedded secrets, Unicode smuggling, typosquatting, known CVEs, rug-pull drift, annotation lies, a single tool built as an exfiltration primitive. Answers **"any sign this server is malicious or negligent?"** — this is the pure `threatScore`, preserved on every report.
 - **Capability — a level (Minimal → Critical).** Driven by what the server *can do*: code execution, filesystem writes, network egress, the cross-tool toxic-flow surface. Answers **"how much damage if the model driving it is manipulated?"** — a fact to size access against, **not** a mark against the server. It contributes a small **capability-exposure** term to the client score.
 - **Coverage — a level (Live → Source → Manifest → Metadata → Empty).** How much the scan could actually inspect. A Grade A from a `metadata`-only scan (no tools enumerated, no code read) is **not** the assurance of a Grade A from a `live` scan that saw the real runtime tools. It contributes a small **coverage-honesty** term, so a shallow scan is never mistaken for a clean bill of health. When coverage is partial, the report says exactly what it could not see.
-- **Verification — the source (Vendor → Source → None; Unknown offline).** Established from facts the publisher cannot forge — npm/PyPI build provenance (Sigstore/SLSA) and vendor-owned scopes — computed by the engine on an `--online` scan so the CLI, registry and hosted API all agree. It contributes a small **verification-discount** term. Offline it is `Unknown` and the term is skipped (a caveat says so), because an unchecked signal must never read as verified.
+- **Verification — the source (Vendor → Source → None; Unknown offline).** Established from facts the publisher cannot forge — npm/PyPI build provenance (Sigstore/SLSA) and vendor-owned scopes — computed by the engine on an `--online` scan so the CLI and the hosted API agree. It contributes a small **verification-discount** term. Offline it is `Unknown` and the term is skipped (a caveat says so), because an unchecked signal must never read as verified.
 
 ```
 firecrawl   Trust B (81/100)   Capability CRITICAL   Coverage LIVE     → trustworthy, but huge blast radius — grant carefully
@@ -333,7 +333,7 @@ Three subtract-only terms, each **one itemized line** in `vector` — no black b
 | **E_ver** — verification discount | how verifiable the *source* is (build provenance / vendor scope / public repo) | vendor 0 · provenance 0 · public repo 1 · none 5 (**2** when the shipped source was fully read — the gap is a missing repo *link*, not the code) · **unknown → term skipped** |
 | **E_cov** — coverage honesty | how much of the target the scan could actually inspect | live 0 · source 0 · manifest 4 · metadata 8 · **empty 25** |
 
-- **Verification is an engine signal**, computed from the fetched npm/PyPI document (Sigstore/SLSA provenance + vendor-owned scope; for PyPI, the PEP 740 attestation of the scanned file from PyPI's integrity API, counted only when its repository matches the declared one) on an `--online` scan — identical logic in the CLI, the registry and the hosted API, so every mode agrees. An **offline** scan cannot check provenance, so verification is `unknown`, the term is **skipped**, and a coverage caveat records the omission — an unchecked signal never reads as clean.
+- **Verification is an engine signal**, computed from the fetched npm/PyPI document (Sigstore/SLSA provenance + vendor-owned scope; for PyPI, the PEP 740 attestation of the scanned file from PyPI's integrity API, counted only when its repository matches the declared one) on an `--online` scan — identical logic in the CLI and the hosted API, so both modes agree. An **offline** scan cannot check provenance, so verification is `unknown`, the term is **skipped**, and a coverage caveat records the omission — an unchecked signal never reads as clean.
 - The terms are **subtract-only**, and their total reach is enumerated rather than asserted: across all 70 reachable clean states (every combination of capability, verification and coverage that a threat-clean target can actually occupy) the grade lands **52 A · 13 B · 5 C**, floor **70**. Exposure alone never costs a threat-clean server more than one band — except where the scan inspected nothing, which is the one case that must not read as clean. A test walks the whole lattice, so the claim cannot drift from the constants. The confirmed-critical **F-gate holds** regardless.
 - **Bands:** A 90–100 · B 80–89 · C 70–79 · D 60–69 · F 0–59.
 
@@ -353,7 +353,7 @@ const report  = await scanSurface(surface);
 
 report.score.grade;              // 'A' … 'F'
 report.score.score;              // 0 … 100
-report.score.methodologyVersion; // 'mcptrustchecker-1.17'  ← pin & display this
+report.score.methodologyVersion; // 'mcptrustchecker-1.18'  ← pin & display this
 report.toxicFlows;               // enumerated exfiltration primitives
 renderBadge(report);             // shields.io endpoint JSON for a live trust badge
 ```

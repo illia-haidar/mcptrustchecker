@@ -16,8 +16,8 @@ import type { FileCtx, FnInfo } from '../util/fileCtx.js';
 import { splitArgs, splitTopLevel } from '../util/jsLex.js';
 
 export interface ToolFlow {
-  /** True when the expression, evaluated at offset `at`, visibly carries tool input. */
-  carries(expr: string, at: number): boolean;
+  /** True when the expression (or any of several), evaluated at offset `at`, visibly carries tool input. */
+  carries(expr: string | string[], at: number): boolean;
   /** Whether the file registers any tool handler at all. */
   hasHandlers: boolean;
 }
@@ -146,12 +146,13 @@ export function toolFlowOf(ctx: FileCtx): ToolFlow {
 
   return {
     hasHandlers: true,
-    carries(expr: string, at: number): boolean {
-      // Closures see their enclosing functions' bindings too.
-      for (const fn of fns) {
+    carries(expr: string | string[], at: number): boolean {
+      const exprs = typeof expr === 'string' ? [expr] : expr;
+      // Closures see their enclosing functions' bindings too. Only a function with a tainted
+      // name can answer yes, so only those are visited (1.18: same answers, less work).
+      for (const [fn, set] of tainted) {
         if (at < fn.bodyStart || at >= fn.bodyEnd) continue;
-        const set = tainted.get(fn);
-        if (set && references(expr, set)) return true;
+        if (exprs.some((e) => references(e, set))) return true;
       }
       return false;
     },

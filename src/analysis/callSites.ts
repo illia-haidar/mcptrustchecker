@@ -51,8 +51,53 @@ export interface ProcessCall {
   program: string;
   /** Normalized call text, for evidence and the finding fingerprint. */
   snippet: string;
-  /** An argv element visibly carries tool input (best-effort, same-file). */
+  /**
+   * Tool input visibly reaches the call (best-effort, same-file): an argv
+   * element; for a call that runs code chosen at runtime, the program or the
+   * options too (1.18: not a result callback; not over 4 KB of program and
+   * options). Always false for a call recorded without its arguments (a
+   * function handed on as a value, an API chosen at runtime), as in 1.17.
+   */
   toolInput: boolean;
+  /** The `shell` option is an explicit key set at runtime (`shell: process.platform === "win32"`). */
+  shellAtRuntime?: boolean;
+  /**
+   * The call keeps the 1.17 words whatever else holds (1.18): its program is
+   * not written as a plain name, a member of one or an element of one (`bin`,
+   * `this.bin`, `process.env.TOOL`, `argv[0]`) — a literal, a call, an operator,
+   * a cast or a comment may hide a program the scanner did not read; or its
+   * arguments hold a shell or eval flag as a literal (`-c`, `/c`, `-e`, …: a
+   * shell or an interpreter given a command line); or its options ask for a
+   * shell or name one (`shell: true`, `shell: isWin`, a `shell` key next to a
+   * spread); or, in Python, the program is given by keyword (`args=`,
+   * `executable=`).
+   */
+  keepWords?: boolean;
+  /**
+   * The shape the call ranks as when a file's worst call is picked, when that
+   * differs from `shape`: a call relabelled `shell-dynamic` only by the words
+   * (same profile) ranks as the `dynamic-program` 1.17 read, so the finding's
+   * evidence and fingerprint stay those of 1.17.
+   */
+  rankAs?: CallShape;
+}
+
+/** The rank of a call when a file's worst one is picked. */
+export function callRank(c: ProcessCall): number {
+  return SHAPE_RANK[c.rankAs ?? c.shape];
+}
+
+/**
+ * Does METHOD run a program with an argv array and no shell of its own (1.18)?
+ * Not a shell API (`exec`, `os.system`, …), not one string split into a command
+ * (`execaCommand`), and not an API the scanner cannot name: one chosen at
+ * runtime (`cp[name]`, `getattr(subprocess, name)`) or a module loaded through
+ * a binding it cannot read.
+ */
+export function runsArgv(method: string): boolean {
+  if (ARGV_METHODS.has(method)) return true;
+  const [mod, fn = ''] = method.split('.');
+  return mod === 'subprocess' ? PY_SUBPROCESS.has(fn) && !PY_SHELL.has(fn) : method === 'asyncio.create_subprocess_exec';
 }
 
 export interface ProcessScan {
@@ -72,6 +117,8 @@ const LIB_EXPORTS: Record<string, Record<string, string>> = {
   execa: { default: 'execFile', execa: 'execFile', execaSync: 'execFileSync', execaNode: 'fork', execaCommand: 'execaCommand', execaCommandSync: 'execaCommandSync' },
 };
 const JS_SHELL_METHODS = new Set(['exec', 'execSync']);
+/** Process APIs that take a program and an argv array. */
+const ARGV_METHODS = new Set(['execFile', 'execFileSync', 'spawn', 'spawnSync', 'fork']);
 const CP_SPEC = String.raw`['"](?:node:)?child_process['"]`;
 
 /** Programs that are themselves shells, and the flag that hands them a command line. */
@@ -310,7 +357,17 @@ function scanJs(ctx: FileCtx, flow?: ToolFlow): ProcessScan {
       if (/promisify\)?\s*\(\s*$/.test(before) || /\bfunction\s*\*?\s*$/.test(before)) continue;
       if (/(?:const|let|var)\s*$/.test(before)) continue;
       seen.add(i);
-      calls.push({ index: i, line: ctx.line(i), method, shape: 'dynamic-program', program: '<passed on as a value>', snippet: normalize(src.slice(Math.max(0, i - 40), i + local.length + 40)), toolInput: false });
+      // `X.sync(…)` on a cross-spawn binding stays this record, as in 1.17: whether `.sync` is still
+      // cross-spawn's own when it runs is not something the scanner can prove from the package's text.
+      calls.push({
+        index: i,
+        line: ctx.line(i),
+        method,
+        shape: 'dynamic-program',
+        program: '<passed on as a value>',
+        snippet: normalize(src.slice(Math.max(0, i - 40), i + local.length + 40)),
+        toolInput: false,
+      });
     }
   }
   // `require(<folds to child_process>).exec(…)` and `cp['exec'](…)`.
@@ -389,21 +446,62 @@ function leavesPackage(file: string, rel: string): boolean {
   return false;
 }
 
+const CALLBACK = /^(?:function\b|\(|async\b|[A-Za-z_$][\w$]*\s*=>)/;
+/** A program and options longer than this are not read again for tool input (1.18): the reading of 1.17 stays. */
+const CODE_INPUT_CAP = 4096;
+
+/**
+ * A program written as a plain name, a member of one or an element of one
+ * (1.18): `bin`, `this.bin`, `cfg?.paths.bin`, `process.env.TOOL`, `argv[0]`.
+ * Nothing else: no literal, no call, no operator, no cast, no comment.
+ */
+const PLAIN_REFERENCE = /^[A-Za-z_$][\w$]*(?:\s*\??\.\s*[A-Za-z_$][\w$]*|\s*\[\s*(?:\d+|[A-Za-z_$][\w$]*)\s*\])*$/;
+
+/**
+ * A shell or eval flag as written in an argv: `-c`, `-lc`, `-ic`, `-e`, `-p`, `--eval`, `--command`
+ * (case matters: `git -C dir` is no such flag); `/c`, `/k`, `/r`, `-Command`, `-EncodedCommand`,
+ * `-enc` in any case.
+ */
+const CODE_FLAG = /^(?:-[a-z]*c|-e|-p|--eval|--print|--command|--exec)$/;
+const CODE_FLAG_ANY_CASE = /^(?:\/[ckr]|-command(?:withargs)?|-encodedcommand|-enc)$/i;
+
+/** The same flags as a quoted string anywhere in the arguments as written: `["-c"].concat(line)`, `f ? ["-c", x] : [x]`. */
+const CODE_FLAG_WRITTEN = /['"`](?:-[a-z]*c|-e|-p|--eval|--print|--command|--exec)['"`]/;
+const CODE_FLAG_WRITTEN_ANY_CASE = /['"`](?:\/[ckr]|-command(?:withargs)?|-encodedcommand|-enc)['"`]/i;
+const flagWritten = (text: string): boolean => CODE_FLAG_WRITTEN.test(text) || CODE_FLAG_WRITTEN_ANY_CASE.test(text);
+
+/** Does a folded argv hold a shell or eval flag as a literal element? */
+function holdsCodeFlag(argv: Folded): boolean {
+  return argv.kind === 'array' && argv.elements.some((e) => e.kind === 'literal' && e.values.some((v) => CODE_FLAG.test(v.trim()) || CODE_FLAG_ANY_CASE.test(v.trim())));
+}
+
 function classifyJs(ctx: FileCtx, method: string, index: number, args: ArgList, flow?: ToolFlow): ProcessCall {
   const a = args.args;
   const snippet = normalize(ctx.src.slice(index, args.end + 1));
   const line = ctx.line(index);
   const base = { index, line, method, snippet };
+  // Tool input in `read` (the argv, or the command line), as in 1.17. A call that runs code chosen at
+  // runtime also counts its program and its options (1.18): not a result callback, which runs after the
+  // process, and not a program and options over the cap, where the reading of 1.17 stays. One walk.
+  const toolInputOf = (shape: CallShape, read: string | undefined, program: string | undefined, options: string | undefined): boolean => {
+    if (!flow?.hasHandlers) return false;
+    const more = shape === 'shell-dynamic' || shape === 'dynamic-program' ? [program, options !== undefined && !CALLBACK.test(options) ? options : undefined] : [];
+    // Not a program or options that hold a template literal either: reading them is not linear.
+    const parts = more.filter((x): x is string => !!x && !x.includes('`'));
+    return flow.carries([read ?? '', ...(parts.reduce((n, x) => n + x.length, 0) <= CODE_INPUT_CAP ? parts : [])], index);
+  };
   if (STRING_COMMAND_METHODS.has(method)) {
     // execaCommand('git status'): no shell, the string is split into program + argv.
     const cmd = foldInScope(ctx, a[0] ?? '', index);
-    const toolInput = !!flow?.carries(a[0] ?? '', index);
-    return { ...base, shape: isConst(cmd) ? 'fixed-program-fixed-args' : 'dynamic-program', program: describeFolded(cmd), toolInput };
+    const shape: CallShape = isConst(cmd) ? 'fixed-program-fixed-args' : 'dynamic-program';
+    const toolInput = toolInputOf(shape, a[0], undefined, a[1]);
+    return { ...base, shape, program: describeFolded(cmd), toolInput };
   }
   if (JS_SHELL_METHODS.has(method)) {
     const cmd = foldInScope(ctx, a[0] ?? '', index);
-    const toolInput = !!flow?.carries(a[0] ?? '', index);
-    return { ...base, shape: isConst(cmd) ? 'shell-fixed' : 'shell-dynamic', program: describeFolded(cmd), toolInput };
+    const shape: CallShape = isConst(cmd) ? 'shell-fixed' : 'shell-dynamic';
+    const toolInput = toolInputOf(shape, a[0], undefined, a[1]);
+    return { ...base, shape, program: describeFolded(cmd), toolInput };
   }
   // execFile/spawn/fork(program, [argv], [options], [callback])
   let program = foldInScope(ctx, a[0] ?? '', index);
@@ -412,7 +510,7 @@ function classifyJs(ctx: FileCtx, method: string, index: number, args: ArgList, 
   let argvText: string | undefined;
   let optsText: string | undefined;
   const second = a[1];
-  if (second !== undefined && !/^(?:function\b|\(|async\b|[A-Za-z_$][\w$]*\s*=>)/.test(second)) {
+  if (second !== undefined && !CALLBACK.test(second)) {
     if (second.startsWith('{')) optsText = second;
     else if (second.startsWith('[')) {
       argvText = second;
@@ -431,12 +529,62 @@ function classifyJs(ctx: FileCtx, method: string, index: number, args: ArgList, 
       }
     }
   }
-  if (optsText && /^(?:function\b|\(|async\b|[A-Za-z_$][\w$]*\s*=>)/.test(optsText)) optsText = undefined; // a callback
-  const shell = method === 'fork' ? false : shellOption(ctx, optsText, index);
+  if (optsText && CALLBACK.test(optsText)) optsText = undefined; // a callback
+  const shellRead = method === 'fork' ? false : shellOption(ctx, optsText, index);
+  let shell = shellRead;
+  // 1.18, the label only: "set at runtime" is said of the value of a `shell` key written at the top
+  // level of inline options. A key in a comment, in a nested object or in another value stays the
+  // 'unknown' of 1.17.
+  if (shell === 'runtime') {
+    const value = topLevelShellValue(ctx, args, optsText);
+    if (value === null || !setAtRuntime(ctx, value, index)) shell = 'unknown';
+  }
   const argv: Folded = argvText !== undefined ? foldInScope(ctx, argvText, index) : { kind: 'array', elements: [], dynamic: false };
-  const toolInput = argvText !== undefined && !!flow?.carries(argvText, index);
   const stdinLiteral = !!optsText && /\binput\s*:\s*(['"])(?:(?!\1)[^\\])*\1\s*[,}]/.test(optsText);
-  return { ...base, ...shapeOf(program, argv, shell, stdinLiteral), toolInput };
+  const shaped = shell === 'runtime' ? shellSetAtRuntime(program, argv, stdinLiteral) : shapeOf(program, argv, shell, stdinLiteral);
+  // A fixed program: the argv alone decides it, as in 1.17 (that is all the medium "option injection" rule reads).
+  const toolInput = toolInputOf(shaped.shape, argvText, a[0], optsText);
+  // 1.18, the words only: a program not written as a plain reference, a shell / eval flag in the
+  // arguments, or options that ask for a shell or name one (`shell: true`, `shell: isWin`, a `shell`
+  // key next to a spread).
+  // The options as written, or the object a constant holds: do they ask for a shell, or name one?
+  const optsDecl = optsText !== undefined && /^[A-Za-z_$][\w$]*$/.test(optsText) ? ctx.constInitAt(optsText, index) : undefined;
+  const shellSeen = shellRead === true || shellRead === 'runtime' || (shellRead === 'unknown' && /shell/i.test(optsDecl?.init ?? optsText ?? ''));
+  const keepWords = !PLAIN_REFERENCE.test(a[0] ?? '') || holdsCodeFlag(argv) || flagWritten(a.slice(1).join(',')) || shellSeen;
+  return { ...base, ...shaped, toolInput, ...(keepWords ? { keepWords: true } : {}) };
+}
+
+/** The value of the `shell` key written at the top level of these inline options (the last one), or null. */
+function topLevelShellValue(ctx: FileCtx, args: ArgList, optsText: string | undefined): string | null {
+  const k = optsText === undefined ? -1 : args.args.indexOf(optsText);
+  if (k < 0 || !optsText!.startsWith('{')) return null;
+  let value: string | null = null;
+  for (const e of splitArgs(ctx.src, ctx.mask, args.starts[k]!)?.args ?? []) {
+    if (e === 'shell') value = 'shell';
+    else {
+      const m = /^(?:shell|'shell'|"shell")\s*:\s*([\s\S]+)$/.exec(e);
+      if (m) value = m[1]!;
+    }
+  }
+  return value;
+}
+
+type Shaped = { shape: CallShape; program: string; shellAtRuntime?: boolean; rankAs?: CallShape };
+
+/**
+ * An explicit `shell` option whose value is decided at runtime
+ * (`shell: process.platform === "win32"`) is judged exactly as options the
+ * scanner cannot read (1.17); only the label says which (1.18). A dynamic
+ * program with runtime arguments is then the `shell-dynamic` it is where that
+ * value is true — same severity, confidence and capability, and it ranks as
+ * the `dynamic-program` it was. A shape 1.17 called fixed is never raised.
+ */
+function shellSetAtRuntime(program: Folded, argv: Folded, stdinLiteral: boolean): Shaped {
+  const s = shapeOf(program, argv, 'unknown', stdinLiteral);
+  // A shell only because the options may turn one on (not `bash -c …`): say why.
+  if (s.shape === 'shell-dynamic') return shapeOf(program, argv, false, stdinLiteral).shape === 'shell-dynamic' ? s : { ...s, shellAtRuntime: true };
+  if (s.shape === 'dynamic-program' && !isConst(argv)) return { ...s, shape: 'shell-dynamic', shellAtRuntime: true, rankAs: 'dynamic-program' };
+  return s;
 }
 
 /** Shape from a folded program + argv. `shell` is true, false, or 'unknown' (options we cannot see). */
@@ -525,10 +673,30 @@ function shapeOf(programIn: Folded, argvIn: Folded, shell: boolean | 'unknown', 
 }
 
 /**
- * Is a shell requested by these options? true / false, or 'unknown' when the
- * options are a parameter, a spread, or anything else we cannot read.
+ * Does a `shell` value that does not fold name a binding, so that it is set at
+ * runtime (`process.platform === "win32"`, `isWin`)? A value of literals and
+ * operators only (`!1`, `!0`, `void 0`), or a constant initialised to one, does
+ * not: it stays the 'unknown' of 1.17.
  */
-function shellOption(ctx: FileCtx, optsText: string | undefined, at: number, depth = 0): boolean | 'unknown' {
+function setAtRuntime(ctx: FileCtx, value: string, at: number, depth = 0): boolean {
+  const v = value.trim();
+  // A value this long is no platform test; reading it is not linear either. The 'unknown' of 1.17.
+  if (v.length > 200) return false;
+  if (depth < 3 && /^[A-Za-z_$][\w$]*$/.test(v)) {
+    const decl = ctx.constInitAt(v, at);
+    if (decl) return setAtRuntime(ctx, decl.init, decl.at, depth + 1);
+  }
+  const code = v.replace(/'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`/g, '""');
+  return /(?<![\w$.])(?!(?:true|false|null|undefined|void|typeof|NaN|Infinity)(?![\w$]))[A-Za-z_$][\w$]*/.test(code);
+}
+
+/**
+ * Is a shell requested by these options? true / false; 'runtime' when an
+ * explicit `shell` key holds a value set at runtime (1.18: judged exactly
+ * as 'unknown'); 'unknown' when the options are a parameter, a spread, or
+ * anything else we cannot read.
+ */
+function shellOption(ctx: FileCtx, optsText: string | undefined, at: number, depth = 0): boolean | 'unknown' | 'runtime' {
   if (optsText === undefined) return false;
   const t = optsText.trim();
   if (t.startsWith('{')) {
@@ -542,7 +710,7 @@ function shellOption(ctx: FileCtx, optsText: string | undefined, at: number, dep
     if (/[{,]\s*shell\s*[,}]/.test(t)) {
       const f = fold(ctx, 'shell', { at });
       if (f.kind === 'literal') return f.values.some((x) => !/^(?:false|undefined|null|0|)$/.test(x));
-      return 'unknown';
+      return setAtRuntime(ctx, 'shell', at) ? 'runtime' : 'unknown';
     }
     if (/\[\s*[^\]]+\]\s*:/.test(t)) return 'unknown'; // a computed key could be `shell`
     const m = /(?:\bshell|['"`]shell['"`])\s*:\s*([^,}\n]+)/.exec(t);
@@ -552,7 +720,7 @@ function shellOption(ctx: FileCtx, optsText: string | undefined, at: number, dep
     if (/^(?:true|['"`])/.test(v)) return true;
     const f = fold(ctx, v, { at });
     if (f.kind === 'literal') return f.values.some((x) => !/^(?:false|undefined|null|0|)$/.test(x));
-    return 'unknown';
+    return setAtRuntime(ctx, v, at) ? 'runtime' : 'unknown';
   }
   if (depth < 3 && /^[A-Za-z_$][\w$]*$/.test(t)) {
     const decl = ctx.constInitAt(t, at);
@@ -721,20 +889,34 @@ function classifyPy(ctx: FileCtx, method: string, index: number, args: ArgList, 
     const cmd = foldInScope(ctx, first, index);
     return { ...base, shape: isConst(cmd) ? 'shell-fixed' : 'shell-dynamic', program: describeFolded(cmd), toolInput };
   }
+  // 1.18, the words only. The program as written: the first element of one inline list, else the whole
+  // first argument (`*argv` is its first element). It must be a plain reference; a program given by
+  // keyword (`args=`, `executable=`) is not where the scanner reads it.
+  const programText = (): string => {
+    const firstAt = args.starts[args.args.indexOf(first)] ?? -1;
+    if (firstAt < 0) return '';
+    const list = first.startsWith('[') ? splitArgs(ctx.src, ctx.mask, firstAt) : null;
+    const text = list && list.end + 1 === firstAt + first.length ? (list.args[0] ?? '') : first;
+    return text.replace(/^\*\s*/, '');
+  };
+  const byKeyword = kwargs.some((k) => /^(?:args|executable)\s*=/.test(k));
+  const flagInArgs = flagWritten(args.args.join(','));
+  const words = (argv: Folded): { keepWords?: true } => (byKeyword || flagInArgs || !PLAIN_REFERENCE.test(programText()) || holdsCodeFlag(argv) ? { keepWords: true } : {});
   if (short === 'create_subprocess_exec') {
     const program = foldInScope(ctx, first, index);
     const rest = positional.slice(1).map((x) => foldInScope(ctx, x, index));
     const argv: Folded = { kind: 'array', elements: rest, dynamic: positional.slice(1).some((x) => x.startsWith('*')) };
-    return { ...base, ...shapeOf(program, argv, false), toolInput };
+    return { ...base, ...shapeOf(program, argv, false), toolInput, ...words(argv) };
   }
   const cmd = foldInScope(ctx, first, index);
   if (cmd.kind === 'array') {
     const program = cmd.elements[0] ?? { kind: 'unknown' };
     const argv: Folded = { kind: 'array', elements: cmd.elements.slice(1), dynamic: cmd.dynamic };
-    return { ...base, ...shapeOf(cmd.dynamic && !cmd.elements.length ? { kind: 'unknown' } : program, argv, false), toolInput };
+    return { ...base, ...shapeOf(cmd.dynamic && !cmd.elements.length ? { kind: 'unknown' } : program, argv, false), toolInput, ...words(argv) };
   }
   // A plain string without shell=True is the program name itself.
-  return { ...base, ...shapeOf(cmd, { kind: 'array', elements: [], dynamic: false }, false), toolInput };
+  const none: Folded = { kind: 'array', elements: [], dynamic: false };
+  return { ...base, ...shapeOf(cmd, none, false), toolInput, ...words(none) };
 }
 
 function normalize(s: string): string {

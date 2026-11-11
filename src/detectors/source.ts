@@ -14,7 +14,7 @@ import type { CapabilityTag, Confidence, Detector, DetectorContext, Finding, Sev
 import { SOURCE_PATTERNS, isNonRuntimePath, type SourcePattern } from '../data/sourcePatterns.js';
 import { SECRET_PATTERNS } from '../data/injectionPatterns.js';
 import { buildReachability, type Reach } from '../analysis/reachability.js';
-import { scanProcessCalls, SHAPE_RANK, type CallShape, type ProcessCall } from '../analysis/callSites.js';
+import { callRank, runsArgv, scanProcessCalls, type CallShape, type ProcessCall } from '../analysis/callSites.js';
 import { toolFlowOf } from '../analysis/toolFlow.js';
 import { fileCtxOf, type FileCtx, type FnInfo } from '../util/fileCtx.js';
 import { fold, isConst } from '../util/constFold.js';
@@ -632,14 +632,74 @@ const SHAPE_WORDS: Record<CallShape, string> = {
   'shell-fixed': 'a shell runs a command line that is entirely literal',
   'fixed-program-fixed-args': 'a fixed program with fixed arguments',
 };
+/** `shell: process.platform === "win32"` with runtime arguments (1.18). */
+const SHELL_AT_RUNTIME_WORDS = 'a shell may run a command line built at runtime (the shell option is set at runtime)';
+/** The program label of a program that does not fold. */
+const RUNTIME_VALUE = '<runtime value>';
+/** "tool", "schema", JSON-RPC or an MCP tool annotation, in any case, anywhere in a file's text: code, comments and strings alike. */
+const TOOL_TEXT = /tool|schema|json-?rpc|(?:read_?only|destructive|idempotent|open_?world)_?hint/i;
+/** "mcp" or the SDK's scope, in any case: a sign in code, or on a line that imports or requires. */
+const MCP_WORD = /mcp|modelcontextprotocol/gi;
 
-function src002Title(worst: ProcessCall | null, path: string, suffix: string): string {
+/**
+ * Does the file show any sign of MCP or tools (1.18)? "tool" in its path;
+ * "tool", "schema", "jsonrpc" / "json-rpc" or an MCP tool annotation
+ * (`destructiveHint`, …) anywhere in its text, comments and strings included
+ * (so code the lexer misreads still counts); "mcp" or `modelcontextprotocol`
+ * in its code or on a line that imports or requires; or a handler the
+ * tool-input tracker recognises. Broad on purpose: the tracker does not follow
+ * every path inside such a file, so only a file with none of these is told that
+ * the scanner saw no tool input reach the call.
+ */
+function showsToolSign(fctx: FileCtx, path: string, hasHandlers: boolean): boolean {
+  if (hasHandlers || /tool/i.test(path) || TOOL_TEXT.test(fctx.src)) return true;
+  let seen = 0;
+  for (const m of fctx.src.matchAll(MCP_WORD)) {
+    const at = m.index!;
+    // A file that says it a thousand times is about MCP; reading on would only cost time.
+    if (fctx.isCode(at) || ++seen > 1000) return true;
+    // A specifier is a string: `require("@modelcontextprotocol/sdk")`, `from "mcp-framework"`.
+    // (The 200 characters before it on its line: a bounded window keeps this linear.)
+    const before = fctx.src.slice(Math.max(0, at - 200), at);
+    if (/\b(?:import|require|from)\b/.test(before.slice(before.lastIndexOf('\n') + 1))) return true;
+  }
+  return false;
+}
+
+function shapeWords(c: ProcessCall): string {
+  return c.shape === 'shell-dynamic' && c.shellAtRuntime ? SHELL_AT_RUNTIME_WORDS : SHAPE_WORDS[c.shape];
+}
+
+/**
+ * May this call be described as a program resolved at runtime (1.18)? Its
+ * program does not fold and is written as a plain reference; it is run by an
+ * API that takes a program and an argv array (not a shell API, not one the
+ * scanner cannot name, not a function handed on as a value); its arguments
+ * hold no shell or eval flag as a literal; and it shows no tool input.
+ */
+function rewordable(c: ProcessCall): boolean {
+  return c.shape === 'dynamic-program' && c.program === RUNTIME_VALUE && runsArgv(c.method) && !c.keepWords && !c.toolInput;
+}
+
+/**
+ * A file whose reported call, and every other call of it that runs code chosen
+ * at runtime, is a program resolved at runtime as `rewordable` reads it. One
+ * call that is not — a shell, an interpreter running runtime code, an API the
+ * scanner cannot name, visible tool input — keeps the 1.17 words for the file,
+ * whatever the order of its calls. Same severity, confidence and capability as
+ * any dynamic program; only the words differ (1.18).
+ */
+function resolvedAtRuntime(worst: ProcessCall | null, calls: ProcessCall[]): boolean {
+  return !!worst && rewordable(worst) && calls.every((c) => (c.shape !== 'dynamic-program' && c.shape !== 'shell-dynamic') || rewordable(c));
+}
+
+function src002Title(worst: ProcessCall | null, path: string, suffix: string, atRuntime = false): string {
   if (!worst) return `Imports child_process; no call site found (${path})`;
   const prog = worst.program.length > 48 ? `${worst.program.slice(0, 45)}…` : worst.program;
   switch (worst.shape) {
     case 'shell-dynamic':
     case 'dynamic-program':
-      return `Shell/command execution ${suffix} (${path})`;
+      return atRuntime ? `Runs a program resolved at runtime ${suffix} (${path})` : `Shell/command execution ${suffix} (${path})`;
     case 'fixed-program-dynamic-args':
       return `Spawns \`${prog}\` with runtime arguments, no shell, ${suffix} (${path})`;
     case 'shell-fixed':
@@ -885,10 +945,11 @@ function processCandidate(
   entry: string | undefined,
   effReach: (index: number) => Reach = () => fileReach,
 ): Candidate | null {
-  const scan = scanProcessCalls(fctx, toolFlowOf(fctx));
+  const flow = toolFlowOf(fctx);
+  const scan = scanProcessCalls(fctx, flow);
   if (!scan.calls.length && !scan.importsModule) return null;
   // Calls the server can run come first; then the most dangerous.
-  const worst = [...scan.calls].sort((a, b) => REACH_RANK(effReach(a.index)) - REACH_RANK(effReach(b.index)) || SHAPE_RANK[b.shape] - SHAPE_RANK[a.shape] || a.index - b.index)[0] ?? null;
+  const worst = [...scan.calls].sort((a, b) => REACH_RANK(effReach(a.index)) - REACH_RANK(effReach(b.index)) || callRank(b) - callRank(a) || a.index - b.index)[0] ?? null;
   const reach: Reach = worst ? effReach(worst.index) : fileReach;
   const shape: CallShape | 'import-only' = worst ? worst.shape : 'import-only';
   const profile = SHAPE_PROFILE[shape];
@@ -906,13 +967,24 @@ function processCandidate(
   const at = worst ? worst.index : Math.max(0, scan.importIndex);
   const line = fctx.line(at);
   const codeExec = shape === 'shell-dynamic' || shape === 'dynamic-program';
+  const atRuntime = resolvedAtRuntime(worst, scan.calls);
+  // Any sign of MCP or tools: the words say only what is always true there, and keep the 1.17 remediation.
+  const toolSign = atRuntime && showsToolSign(fctx, path, flow.hasHandlers);
 
   let what: string;
   if (!worst) {
     what = `the file imports child_process, but no call to it was found (it may be unused, or re-exported).`;
+  } else if (atRuntime) {
+    what =
+      `\`${worst.method}(…)\` runs a program resolved at runtime (a variable, configuration or a lookup). ` +
+      (toolSign
+        ? 'The scanner cannot tell whether tool input reaches the program or its arguments in this file. '
+        : 'In this file the scanner saw no tool input reach the program or its arguments. ') +
+      `If tool input can reach it${toolSign ? '' : ' from elsewhere'}, this is command injection / RCE; ` +
+      "if it is the package's own binary or a known tool run with fixed arguments, it is a process-spawning capability.";
   } else if (codeExec) {
     what =
-      `\`${worst.method}(…)\` — ${SHAPE_WORDS[worst.shape]}. Spawning a process whose command line or program is decided at runtime ` +
+      `\`${worst.method}(…)\` — ${shapeWords(worst)}. Spawning a process whose command line or program is decided at runtime ` +
       'is code execution: with unsanitized tool input it is command injection / RCE.';
   } else {
     what =
@@ -931,12 +1003,15 @@ function processCandidate(
       (scan.calls.length > 6 ? `; …${scan.calls.length - 6} more` : '') +
       '.'
     : '';
-  const remediation = codeExec
-    ? 'Pass a fixed program and an argv array instead of a shell string; never let tool input choose the program or the command line. ' +
-      'If a shell is genuinely required, validate every value that reaches it.'
-    : worst
-      ? 'Nothing to fix by itself: the program is fixed. Keep the argv array (no shell), and validate any argument that comes from tool input so it cannot start with `-`.'
-      : 'If the import is unused, drop it.';
+  const remediation = atRuntime && !toolSign
+    ? 'If the program comes only from your own configuration or a fixed install path, keep it that way: pass an argv array (no shell), ' +
+      'never let tool input choose the program or a command line it runs, and validate any argument that comes from tool input.'
+    : codeExec
+      ? 'Pass a fixed program and an argv array instead of a shell string; never let tool input choose the program or the command line. ' +
+        'If a shell is genuinely required, validate every value that reaches it.'
+      : worst
+        ? 'Nothing to fix by itself: the program is fixed. Keep the argv array (no shell), and validate any argument that comes from tool input so it cannot start with `-`.'
+        : 'If the import is unused, drop it.';
   const evidence = worst
     ? worst.snippet
     : f.content.slice(at, at + 120).replace(/\s+/g, ' ').trim().slice(0, 160);
@@ -946,10 +1021,10 @@ function processCandidate(
     index: at,
     reach,
     nonRuntime: outside,
-    danger: worst ? SHAPE_RANK[worst.shape] : 0,
+    danger: worst ? callRank(worst) : 0,
     finding: {
       ruleId: 'MTC-SRC-002',
-      title: src002Title(worst, path, place.suffix),
+      title: src002Title(worst, path, place.suffix, atRuntime),
       category: 'permissions',
       severity,
       confidence,
